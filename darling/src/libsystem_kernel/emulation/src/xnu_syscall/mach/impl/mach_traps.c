@@ -10,6 +10,7 @@
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/xnu_syscall/mach/impl/mach_traps.h>
 #include <darling/emulation/linux_premigration/ext/mremap.h>
+#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/conversion/duct_errno.h>
 
@@ -176,7 +177,8 @@ kern_return_t semaphore_timedwait_trap_impl(
 		if (code == -LINUX_EINTR) {
 			return KERN_ABORTED;
 		}
-		__simple_printf("semaphore_timedwait failed (internally): %d\n", code);
+		__simple_printf("semaphore_timedwait failed (internally): code=%d pid=%ld tid=%ld wait=%u sec=%u nsec=%u\n",
+				code, LINUX_SYSCALL(__NR_getpid), LINUX_SYSCALL(__NR_gettid), wait_name, sec, nsec);
 		__simple_abort();
 	}
 
@@ -195,7 +197,8 @@ kern_return_t semaphore_timedwait_signal_trap_impl(
 		if (code == -LINUX_EINTR) {
 			return KERN_ABORTED;
 		}
-		__simple_printf("semaphore_timedwait_signal failed (internally): %d\n", code);
+		__simple_printf("semaphore_timedwait_signal failed (internally): code=%d pid=%ld tid=%ld wait=%u signal=%u sec=%u nsec=%u\n",
+				code, LINUX_SYSCALL(__NR_getpid), LINUX_SYSCALL(__NR_gettid), wait_name, signal_name, sec, nsec);
 		__simple_abort();
 	}
 

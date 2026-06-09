@@ -64,6 +64,7 @@
 
 #ifdef DARLING
 #include <darling/emulation/conversion/duct_errno.h>
+#include <darling/emulation/common/simple.h>
 #include <darlingserver/rpc.h>
 #endif
 
@@ -153,7 +154,8 @@ retry:
 		if (result == -LINUX_EINTR) {
 			goto retry;
 		}
-		__builtin_unreachable();
+		__simple_printf("*** dserver_rpc_fork_wait_for_child failed: code=%d ***\n", result);
+		__simple_abort();
 	}
 	return 0;
 };

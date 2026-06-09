@@ -61,9 +61,14 @@ static void float_state_to_mcontext(const x86_float_state32_t* s, linux_fpregset
 static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, const void* fstate);
 static void state_to_kernel(struct linux_ucontext* ctxt, void* tstate, void* fstate);
 
-#define DEBUG_SIGEXC
 #ifdef DEBUG_SIGEXC
-#define kern_printf(...) __simple_kprintf(__VA_ARGS__)
+/*
+ * Signal-exception tracing runs from signal handlers. Do not route it through
+ * kprintf/darlingserver RPC: a signal can interrupt an in-flight RPC, and doing
+ * another RPC from the handler can desynchronize or deadlock the interrupted
+ * thread. Keep this path local to the process.
+ */
+#define kern_printf(...) __simple_fprintf(2, __VA_ARGS__)
 #else
 #define kern_printf(...)
 #endif
@@ -151,7 +156,8 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		__simple_printf("*** dserver_rpc_interrupt_enter failed: code=%d pid=%ld tid=%ld handler=sigrt signum=%d ***\n",
+				status, LINUX_SYSCALL(__NR_getpid), LINUX_SYSCALL(__NR_gettid), signum);
 		__simple_abort();
 	}
 
@@ -272,7 +278,8 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
+		__simple_printf("*** dserver_rpc_interrupt_enter failed: code=%d pid=%ld tid=%ld handler=sigexc linux_signum=%d ***\n",
+				status, LINUX_SYSCALL(__NR_getpid), LINUX_SYSCALL(__NR_gettid), linux_signum);
 		__simple_abort();
 	}
 
