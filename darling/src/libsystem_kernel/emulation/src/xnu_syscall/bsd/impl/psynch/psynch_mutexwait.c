@@ -21,5 +21,11 @@ long sys_psynch_mutexwait(void* mutex, uint32_t mgen, uint32_t ugen, uint64_t ti
 		__simple_abort();
 	}
 
-	return (ret) ? ret : retval;
+	// Non-zero result code is a BSD error (EINTR/ETIMEDOUT) from
+	// psynch_mtxcontinue; propagate it as a negative return so cerror sets
+	// errno and the syscall returns -1. Returning it positively would make
+	// libpthread treat the error as a successful mutex updateval, defeating
+	// the EINTR retry / kw_intr interrupted-wakeup redirection and stranding
+	// a contended-mutex handoff. See psynch_cvwait.c for the full analysis.
+	return (ret) ? -ret : retval;
 }
