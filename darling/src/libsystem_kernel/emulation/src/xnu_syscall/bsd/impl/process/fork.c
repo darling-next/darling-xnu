@@ -34,6 +34,8 @@ long sys_fork(void)
 	{
 		// in the child
 
+		__mldr_postfork_child();
+
 		// the old RPC FD will be closed in `guard_table_postfork_child`;
 		// we don't need to close it ourselves.
 		// that should also take care of closing descriptors for any other threads.
