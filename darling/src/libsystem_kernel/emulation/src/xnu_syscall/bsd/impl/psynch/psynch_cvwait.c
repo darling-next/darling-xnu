@@ -23,12 +23,13 @@ long sys_psynch_cvwait(void* cv, uint64_t cvlsgen, uint32_t cvugen, void * mutex
 
 	// A non-zero result code is the BSD error returned by psynch_cvcontinue
 	// (EINTR/ETIMEDOUT, possibly OR'd with the cvar ECVCLEARED/ECVPREPOST
-	// status bits). It must be propagated as a *negative* return so cerror
-	// sets errno and the syscall returns -1; libpthread then masks errno&0xff
-	// for EINTR/ETIMEDOUT and inspects the ECVCLEARED/ECVPREPOST bits to clear
-	// any orphaned prepost via psynch_cvclrprepost. Returning it positively
-	// (the previous behaviour) made libpthread treat the error code as a
-	// successful updateval, so the prepost was never cleared and an
-	// interrupted cvwait could permanently strand a condvar wakeup.
+	// status bits). Return it *negated* so it reaches libpthread as a negative
+	// value. NOTE: unlike a real macOS syscall this emulated BSD syscall does
+	// NOT route the negative return through cerror -> errno; the value arrives
+	// directly in libpthread's return register, where _pthread_psynch_cond_wait
+	// decodes it ((int32_t)ret < 0 -> err = -ret) to run the EINTR / prepost
+	// recovery. Returning it positively would make libpthread treat the error
+	// as a successful updateval, leaving an orphaned prepost that permanently
+	// strands a later condvar wakeup.
 	return (ret) ? -ret : retval;
 }

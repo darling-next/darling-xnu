@@ -20,9 +20,11 @@ long sys_psynch_rw_wrlock(void* rwlock, uint32_t lgenval, uint32_t ugenval, uint
 		__simple_abort();
 	}
 
-	// Non-zero result code is a BSD error (EINTR/ETIMEDOUT); propagate it as a
-	// negative return so cerror sets errno and the syscall returns -1, rather
-	// than letting libpthread mistake the error for a successful rwlock
-	// updateval. See psynch_cvwait.c for the full analysis.
+	// Non-zero result code is a BSD error (EINTR/ETIMEDOUT); return it negated
+	// so it reaches libpthread as a negative value (this emulated BSD syscall
+	// does NOT route it through cerror -> errno; it arrives directly in the
+	// return register, where the rwlock wait loop decodes (int32_t)ret < 0 and
+	// retries on EINTR) rather than letting libpthread mistake the error for a
+	// successful rwlock updateval. See psynch_cvwait.c for the full analysis.
 	return (ret) ? -ret : retval;
 }
