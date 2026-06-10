@@ -21,5 +21,14 @@ long sys_psynch_cvwait(void* cv, uint64_t cvlsgen, uint32_t cvugen, void * mutex
 		__simple_abort();
 	}
 
-	return (ret) ? ret : retval;
+	// A non-zero result code is the BSD error returned by psynch_cvcontinue
+	// (EINTR/ETIMEDOUT, possibly OR'd with the cvar ECVCLEARED/ECVPREPOST
+	// status bits). It must be propagated as a *negative* return so cerror
+	// sets errno and the syscall returns -1; libpthread then masks errno&0xff
+	// for EINTR/ETIMEDOUT and inspects the ECVCLEARED/ECVPREPOST bits to clear
+	// any orphaned prepost via psynch_cvclrprepost. Returning it positively
+	// (the previous behaviour) made libpthread treat the error code as a
+	// successful updateval, so the prepost was never cleared and an
+	// interrupted cvwait could permanently strand a condvar wakeup.
+	return (ret) ? -ret : retval;
 }
