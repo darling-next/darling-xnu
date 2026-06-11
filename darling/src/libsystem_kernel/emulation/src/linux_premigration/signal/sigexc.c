@@ -242,6 +242,21 @@ void darling_sigexc_self(void)
 	sys_sigaltstack(&newstack, NULL);
 }
 
+long sigexc_set_restart(int linux_signum, bool restart)
+{
+	struct linux_sigaction sa;
+
+	sa.sa_sigaction = (linux_sig_handler*) sigexc_handler;
+	sa.sa_mask = 0x7fffffff;
+	sa.sa_mask |= (1ull << (SIGNAL_SIGEXC_SUSPEND-1));
+	sa.sa_flags = LINUX_SA_RESTORER | LINUX_SA_SIGINFO | LINUX_SA_ONSTACK;
+	if (restart)
+		sa.sa_flags |= LINUX_SA_RESTART;
+	sa.sa_restorer = sig_restorer;
+
+	return LINUX_SYSCALL(__NR_rt_sigaction, linux_signum, &sa, NULL, sizeof(sa.sa_mask));
+}
+
 
 static void state_to_kernel(struct linux_ucontext* ctxt, void* tstate, void* fstate)
 {
