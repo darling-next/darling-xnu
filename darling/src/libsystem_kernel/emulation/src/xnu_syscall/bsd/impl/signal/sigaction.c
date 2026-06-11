@@ -85,6 +85,15 @@ long sys_sigaction(int signum, const struct bsd___sigaction* nsa, struct bsd_sig
 	{
 		ret = 0;
 
+		if (nsa != NULL)
+		{
+			bool restart = nsa->sa_sigaction == XNU_SIG_IGN
+				|| (nsa->sa_flags & BSD_SA_RESTART);
+			ret = sigexc_set_restart(linux_signum, restart);
+			if (ret < 0)
+				return errno_linux_to_bsd(ret);
+		}
+
 		if (osa != NULL)
 		{
 			osa->sa_sigaction = sig_handlers[linux_signum];
