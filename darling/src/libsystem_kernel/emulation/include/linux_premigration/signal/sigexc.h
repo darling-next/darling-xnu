@@ -16,6 +16,7 @@ void sigexc_setup(void);
 // for PT_SIGEXC to handle this operation synchronously
 void darling_sigexc_self(void);
 void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt);
+long sigexc_set_restart(int linux_signum, bool restart);
 
 void sigexc_thread_setup(void);
 void sigexc_thread_exit(void);
