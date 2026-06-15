@@ -33,6 +33,10 @@ int vchroot_whiteout(const char* guest);
 int vchroot_unwhiteout(const char* guest);
 int vchroot_set_opaque(const char* guest);
 int vchroot_readdir_merge(const char* guest, char* out, int cap);
+// Paged merged getdents for getdirentries (per-fd state); vchroot_dir_closed
+// MUST be called from close()/closedir() so the per-fd state is freed.
+int vchroot_getdents_merge(int fd, char* out, int cap);
+void vchroot_dir_closed(int fd);
 // Thin policy helpers the syscall-emulation sites call (see vchroot_userspace.c):
 //   vchroot_prepare_write(guest) BEFORE a write/mutate (expand then hits upper);
 //   vchroot_post_unlink(guest)   AFTER a successful unlink/rmdir;
