@@ -76,6 +76,28 @@ static bool next_component(const char* from, const char** end);
 static char prefix_path[4096] = {0}; // MUST NOT end with '/'
 static int prefix_path_len = -1;
 
+#ifdef EUNION
+// E-UNION (dar-test-infra-sp5.8.4.4): shared read-only system template that
+// the writable per-prefix layer (prefix_path) is unioned over. When a guest
+// path is absent in prefix_path it falls back to libexec_path. Empty/unset
+// (len <= 0) disables the union and the resolver behaves exactly as before.
+static char libexec_path[4096] = {0}; // MUST NOT end with '/'
+static int libexec_path_len = -1;
+
+static void set_libexec_path(const char* p)
+{
+	if (!p || !*p)
+	{
+		libexec_path[0] = '\0';
+		libexec_path_len = 0;
+		return;
+	}
+	strcpy(libexec_path, p);
+	libexec_path_len = (int)strlen(libexec_path);
+}
+#define HAVE_LIBEXEC_SETTER 1
+#endif
+
 static const char EXIT_PATH[] = "/Volumes/SystemRoot";
 
 #ifndef TEST
@@ -332,6 +354,63 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 							int status = LINUX_SYSCALL(__NR_fstatat64, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
 						#endif
 					#endif
+
+#ifdef EUNION
+					// E-UNION lower-layer fallback: the component does not exist
+					// in the writable upper layer (prefix_path). If we are still
+					// rooted at the upper layer and a shared read-only template
+					// (libexec_path) is configured, retry the SAME guest-relative
+					// path against the template. The guest-relative suffix is
+					// everything past current_root_len; we swap only the host root
+					// prefix so the rest of the resolver is layer-agnostic.
+					if (status == -LINUX_ENOENT
+						&& libexec_path_len > 0
+						&& ctxt->current_root_len == prefix_path_len
+						&& strncmp(ctxt->current_path, prefix_path, prefix_path_len) == 0)
+					{
+						char relbuf[4096];
+						const int rellen = ctxt->current_path_len - prefix_path_len;
+						if (libexec_path_len + rellen + 1 <= (int)sizeof(ctxt->current_path))
+						{
+							// stash the guest-relative suffix, rebuild under libexec
+							memcpy(relbuf, ctxt->current_path + prefix_path_len, rellen);
+							relbuf[rellen] = '\0';
+
+							memcpy(ctxt->current_path, libexec_path, libexec_path_len);
+							memcpy(ctxt->current_path + libexec_path_len, relbuf, rellen + 1);
+							ctxt->current_path_len = libexec_path_len + rellen;
+
+							#if defined(__NR_lstat)
+								int lstatus = LINUX_SYSCALL(__NR_lstat, ctxt->current_path, &st);
+							#else
+								#if __NR_newfstatat
+									int lstatus = LINUX_SYSCALL(__NR_newfstatat, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+								#else
+									int lstatus = LINUX_SYSCALL(__NR_fstatat64, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+								#endif
+							#endif
+
+							if (lstatus == 0 || lstatus != -LINUX_ENOENT)
+							{
+								// Found in (or definitively errored against) the
+								// lower layer: commit the switch to the template
+								// root and adopt the lower-layer stat result.
+								ctxt->current_root = libexec_path;
+								ctxt->current_root_len = libexec_path_len;
+								status = lstatus;
+							}
+							else
+							{
+								// Not in lower layer either: restore the upper-layer
+								// path so the case-insensitive search below runs
+								// against prefix_path as it did originally.
+								memcpy(ctxt->current_path, prefix_path, prefix_path_len);
+								memcpy(ctxt->current_path + prefix_path_len, relbuf, rellen + 1);
+								ctxt->current_path_len = prefix_path_len + rellen;
+							}
+						}
+					}
+#endif
 
 					if (icase_enabled && status == -LINUX_ENOENT)
 					{
