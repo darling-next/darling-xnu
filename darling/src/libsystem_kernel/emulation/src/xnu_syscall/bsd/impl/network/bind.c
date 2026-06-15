@@ -2,6 +2,7 @@
 
 #include <sys/errno.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -24,6 +25,36 @@ long sys_bind(int fd, const void* name, int socklen)
 
 	if (socklen > 512)
 		return -EINVAL;
+
+#ifdef EUNION
+	// E-UNION: binding an AF_UNIX socket CREATES a filesystem object. Its parent
+	// directory must live in the writable upper layer, or the bind lands in (or
+	// fails against) the read-only template -- e.g. launchd binding
+	// /var/run/shellspawn.sock, whose /var/run exists only in the template until
+	// copied up. Materialize the parent before the path is expanded+bound.
+	{
+		const struct sockaddr* sa = (const struct sockaddr*) name;
+		// AF_UNIX == 1 on both BSD and Linux family numbering used here
+		if (sa && socklen > 2 && sa->sa_family == 1)
+		{
+			const char* p = ((const struct sockaddr_un*) name)->sun_path;
+			if (p[0] == '/')
+			{
+				// copy-up the PARENT dir of the socket path
+				char parent[4096];
+				int n = (int) strlen(p);
+				if (n > 0 && n < (int) sizeof(parent))
+				{
+					strcpy(parent, p);
+					char* slash = parent;
+					for (char* c = parent; *c; ++c)
+						if (*c == '/') slash = c;
+					if (slash != parent) { *slash = '\0'; vchroot_prepare_write(parent); }
+				}
+			}
+		}
+	}
+#endif
 
 	fixed = __builtin_alloca(sockaddr_fixup_size_from_bsd(name, socklen));
 	ret = socklen = sockaddr_fixup_from_bsd(fixed, name, socklen);
