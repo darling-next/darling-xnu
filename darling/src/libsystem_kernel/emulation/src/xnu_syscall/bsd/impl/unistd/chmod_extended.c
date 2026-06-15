@@ -18,6 +18,15 @@ long sys_chmod_extended(const char* path, int uid, int gid, int mode, void* xsec
 	if (!path)
 		return -EFAULT;
 
+#ifdef EUNION
+	// chmod+chown mutate metadata: copy up first so the change lands on the upper.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_write(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+#endif
+
 	strcpy(vc.path, path);
 	ret = vchroot_expand(&vc);
 	if (ret < 0)
