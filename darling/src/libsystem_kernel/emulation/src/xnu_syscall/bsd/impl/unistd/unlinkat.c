@@ -38,5 +38,12 @@ long sys_unlinkat(int fd, const char* path, int flag)
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 
+#ifdef EUNION
+	// the upper object was removed; if the name still exists in the lower
+	// template, drop a whiteout so the merged view keeps it deleted.
+	if (ret == 0 && path[0] == '/')
+		vchroot_post_unlink(path);
+#endif
+
 	return ret;
 }

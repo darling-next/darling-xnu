@@ -15,9 +15,13 @@ long sys_mknod(const char* path, int mode, int dev)
 
 	vc.flags = 0;
 	vc.dfd = get_perthread_wd();
-	
 	if (!path)
 		return -EFAULT;
+
+#ifdef EUNION
+	if (path[0] == '/')
+		vchroot_pre_mkdir(path); // clear any whiteout at the new name
+#endif
 
 	strcpy(vc.path, path);
 

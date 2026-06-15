@@ -478,6 +478,80 @@ int vchroot_set_opaque(const char* guest)
 	return eunion_set_marker(up, EUNION_OPAQUE_XATTR);
 }
 
+// -------- E-UNION write-op wiring helpers --------------------------------
+//
+// These are the thin entrypoints the syscall-emulation sites call so the union
+// policy stays in one place. The pattern at a mutating site is:
+//   vchroot_prepare_write(guest);   // BEFORE vchroot_expand -> expand hits upper
+//   ... vchroot_expand(); real syscall ...
+//   vchroot_post_unlink(guest);     // AFTER a successful unlink/rmdir
+// All take an ABSOLUTE guest path (the shared template is addressed absolutely:
+// /usr, /System, ...). A relative or out-of-prefix path is a no-op success --
+// such writes never touch the read-only template, so there is nothing to do.
+
+// Is this a guest path we union-manage? (absolute, and a prefix is configured)
+static int eunion_manage(const char* guest)
+{
+	return libexec_path_len > 0 && prefix_path_len >= 0
+		&& guest && guest[0] == '/';
+}
+
+// Before a write/mutate: ensure the target lives in the writable upper layer so
+// the real syscall never mutates the shared template. If the path is lower-only
+// it is copied up; if it carries a whiteout the marker is cleared first (an
+// O_CREAT-style write resurrects a deleted name); absent-in-both and
+// already-upper are both no-op successes (the create lands in the upper).
+int vchroot_prepare_write(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+
+	// a whiteout means the name was deleted; writing it resurrects it
+	if (eunion_is_whiteout(guest))
+	{
+		int r = vchroot_unwhiteout(guest);
+		if (r < 0)
+			return r;
+		// fall through: nothing to copy up (it was deleted), create-in-upper
+		return 0;
+	}
+
+	int r = vchroot_copyup(guest);
+	if (r == -LINUX_ENOENT)
+		return 0; // absent in both layers: a create will make it fresh in upper
+	return r; // 0 if copied up or already upper; negative on real error
+}
+
+// After a successful unlink/rmdir of the upper object: if the name still exists
+// in the lower template, drop a whiteout so it stays deleted. If it was
+// upper-only (absent from lower), do nothing -- the unlink already removed it.
+int vchroot_post_unlink(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+
+	char lo[4096];
+	if (eunion_host_path(libexec_path, libexec_path_len, guest, lo, sizeof(lo)) < 0)
+		return -LINUX_ENAMETOOLONG;
+
+	stat_t lst;
+	if (eunion_lstat(lo, &lst) != 0)
+		return 0; // not in the template: nothing to hide
+
+	return vchroot_whiteout(guest);
+}
+
+// Before re-creating a name (mkdir/create over a previously deleted name): clear
+// any whiteout marker so the new object is visible. No-op if not whited out.
+int vchroot_pre_mkdir(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+	if (!eunion_is_whiteout(guest))
+		return 0;
+	return vchroot_unwhiteout(guest);
+}
+
 // helper: append `name` to a NUL-separated out buffer if it fits and is not a
 // duplicate of an already-appended name. Returns 1 if appended, 0 if dup, <0 on
 // overflow.
