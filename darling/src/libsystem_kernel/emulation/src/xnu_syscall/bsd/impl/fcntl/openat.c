@@ -65,6 +65,20 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 		return ret;
 	}
 
+#ifdef EUNION
+	// E-UNION: if this open writes/creates/truncates, materialize the target in
+	// the writable upper layer BEFORE expand so the real syscall never mutates the
+	// shared read-only template. Absolute guest paths only; relative/out-of-prefix
+	// is a no-op inside the helper. (Read-only opens are left alone.)
+	if (filename[0] == '/' &&
+	    ((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
+	     (flags & BSD_O_CREAT) || (flags & BSD_O_TRUNC))) {
+		int wr = vchroot_prepare_write(filename);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+#endif
+
 	struct vchroot_expand_args vc;
 	vc.flags = (flags & BSD_O_SYMLINK || flags & BSD_O_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	vc.dfd = atfd(fd);
