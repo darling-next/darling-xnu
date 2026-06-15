@@ -477,6 +477,128 @@ int vchroot_set_opaque(const char* guest)
 		return -LINUX_ENAMETOOLONG;
 	return eunion_set_marker(up, EUNION_OPAQUE_XATTR);
 }
+
+// helper: append `name` to a NUL-separated out buffer if it fits and is not a
+// duplicate of an already-appended name. Returns 1 if appended, 0 if dup, <0 on
+// overflow.
+static int eunion_emit_name(char* out, int cap, int* used, int* count, const char* name)
+{
+	// dedup against already-emitted names
+	const char* p = out;
+	for (int i = 0; i < *count; i++)
+	{
+		if (strcmp(p, name) == 0)
+			return 0;
+		p += strlen(p) + 1;
+	}
+	int nlen = (int)strlen(name) + 1;
+	if (*used + nlen > cap)
+		return -LINUX_ENAMETOOLONG;
+	memcpy(out + *used, name, nlen);
+	*used += nlen;
+	(*count)++;
+	return 1;
+}
+
+// is `name` present in a NUL-separated set of `n` names?
+static int name_in_set(const char* buf, int n, const char* name)
+{
+	const char* p = buf;
+	for (int i = 0; i < n; i++)
+	{
+		if (strcmp(p, name) == 0)
+			return 1;
+		p += strlen(p) + 1;
+	}
+	return 0;
+}
+
+// Produce the merged directory listing for guest dir `guest` as a NUL-separated
+// list of names in `out`. Upper layer wins on name clash; whiteouts hide the
+// lower namesake; an opaque upper dir is not merged with the lower. Returns the
+// number of names, or a negative Linux errno.
+int vchroot_readdir_merge(const char* guest, char* out, int cap)
+{
+	if (prefix_path_len < 0)
+		return -LINUX_ENOENT;
+
+	int used = 0, count = 0;
+
+	char up[4096], lo[4096];
+	int have_upper = (eunion_host_path(prefix_path, prefix_path_len, guest, up, sizeof(up)) >= 0);
+
+	// 1. upper layer: emit non-whiteout names; record whiteout names so the
+	//    lower namesake is suppressed (tracked in a separate seen-set).
+	char whbuf[4096]; int whused = 0, whcount = 0;
+	if (have_upper)
+	{
+		int dfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, up, LINUX_O_RDONLY | LINUX_O_DIRECTORY, 0);
+		if (dfd >= 0)
+		{
+			char dirents[8192];
+			int len;
+			while ((len = LINUX_SYSCALL(__NR_getdents64, dfd, dirents, sizeof(dirents))) > 0)
+			{
+				int pos = 0;
+				while (pos < len)
+				{
+					struct linux_dirent64* de = (struct linux_dirent64*) &dirents[pos];
+					pos += de->d_reclen;
+					const char* nm = de->d_name;
+					if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
+						continue;
+
+					char child[4096];
+					int hl = (int)strlen(up), nl = (int)strlen(nm);
+					if (hl + 1 + nl + 1 > (int)sizeof(child))
+						continue;
+					memcpy(child, up, hl); child[hl] = '/'; memcpy(child + hl + 1, nm, nl + 1);
+
+					if (eunion_has_marker(child, EUNION_WH_XATTR))
+						eunion_emit_name(whbuf, sizeof(whbuf), &whused, &whcount, nm); // hidden
+					else
+						eunion_emit_name(out, cap, &used, &count, nm); // visible upper entry
+				}
+			}
+			LINUX_SYSCALL(__NR_close, dfd);
+		}
+
+		// 2. opaque upper dir -> do not merge lower
+		if (eunion_has_marker(up, EUNION_OPAQUE_XATTR))
+			return count;
+	}
+
+	// 3. lower layer: emit names not already visible (upper wins) and not
+	//    whited-out.
+	if (libexec_path_len > 0 && eunion_host_path(libexec_path, libexec_path_len, guest, lo, sizeof(lo)) >= 0)
+	{
+		int dfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, lo, LINUX_O_RDONLY | LINUX_O_DIRECTORY, 0);
+		if (dfd >= 0)
+		{
+			char dirents[8192];
+			int len;
+			while ((len = LINUX_SYSCALL(__NR_getdents64, dfd, dirents, sizeof(dirents))) > 0)
+			{
+				int pos = 0;
+				while (pos < len)
+				{
+					struct linux_dirent64* de = (struct linux_dirent64*) &dirents[pos];
+					pos += de->d_reclen;
+					const char* nm = de->d_name;
+					if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
+						continue;
+					// suppressed by a whiteout in the upper?
+					if (name_in_set(whbuf, whcount, nm))
+						continue;
+					eunion_emit_name(out, cap, &used, &count, nm);
+				}
+			}
+			LINUX_SYSCALL(__NR_close, dfd);
+		}
+	}
+
+	return count;
+}
 #endif
 
 static const char EXIT_PATH[] = "/Volumes/SystemRoot";
