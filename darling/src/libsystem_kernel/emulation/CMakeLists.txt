@@ -376,6 +376,18 @@ set_target_properties(emulation_dyld PROPERTIES COMPILE_FLAGS "-ffunction-sectio
 add_dependencies(emulation rtsig_h generate_dserver_rpc_wrappers)
 add_dependencies(emulation_dyld rtsig_h generate_dserver_rpc_wrappers)
 
+# E-UNION (dar-test-infra-sp5.8.4.4): union-by-path-translation in vchroot.
+# OFF by default -> the emulation builds byte-identical to baseline. When ON,
+# define EUNION (activates the #ifdef EUNION code) and EUNION_LIBEXEC_PATH (the
+# shared read-only template, == darlingserver's LIBEXEC_PATH).
+option(DARLING_EUNION "Enable E-UNION union-in-vchroot prefix assembly (experimental)" OFF)
+if (DARLING_EUNION)
+	target_compile_definitions(emulation PRIVATE
+		EUNION EUNION_LIBEXEC_PATH="${CMAKE_INSTALL_PREFIX}/libexec/darling")
+	target_compile_definitions(emulation_dyld PRIVATE
+		EUNION EUNION_LIBEXEC_PATH="${CMAKE_INSTALL_PREFIX}/libexec/darling")
+endif()
+
 make_fat(emulation)
 make_fat(emulation_dyld)
 

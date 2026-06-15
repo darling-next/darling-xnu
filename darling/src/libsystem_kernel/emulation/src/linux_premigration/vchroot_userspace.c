@@ -97,6 +97,43 @@ static void set_libexec_path(const char* p)
 }
 #define HAVE_LIBEXEC_SETTER 1
 
+// The shared template path baked in at build time (== darlingserver's
+// LIBEXEC_PATH). Provided to the emulation build as a compile definition; the
+// fallback below keeps the hermetic unit build (which sets the template itself)
+// and any build that forgets the define from breaking.
+#ifndef EUNION_LIBEXEC_PATH
+#define EUNION_LIBEXEC_PATH ""
+#endif
+
+static int eunion_lstat(const char* host, stat_t* st); // defined below
+
+// Activate the union for this prefix iff the server provisioned it in E-UNION
+// mode, signalled by the presence of the copy-up staging dir `$prefix/.union-work`
+// (the server creates it instead of copying the 7GB template). If the marker is
+// absent (route 1 / copy-mode), the template path is left unset so libexec_path_len
+// stays <= 0 and every E-UNION code path is inert -- behaviour identical to
+// baseline. `prefix` must already be set in prefix_path. Idempotent.
+static void eunion_init_from_prefix(void)
+{
+	if (libexec_path_len > 0) // already initialised
+		return;
+	if (prefix_path_len <= 0)
+		return;
+
+	char marker[4096];
+	int n = prefix_path_len;
+	if (n + (int)sizeof("/.union-work") > (int)sizeof(marker))
+		return;
+	memcpy(marker, prefix_path, n);
+	strcpy(marker + n, "/.union-work");
+
+	stat_t st;
+	if (eunion_lstat(marker, &st) != 0)
+		return; // not provisioned for union -> stay inert (copy-mode)
+
+	set_libexec_path(EUNION_LIBEXEC_PATH);
+}
+
 // -------- E-UNION copy-on-write ------------------------------------------
 //
 // When a guest path that exists only in the read-only lower template is about
@@ -882,6 +919,10 @@ int __darling_vchroot(int dfd)
 	prefix_path[rv] = '\0';
 	prefix_path_len = rv;
 
+#ifdef EUNION
+	eunion_init_from_prefix();
+#endif
+
 	return 0;
 }
 
@@ -913,6 +954,10 @@ static void init_vchroot_path(void)
 	}
 
 	prefix_path_len = (int)tmp_len;
+
+#ifdef EUNION
+	eunion_init_from_prefix();
+#endif
 
 #ifndef TEST
 	__simple_printf("init_vchroot_path: %s\n", prefix_path);
