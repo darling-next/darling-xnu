@@ -816,6 +816,15 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 	if (prefix_path_len < 0)
 		return -LINUX_ENOENT;
 
+	// Union inactive (no template configured for this prefix): pass straight
+	// through to the real getdents64 so callers see the kernel's true d_ino /
+	// d_type. The merge path synthesizes those (d_ino=1, DT_UNKNOWN), which is
+	// fine for a merged listing but must NOT be imposed when there is nothing to
+	// merge -- otherwise an EUNION build regresses every readdir even with the
+	// union switched off.
+	if (libexec_path_len <= 0)
+		return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+
 	struct eunion_dir_state* s = eunion_dir_find(fd);
 	if (!s)
 	{
