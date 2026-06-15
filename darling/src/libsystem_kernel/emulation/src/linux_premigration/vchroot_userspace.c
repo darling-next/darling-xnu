@@ -673,6 +673,158 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 
 	return count;
 }
+
+// -------- E-UNION paged getdents merge (per-fd state) --------------------
+//
+// getdirentries works on an fd and streams the directory in pages; the kernel
+// tracks the offset for the UPPER fd only. To present a MERGED view (upper wins,
+// lower merged in, whiteouts subtracted, opaque honoured) across an arbitrary
+// number of pages WITHOUT the getdents64 rewind hazards, we materialize the full
+// merged name list ONCE per open dir fd (reusing the proven vchroot_readdir_merge
+// enumeration) into a small per-fd buffer, then hand it back page by page. The
+// emulation site calls:
+//   vchroot_getdents_merge(fd, out, cap)  instead of raw getdents64(fd, ...)
+//   vchroot_dir_closed(fd)                from close()/closedir() teardown
+// rewinddir (lseek(fd,0)) is detected by the emulation, which calls
+// vchroot_dir_closed(fd) so the next getdents re-materializes from the start.
+
+#define EUNION_MAXDIRS  256
+#define EUNION_NAMEBUF  65536  // per-dir merged name list (NUL-separated)
+
+struct eunion_dir_state
+{
+	int  fd;                    // upper fd this state tracks (-1 = free slot)
+	int  ready;                 // names[] materialized?
+	int  count;                 // number of names
+	int  cursor;                // byte offset of the next name to emit
+	int  used;                  // bytes used in names[]
+	char names[EUNION_NAMEBUF]; // NUL-separated merged listing
+};
+
+static struct eunion_dir_state eunion_dirs[EUNION_MAXDIRS];
+static int eunion_dirs_inited = 0;
+
+static void eunion_dirs_init(void)
+{
+	if (eunion_dirs_inited)
+		return;
+	for (int i = 0; i < EUNION_MAXDIRS; i++)
+		eunion_dirs[i].fd = -1;
+	eunion_dirs_inited = 1;
+}
+
+static struct eunion_dir_state* eunion_dir_find(int fd)
+{
+	eunion_dirs_init();
+	for (int i = 0; i < EUNION_MAXDIRS; i++)
+		if (eunion_dirs[i].fd == fd)
+			return &eunion_dirs[i];
+	return 0;
+}
+
+// Free per-fd merge state (call from close()/closedir() and on rewinddir).
+// Idempotent.
+void vchroot_dir_closed(int fd)
+{
+	struct eunion_dir_state* s = eunion_dir_find(fd);
+	if (!s)
+		return;
+	s->fd = -1;
+	s->ready = 0;
+}
+
+static struct eunion_dir_state* eunion_dir_alloc(int fd)
+{
+	struct eunion_dir_state* s = eunion_dir_find(fd);
+	if (!s)
+	{
+		for (int i = 0; i < EUNION_MAXDIRS; i++)
+			if (eunion_dirs[i].fd == -1) { s = &eunion_dirs[i]; break; }
+	}
+	if (!s)
+		return 0; // table full: caller degrades to plain upper stream
+	s->fd = fd;
+	s->ready = 0;
+	s->count = s->cursor = s->used = 0;
+	return s;
+}
+
+// append one linux_dirent64 record for `name` into out; returns bytes used or
+// 0 if it would not fit (caller stops this page). The ON-WIRE header is the
+// fields up to d_name (NOT sizeof(struct), which may be inflated by a fixed
+// d_name[] in some copies of the struct in scope).
+static int eunion_emit_dirent(char* out, int cap, int used, const char* name)
+{
+	int nl = (int)strlen(name) + 1;
+	int hdr = (int)__builtin_offsetof(struct linux_dirent64, d_name);
+	int reclen = hdr + nl;
+	reclen = (reclen + 7) & ~7; // 8-byte align like the kernel
+	if (used + reclen > cap)
+		return 0;
+	struct linux_dirent64* de = (struct linux_dirent64*) (out + used);
+	de->d_ino = 1;          // synthetic; getdirentries does not require real ino
+	de->d_off = 0;
+	de->d_reclen = (unsigned short) reclen;
+	de->d_type = 0;         // DT_UNKNOWN: portable, callers stat if they care
+	memcpy(de->d_name, name, nl);
+	return reclen;
+}
+
+// Paged merged getdents. `fd` is the UPPER directory fd already opened by the
+// emulation. Returns bytes written into out (>0), 0 at end of the merged
+// stream, or a negative Linux errno. On first call it materializes the full
+// merged listing; subsequent calls page it out.
+int vchroot_getdents_merge(int fd, char* out, int cap)
+{
+	if (prefix_path_len < 0)
+		return -LINUX_ENOENT;
+
+	struct eunion_dir_state* s = eunion_dir_find(fd);
+	if (!s)
+	{
+		s = eunion_dir_alloc(fd);
+		if (!s) // table full: degrade gracefully to plain upper stream
+			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+	}
+
+	if (!s->ready)
+	{
+		// recover the guest dir path from the upper fd, then materialize the
+		// merged listing once.
+		char guest[4096];
+		struct vchroot_fdpath_args fp;
+		fp.fd = fd; fp.path = guest; fp.maxlen = sizeof(guest);
+		if (vchroot_fdpath(&fp) < 0) // not under the prefix: no merge to do
+			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+
+		int n = vchroot_readdir_merge(guest, s->names, sizeof(s->names));
+		if (n < 0) // fall back to the raw stream on any merge error
+			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+
+		s->count = n;
+		s->cursor = 0;
+		s->used = 0;
+		// compute total bytes for cursor walking
+		const char* p = s->names;
+		for (int i = 0; i < n; i++)
+			p += strlen(p) + 1;
+		s->used = (int)(p - s->names);
+		s->ready = 1;
+	}
+
+	// page out from cursor
+	int written = 0;
+	while (s->cursor < s->used)
+	{
+		const char* name = s->names + s->cursor;
+		int w = eunion_emit_dirent(out, cap, written, name);
+		if (!w)
+			break; // page full; resume here next call
+		written += w;
+		s->cursor += (int)strlen(name) + 1;
+	}
+	return written; // 0 when cursor reaches used -> end of merged stream
+}
 #endif
 
 static const char EXIT_PATH[] = "/Volumes/SystemRoot";
