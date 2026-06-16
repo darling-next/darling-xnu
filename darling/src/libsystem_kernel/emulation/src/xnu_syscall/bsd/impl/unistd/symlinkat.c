@@ -19,9 +19,13 @@ long sys_symlinkat(const char* path, int fd, const char* link)
 	vc.dfd = get_perthread_wd();
 
 #ifdef EUNION
-	// creating a symlink at `link`: clear any whiteout so the new name is visible.
-	if (link[0] == '/')
-		vchroot_pre_mkdir(link);
+	// creating a symlink at `link`: copy up its parent dir (so the link lands in
+	// the upper layer, not the shared template) and clear any whiteout at the name.
+	if (link[0] == '/') {
+		int wr = vchroot_prepare_create(link);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
 #endif
 
 	strcpy(vc.path, link);
