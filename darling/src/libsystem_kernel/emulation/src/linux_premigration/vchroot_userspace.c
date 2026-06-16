@@ -744,7 +744,18 @@ int vchroot_prepare_write_fd(int fd, char* out, int cap)
 	if (vchroot_fdpath(&fp) < 0)
 		return 0; // cannot map the fd: proceed with the original fd
 	if (guest[0] != '/')
-		return 0; // fd escapes the guest (EXIT_PATH): not union-managed
+		return 0; // not an absolute guest path: not union-managed
+	// vchroot_fdpath detranslates a fd that lives OUTSIDE both union layers to the
+	// EXIT_PATH escape hatch ("/Volumes/SystemRoot/..."), which is a real absolute
+	// path but points at the native host root, NOT the union. Such a fd is not
+	// union-managed -- proceed with the original fd. (EXIT_PATH is defined further
+	// down; compare against the literal here.)
+	{
+		static const char esc[] = "/Volumes/SystemRoot";
+		int el = (int)sizeof(esc) - 1;
+		if (strncmp(guest, esc, el) == 0 && (guest[el] == '\0' || guest[el] == '/'))
+			return 0;
+	}
 
 	if (!eunion_manage(guest))
 		return 0;
@@ -758,6 +769,61 @@ int vchroot_prepare_write_fd(int fd, char* out, int cap)
 		return -LINUX_ENAMETOOLONG;
 	memcpy(out, guest, gl + 1);
 	return gl;
+}
+
+#ifndef LINUX_O_NOFOLLOW
+#define LINUX_O_NOFOLLOW 0400000 // Linux O_NOFOLLOW (x86); re-open the object itself
+#endif
+// High-level helper for the fd-metadata syscall sites (fchmod/fchmod_extended/
+// futimes/fsetxattr/fremovexattr). A metadata op on an fd has no path, so if the
+// fd was opened on a lower-only object the op hits the SHARED template. This
+// copies the object up (via vchroot_prepare_write_fd) and RE-OPENS the upper copy,
+// returning a fresh fd the caller must apply the op to -- the original fd still
+// references the lower inode after copy-up, so mutating it would still corrupt the
+// template.
+//
+// Caller contract (uniform): apply the metadata op to the RETURNED fd, and close
+// the returned fd iff it differs from the original.
+//
+// Returns:
+//   == fd            -> not union-managed / fd escapes the union; caller uses the
+//                       ORIGINAL fd and must NOT close it here.
+//   >= 0 and != fd   -> a fresh fd on the upper copy (after copy-up if the object
+//                       was lower-only; for an already-upper object this just
+//                       re-opens the same upper inode). Caller applies the op to
+//                       it and MUST close it when done.
+//   < 0              -> negative Linux errno.
+int vchroot_fd_for_meta_write(int fd)
+{
+	char guest[4096];
+	int r = vchroot_prepare_write_fd(fd, guest, sizeof(guest));
+	if (r < 0)
+		return r;          // negative errno
+	if (r == 0)
+		return fd;         // unmanaged / escape / no path: use the original fd
+
+	// The object was copied up; guest now resolves to the UPPER copy. The caller's
+	// original fd still references the LOWER inode, so re-open the upper copy and
+	// hand back a fresh fd. Expand the guest path (resolves to upper after copy-up)
+	// and open it. O_RDONLY is sufficient on Linux for fchmod/utimensat/fsetxattr/
+	// fremovexattr (they check inode perms, not the fd's open mode). O_NOFOLLOW so
+	// we mutate the object itself, never a symlink target.
+	struct vchroot_expand_args vc;
+	vc.flags = 0;          // do not follow the final symlink
+	vc.dfd = -100;         // AT_FDCWD-equivalent; guest is absolute
+	int gl = (int)strlen(guest);
+	if (gl + 1 > (int)sizeof(vc.path))
+		return -LINUX_ENAMETOOLONG;
+	memcpy(vc.path, guest, gl + 1);
+	int er = vchroot_expand(&vc);
+	if (er < 0)
+		return er;
+
+	int nfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, vc.path,
+		LINUX_O_RDONLY | LINUX_O_NOFOLLOW, 0);
+	if (nfd < 0)
+		return nfd;
+	return nfd;            // != fd: caller applies the op to nfd and closes it
 }
 
 // BEFORE an unlink/rmdir: decide the union policy and tell the caller whether to
