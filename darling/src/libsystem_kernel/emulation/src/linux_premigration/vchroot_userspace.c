@@ -1407,6 +1407,27 @@ int vchroot_fdpath(struct vchroot_fdpath_args* args)
 		if (args->path[0] == '\0')
 			strcpy(args->path, "/");
 	}
+#ifdef EUNION
+	// E-UNION: a fd may resolve into the read-only LOWER template, which lives
+	// OUTSIDE the prefix (at libexec_path). Detranslate it to the guest path too
+	// -- otherwise it falls through to the EXIT_PATH escape hatch and yields a
+	// bogus /Volumes/SystemRoot/<host-template-path> guest path. launchctl uses
+	// F_GETPATH on the System/Library/LaunchDaemons dir fd (which resolves to the
+	// lower template) to build child plist paths; the escape-hatch path makes
+	// every plist lookup fail, so no daemons load and `bootstrap -S System`
+	// stalls on services that never check in.
+	else if (libexec_path_len > 0 && rv >= libexec_path_len
+	         && strncmp(link, libexec_path, libexec_path_len) == 0
+	         && (link[libexec_path_len] == '/' || link[libexec_path_len] == '\0'))
+	{
+		if (args->maxlen-1 < rv - libexec_path_len)
+			return -LINUX_ENAMETOOLONG;
+		strcpy(args->path, link + libexec_path_len);
+
+		if (args->path[0] == '\0')
+			strcpy(args->path, "/");
+	}
+#endif
 	else
 	{
 		if (args->maxlen < sizeof(EXIT_PATH) + rv)
@@ -1433,6 +1454,21 @@ int vchroot_unexpand(struct vchroot_unexpand_args* args)
 		if (args->path[0] == '\0')
 			strcpy(args->path, "/");
 	}
+#ifdef EUNION
+	// E-UNION: a host path under the read-only LOWER template detranslates to the
+	// guest path too (see vchroot_fdpath). Without this it escapes through
+	// EXIT_PATH to a bogus /Volumes/SystemRoot/<template-path> guest path.
+	else if (libexec_path_len > 0
+	         && memcmp(args->path, libexec_path, libexec_path_len) == 0
+	         && (args->path[libexec_path_len] == '/' || args->path[libexec_path_len] == '\0'))
+	{
+		int bytes = strlen(args->path + libexec_path_len) + 1;
+		memmove(args->path, args->path + libexec_path_len, bytes);
+
+		if (args->path[0] == '\0')
+			strcpy(args->path, "/");
+	}
+#endif
 	else
 	{
 		int bytes = strlen(args->path) + 1;
