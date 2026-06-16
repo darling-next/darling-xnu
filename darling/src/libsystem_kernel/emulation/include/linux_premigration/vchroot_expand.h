@@ -36,6 +36,12 @@ int vchroot_copyup_tree(const char* guest);
 int vchroot_whiteout(const char* guest);
 int vchroot_unwhiteout(const char* guest);
 int vchroot_set_opaque(const char* guest);
+// AFTER a successful mkdir over a name that shadows a LOWER directory: mark the
+// new upper dir opaque so the stale lower children are not re-merged (delete-
+// recreate of a populated dir must not resurrect its old contents). No-op when
+// the name has no lower directory namesake. Call from the mkdir site after the
+// host mkdir returns success.
+int vchroot_post_mkdir(const char* guest);
 // Marker-namespace isolation: 1 if `name` is in the reserved `user.union.*`
 // overlay-private namespace. The xattr syscall sites use this to reject guest
 // attempts to forge a marker (setxattr/removexattr -> EPERM) and to hide markers
