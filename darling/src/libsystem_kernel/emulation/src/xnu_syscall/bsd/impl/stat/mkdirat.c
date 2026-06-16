@@ -45,5 +45,18 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
+#ifdef EUNION
+	// If the new dir shadows a LOWER directory (delete-recreate of a populated
+	// dir), mark it opaque so the stale lower children are not re-merged. Only
+	// meaningful for an absolute guest path; best-effort (a failed opaque-set does
+	// not undo the successful mkdir, but the dir would then leak lower content --
+	// so surface the error to the caller).
+	if (path[0] == '/') {
+		int op = vchroot_post_mkdir(path);
+		if (op < 0)
+			return errno_linux_to_bsd(op);
+	}
+#endif
+
 	return 0;
 }
