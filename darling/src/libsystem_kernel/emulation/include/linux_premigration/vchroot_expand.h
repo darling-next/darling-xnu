@@ -29,6 +29,10 @@ int vchroot_fdpath(struct vchroot_fdpath_args* args);
 // E-UNION: writable-upper / read-only-lower union by path translation.
 // Copy-up / whiteout / opaque / merged-readdir primitives.
 int vchroot_copyup(const char* guest);
+// Recursive copy-up of a guest subtree (node + ALL descendants). Use for rename
+// of a lower-only directory, where the lazy dir-merge no longer applies after
+// the host moves the upper dir and whiteouts the source.
+int vchroot_copyup_tree(const char* guest);
 int vchroot_whiteout(const char* guest);
 int vchroot_unwhiteout(const char* guest);
 int vchroot_set_opaque(const char* guest);
@@ -42,6 +46,9 @@ void vchroot_dir_closed(int fd);
 //   vchroot_post_unlink(guest)   AFTER a successful unlink/rmdir;
 //   vchroot_pre_mkdir(guest)     BEFORE re-creating a possibly-deleted name.
 int vchroot_prepare_write(const char* guest);
+// *at() variant: resolve a dirfd-relative target to a guest-absolute path via
+// the dirfd, then prepare_write. For openat/mkdirat/etc. with a relative path.
+int vchroot_prepare_write_at(int dfd, const char* rel);
 int vchroot_post_unlink(const char* guest);
 int vchroot_pre_mkdir(const char* guest);
 #endif // EUNION

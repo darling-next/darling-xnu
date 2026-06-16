@@ -68,12 +68,14 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 #ifdef EUNION
 	// E-UNION: if this open writes/creates/truncates, materialize the target in
 	// the writable upper layer BEFORE expand so the real syscall never mutates the
-	// shared read-only template. Absolute guest paths only; relative/out-of-prefix
-	// is a no-op inside the helper. (Read-only opens are left alone.)
-	if (filename[0] == '/' &&
-	    ((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
+	// shared read-only template. Handles BOTH absolute paths and dirfd-relative
+	// paths (openat into a lower-only dir): prepare_write_at resolves the dirfd to
+	// a guest path and joins the relative target. (Read-only opens are left alone.)
+	if (((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
 	     (flags & BSD_O_CREAT) || (flags & BSD_O_TRUNC))) {
-		int wr = vchroot_prepare_write(filename);
+		int wr = (filename[0] == '/')
+			? vchroot_prepare_write(filename)
+			: vchroot_prepare_write_at(atfd(fd), filename);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
 	}
