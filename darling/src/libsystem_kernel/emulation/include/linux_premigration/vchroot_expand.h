@@ -49,6 +49,23 @@ int vchroot_prepare_write(const char* guest);
 // *at() variant: resolve a dirfd-relative target to a guest-absolute path via
 // the dirfd, then prepare_write. For openat/mkdirat/etc. with a relative path.
 int vchroot_prepare_write_at(int dfd, const char* rel);
+// fd variant for metadata ops (fchmod/futimes/fsetxattr) on a possibly-lower fd:
+// recovers the fd's guest path, copies it up, returns the guest path in `out`
+// (len > 0) so the caller can re-open the upper copy. 0 = not union-managed.
+int vchroot_prepare_write_fd(int fd, char* out, int cap);
+// BEFORE unlink/rmdir: decide policy and tell the caller whether to run the host
+// delete. The lower template is shared+live (not RO), so a lower-only name must
+// be hidden with a whiteout, never deleted on disk.
+#define VCHROOT_UNLINK_PROCEED 0  // caller runs the host delete
+#define VCHROOT_UNLINK_SKIP    1  // caller must NOT delete (whiteout already set)
+int vchroot_prepare_unlink(const char* guest);
+// BEFORE a rename destination is committed: copy up the dest's parent dir and
+// whiteout a lower-only dest namesake, so the host rename lands in the upper
+// layer and never moves into / overwrites the shared template.
+int vchroot_prepare_rename_dest(const char* guest);
+// BEFORE a create (mkdir/mknod/mkfifo/symlink): copy up the parent dir so the
+// new entry lands in the upper layer, and clear any whiteout at the new name.
+int vchroot_prepare_create(const char* guest);
 int vchroot_post_unlink(const char* guest);
 int vchroot_pre_mkdir(const char* guest);
 #endif // EUNION

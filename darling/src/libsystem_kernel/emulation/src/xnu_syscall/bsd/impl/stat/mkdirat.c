@@ -24,10 +24,14 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	vc.dfd = atfd(fd);
 
 #ifdef EUNION
-	// mkdir over a previously-deleted name must clear its whiteout so the new
-	// dir is visible in the merged view.
-	if (path[0] == '/')
-		vchroot_pre_mkdir(path);
+	// copy up the parent dir (so the new dir lands in the upper layer, not the
+	// shared template) and clear any whiteout at the new name (mkdir over a
+	// previously-deleted name resurrects it).
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_create(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
 #endif
 
 	strcpy(vc.path, path);
