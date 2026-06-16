@@ -649,6 +649,36 @@ int vchroot_unwhiteout(const char* guest)
 	return 0;
 }
 
+// AFTER a successful mkdir: if the new name shadows a LOWER directory, the freshly
+// created upper dir must be made opaque, or the resolver/readdir would re-merge the
+// stale lower children (delete-recreate of a populated dir resurrects its old
+// contents). Set opaque ONLY when the lower namesake is itself a directory -- a
+// brand-new name with no lower dir namesake needs no marker (an opaque empty dir is
+// harmless but pointless, and we avoid touching the upper for the common case).
+// Must run AFTER the mkdir (vchroot_set_opaque copies the dir up, which only exists
+// post-mkdir). No-op when unmanaged or when nothing shadows a lower dir.
+int vchroot_post_mkdir(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+
+	// Does the new name shadow a LOWER directory? Only then is opacity needed --
+	// a mkdir of a brand-new name (no lower namesake, or a lower non-dir namesake)
+	// has nothing to mask.
+	char lo[4096];
+	if (eunion_host_path(libexec_path, libexec_path_len, guest, lo, sizeof(lo)) < 0)
+		return -LINUX_ENAMETOOLONG;
+	stat_t lst;
+	if (eunion_lstat(lo, &lst) != 0)
+		return 0; // no lower namesake: nothing to mask
+	if ((lst.st_mode & LINUX_S_IFMT) != LINUX_S_IFDIR)
+		return 0; // lower namesake is not a dir: no dir-merge to suppress
+
+	// The new upper dir shadows a populated lower dir. Mark it opaque so the stale
+	// lower children are not re-merged into the recreated dir.
+	return vchroot_set_opaque(guest);
+}
+
 // Mark an upper directory opaque so its lower namesake is not merged.
 int vchroot_set_opaque(const char* guest)
 {
