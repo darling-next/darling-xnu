@@ -530,6 +530,28 @@ int vchroot_copyup_tree(const char* guest)
 static const char EUNION_WH_XATTR[]     = "user.union.whiteout";
 static const char EUNION_OPAQUE_XATTR[] = "user.union.opaque";
 
+// E-UNION reserves the `user.union.` xattr namespace for its own overlay-private
+// markers (whiteout/opaque). The guest must never be able to FORGE a marker (a
+// setxattr/removexattr that would fabricate or clear a whiteout/opaque and so
+// resurrect a deleted name or unhide a lower subtree), nor OBSERVE one (a
+// getxattr/listxattr that would leak the union's internal bookkeeping). The
+// syscall-emulation xattr sites call this predicate to reject (set/remove ->
+// EPERM) or hide (get -> ENOATTR, list -> filtered) any name in the namespace.
+// Returns 1 if `name` is in the reserved `user.union.` namespace, else 0.
+static const char EUNION_MARKER_NS[] = "user.union.";
+int vchroot_xattr_is_marker(const char* name)
+{
+	if (!name)
+		return 0;
+	// Reserved iff the name begins with the full "user.union." namespace prefix
+	// (the trailing dot is significant: "user.unionX" is a distinct guest-legal
+	// name, NOT a marker). strncmp over the prefix length tests exactly that
+	// boundary -- a bare "user.union" or "user.unionX" both differ before or at
+	// the dot and so are not matched.
+	int nslen = (int)sizeof(EUNION_MARKER_NS) - 1; // strlen("user.union.")
+	return strncmp(name, EUNION_MARKER_NS, nslen) == 0;
+}
+
 #ifndef LINUX_O_DIRECTORY
 #define LINUX_O_DIRECTORY 0200000
 #endif
