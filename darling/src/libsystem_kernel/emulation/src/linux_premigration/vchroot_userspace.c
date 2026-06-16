@@ -250,11 +250,13 @@ static int eunion_mkparents_upper(const char* guest)
 	return 0;
 }
 
-// Copy all extended attributes from src fd to dst fd. overlay/gVisor preserve
-// xattrs on copy-up (security.capability is a MUST-copy so file capabilities
-// survive; user.* carry app metadata). Overlay-private markers (our
-// user.union.*) are never present on a lower-layer source, so no filtering is
-// needed here. Best-effort: a failure to copy one xattr does not fail copy-up.
+// Copy extended attributes from src fd to dst fd on copy-up (user.* carry app
+// metadata). We DROP security.capability: a file capability is setuid-equivalent,
+// and a copy-up must not smuggle privilege into the writable prefix (overlay's
+// userxattr mode and gVisor both clear it on a data copy-up). Overlay-private
+// markers (our user.union.*) are never present on a lower-layer source, so they
+// need no filtering. Best-effort: a failure to copy one xattr does not fail
+// copy-up.
 static void eunion_copy_xattrs(int sfd, int dfd)
 {
 #if defined(__NR_flistxattr) && defined(__NR_fgetxattr) && defined(__NR_fsetxattr)
@@ -270,6 +272,11 @@ static void eunion_copy_xattrs(int sfd, int dfd)
 		int nlen = (int)strlen(name);
 		if (nlen == 0) { off++; continue; }
 		off += nlen + 1;
+		// Drop security.capability: a file capability is setuid-equivalent, so a
+		// copy-up must not carry it into the writable prefix (matches the setid
+		// strip above; overlay/gVisor clear it on data copy-up).
+		if (strcmp(name, "security.capability") == 0)
+			continue;
 		int vn = LINUX_SYSCALL(__NR_fgetxattr, sfd, name, val, sizeof(val));
 		if (vn < 0)
 			continue;
@@ -325,7 +332,18 @@ static int eunion_copy_regular(const char* src_host, const char* dst_host, unsig
 			off += w;
 		}
 	}
-	// carry xattrs over before publishing (while both fds are open)
+	// Force the upper copy's mode to the permission bits with setid STRIPPED,
+	// independent of how the host honors the open() create mode. open(O_CREAT)
+	// does not reliably reproduce S_ISUID/S_ISGID across filesystems, so the
+	// `& 0777` create mode above is not a dependable defense on its own. An
+	// explicit fchmod makes the strip load-bearing and FS-independent: a copy-up
+	// must NEVER publish a setid binary into the writable prefix (overlay/gVisor
+	// clear setid on a data copy-up). (mode & 0777 == permission bits only.)
+	if (rv == 0)
+		LINUX_SYSCALL(__NR_fchmod, dfd, mode & 0777);
+	// carry xattrs over before publishing (while both fds are open). NOTE:
+	// eunion_copy_xattrs deliberately drops security.capability so a file
+	// capability cannot survive a copy-up either (it is setuid-equivalent).
 	eunion_copy_xattrs(sfd, dfd);
 done:
 	LINUX_SYSCALL(__NR_close, sfd);
