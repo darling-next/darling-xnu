@@ -36,6 +36,11 @@ int vchroot_copyup_tree(const char* guest);
 int vchroot_whiteout(const char* guest);
 int vchroot_unwhiteout(const char* guest);
 int vchroot_set_opaque(const char* guest);
+// Marker-namespace isolation: 1 if `name` is in the reserved `user.union.*`
+// overlay-private namespace. The xattr syscall sites use this to reject guest
+// attempts to forge a marker (setxattr/removexattr -> EPERM) and to hide markers
+// from the guest (getxattr -> ENOATTR, listxattr -> filtered out).
+int vchroot_xattr_is_marker(const char* name);
 int vchroot_readdir_merge(const char* guest, char* out, int cap);
 // Paged merged getdents for getdirentries (per-fd state); vchroot_dir_closed
 // MUST be called from close()/closedir() so the per-fd state is freed.
