@@ -53,6 +53,12 @@ int vchroot_prepare_write_at(int dfd, const char* rel);
 // recovers the fd's guest path, copies it up, returns the guest path in `out`
 // (len > 0) so the caller can re-open the upper copy. 0 = not union-managed.
 int vchroot_prepare_write_fd(int fd, char* out, int cap);
+// High-level fd-metadata helper: copy up the fd's object if lower-only and return
+// a FRESH fd on the upper copy (caller applies the metadata op to it and closes
+// it). Returns the ORIGINAL fd unchanged if unmanaged/escape/no-copyup (caller
+// keeps using it, does not close it), or a negative errno. Used by fchmod/
+// fchmod_extended/futimes/fsetxattr/fremovexattr.
+int vchroot_fd_for_meta_write(int fd);
 // BEFORE unlink/rmdir: decide policy and tell the caller whether to run the host
 // delete. The lower template is shared+live (not RO), so a lower-only name must
 // be hidden with a whiteout, never deleted on disk.
