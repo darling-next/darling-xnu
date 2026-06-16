@@ -707,6 +707,169 @@ int vchroot_prepare_write_at(int dfd, const char* rel)
 	return vchroot_prepare_write(guest);
 }
 
+// fd variant: a metadata op on an fd (fchmod/futimes/fsetxattr) has no path. If
+// the fd was opened on a lower-only object the inode is the template's; mutating
+// via the fd hits the shared template. Recover the fd's guest path, copy it up,
+// and return the guest path in `out` so the caller can RE-OPEN the upper copy and
+// retarget the op (the original fd still references the lower inode). Returns the
+// guest-path length (>0) on success, 0 if unmanaged / the fd escapes the union
+// (caller proceeds with the original fd), or a negative errno.
+int vchroot_prepare_write_fd(int fd, char* out, int cap)
+{
+	if (!out || cap <= 0)
+		return 0; // no buffer to return a path in: caller proceeds with the fd
+	out[0] = '\0';
+
+	char guest[4096];
+	struct vchroot_fdpath_args fp;
+	fp.fd = fd; fp.path = guest; fp.maxlen = sizeof(guest);
+	if (vchroot_fdpath(&fp) < 0)
+		return 0; // cannot map the fd: proceed with the original fd
+	if (guest[0] != '/')
+		return 0; // fd escapes the guest (EXIT_PATH): not union-managed
+
+	if (!eunion_manage(guest))
+		return 0;
+
+	int r = vchroot_prepare_write(guest);
+	if (r < 0)
+		return r;
+
+	int gl = (int)strlen(guest);
+	if (gl + 1 > cap)
+		return -LINUX_ENAMETOOLONG;
+	memcpy(out, guest, gl + 1);
+	return gl;
+}
+
+// BEFORE an unlink/rmdir: decide the union policy and tell the caller whether to
+// run the host delete syscall. The lower template is a SHARED live directory
+// (not a read-only mount), so a delete that reaches a lower host path would
+// physically remove the object from the template for EVERY prefix. We must never
+// let the real syscall touch a lower-only name.
+//
+//   lower-only name  -> drop a whiteout, return VCHROOT_UNLINK_SKIP: the caller
+//                       must NOT call the host syscall (the name is now hidden).
+//   upper present    -> return VCHROOT_UNLINK_PROCEED: the caller deletes the
+//                       upper object, then calls vchroot_post_unlink() to drop a
+//                       whiteout if the name also exists in the template.
+//   absent in both / unmanaged -> VCHROOT_UNLINK_PROCEED (let the syscall ENOENT
+//                       naturally; nothing to hide).
+int vchroot_prepare_unlink(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return VCHROOT_UNLINK_PROCEED;
+
+	// upper object present? then the real delete targets the upper copy -> proceed
+	char up[4096];
+	if (eunion_host_path(prefix_path, prefix_path_len, guest, up, sizeof(up)) < 0)
+		return -LINUX_ENAMETOOLONG;
+	stat_t ust;
+	if (eunion_lstat(up, &ust) == 0)
+		return VCHROOT_UNLINK_PROCEED; // delete the upper; post_unlink handles lower
+
+	// no upper object. is it in the lower template?
+	char lo[4096];
+	if (eunion_host_path(libexec_path, libexec_path_len, guest, lo, sizeof(lo)) < 0)
+		return -LINUX_ENAMETOOLONG;
+	stat_t lst;
+	if (eunion_lstat(lo, &lst) != 0)
+		return VCHROOT_UNLINK_PROCEED; // absent in both: let the syscall ENOENT
+
+	// lower-only: NEVER delete from the shared template. Hide it with a whiteout
+	// and tell the caller to skip the host delete entirely.
+	int r = vchroot_whiteout(guest);
+	if (r < 0)
+		return r;
+	return VCHROOT_UNLINK_SKIP;
+}
+
+// Copy the guest path's PARENT directory up into the writable upper layer. Used
+// before a create/rename so the new entry lands in the upper, not the template.
+// No-op success if there is no parent (root) or the path is unmanaged.
+static int eunion_copyup_parent(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+	// find the last '/'
+	int last = -1;
+	for (int i = 0; guest[i]; i++)
+		if (guest[i] == '/') last = i;
+	if (last <= 0)
+		return 0; // parent is "/" (root): always present in upper
+	char parent[4096];
+	if (last >= (int)sizeof(parent))
+		return -LINUX_ENAMETOOLONG;
+	memcpy(parent, guest, last);
+	parent[last] = '\0';
+	int r = vchroot_copyup(parent);
+	return (r == -LINUX_ENOENT) ? 0 : r; // absent-in-both parent: a create makes it
+}
+
+// BEFORE a rename's DESTINATION is committed: ensure the move lands in the upper
+// layer and never mutates the shared template.
+//   * copy up the destination's PARENT dir (if lower-only, the expanded dest
+//     would otherwise point into the template and the host rename would move
+//     INTO it);
+//   * if the destination NAME exists only in the lower template, whiteout it so
+//     the old template content is hidden once the renamed object takes the name
+//     (the host rename targets the upper path; the lower namesake stays on disk
+//     but must be masked).
+//   * if a whiteout already sits at the dest, clear it (the rename recreates it).
+int vchroot_prepare_rename_dest(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+
+	int r = eunion_copyup_parent(guest);
+	if (r < 0)
+		return r;
+
+	// a stale whiteout at the dest must be cleared so the moved object is visible
+	if (eunion_is_whiteout(guest))
+	{
+		r = vchroot_unwhiteout(guest);
+		if (r < 0)
+			return r;
+		return 0; // it was deleted; nothing in the template to mask
+	}
+
+	// dest present in the upper already? the host rename overwrites it -> fine
+	char up[4096];
+	if (eunion_host_path(prefix_path, prefix_path_len, guest, up, sizeof(up)) < 0)
+		return -LINUX_ENAMETOOLONG;
+	stat_t ust;
+	if (eunion_lstat(up, &ust) == 0)
+		return 0;
+
+	// dest only in the lower template: mask it with a whiteout so the old content
+	// does not show through after the rename publishes the new upper object.
+	char lo[4096];
+	if (eunion_host_path(libexec_path, libexec_path_len, guest, lo, sizeof(lo)) < 0)
+		return -LINUX_ENAMETOOLONG;
+	stat_t lst;
+	if (eunion_lstat(lo, &lst) == 0)
+		return vchroot_whiteout(guest);
+
+	return 0; // absent in both: a plain create-in-upper
+}
+
+// BEFORE creating a new entry (mkdir/mknod/mkfifo/symlink/...): ensure the
+// PARENT dir lives in the writable upper layer (else the create lands inside the
+// shared template) and clear any whiteout at the new name (an explicit create
+// resurrects a previously deleted name). Does NOT create the entry itself.
+int vchroot_prepare_create(const char* guest)
+{
+	if (!eunion_manage(guest))
+		return 0;
+	int r = eunion_copyup_parent(guest);
+	if (r < 0)
+		return r;
+	if (eunion_is_whiteout(guest))
+		return vchroot_unwhiteout(guest);
+	return 0;
+}
+
 // After a successful unlink/rmdir of the upper object: if the name still exists
 // in the lower template, drop a whiteout so it stays deleted. If it was
 // upper-only (absent from lower), do nothing -- the unlink already removed it.

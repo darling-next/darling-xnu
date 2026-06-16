@@ -78,6 +78,14 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 			: vchroot_prepare_write_at(atfd(fd), filename);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
+		// O_CREAT of a new file in a lower-only directory: prepare_write is a
+		// no-op for an absent target, so also copy up the PARENT dir, or the
+		// create lands inside the shared template. (Absolute paths only.)
+		if ((flags & BSD_O_CREAT) && filename[0] == '/') {
+			wr = vchroot_prepare_create(filename);
+			if (wr < 0)
+				return errno_linux_to_bsd(wr);
+		}
 	}
 #endif
 
