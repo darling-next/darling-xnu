@@ -1012,6 +1012,83 @@ int vchroot_prepare_unlink(const char* guest)
 	return VCHROOT_UNLINK_SKIP;
 }
 
+// Materialize a guest DIRECTORY path in the upper layer, following any symlink at
+// the final component to its REAL target dir. A create lands at <parent>/<leaf>,
+// and the kernel resolves the parent's symlinks before creating; so it is not
+// enough to copy up a symlinked parent as a symlink -- the link's TARGET dir must
+// also exist in the upper, or open(O_CREAT) follows the upper symlink into a
+// directory that is absent from the upper layer and fails ENOENT. (Real example:
+// /tmp -> private/tmp; `touch /tmp/x` copied up the /tmp symlink but never
+// materialized private/tmp.) Resolves a chain of dir symlinks (bounded), copying
+// up each link and finally its target real dir. Returns 0 on success (or if the
+// path is absent in both layers -- the create will make it), negative on error.
+static int eunion_copyup_dir_resolved(const char* dir)
+{
+	char cur[4096];
+	int n = (int)strlen(dir);
+	if (n + 1 > (int)sizeof(cur))
+		return -LINUX_ENAMETOOLONG;
+	memcpy(cur, dir, n + 1);
+
+	// bound symlink chains (same limit as the resolver's MAX_SYMLINK_DEPTH, which
+	// is defined later in the file).
+	#define EUNION_MAX_DIR_SYMLINK_HOPS 10
+	for (int hop = 0; hop <= EUNION_MAX_DIR_SYMLINK_HOPS; hop++)
+	{
+		// copy up this path component as-is (a symlink copies up as a symlink;
+		// a real dir copies up as a dir). Absent-in-both -> the create makes it.
+		int r = vchroot_copyup(cur);
+		if (r < 0 && r != -LINUX_ENOENT)
+			return r;
+
+		// inspect the LOWER object to see if it is a symlink we must follow.
+		char lo[4096];
+		if (eunion_host_path(libexec_path, libexec_path_len, cur, lo, sizeof(lo)) < 0)
+			return -LINUX_ENAMETOOLONG;
+		stat_t lst;
+		if (eunion_lstat(lo, &lst) != 0)
+			return 0; // not in the template: nothing more to resolve
+		if ((lst.st_mode & LINUX_S_IFMT) != LINUX_S_IFLNK)
+			return 0; // a real dir (or file): done
+
+		// read the symlink target and rebase it to a guest-absolute dir path.
+		char link[4096];
+		#if defined(__NR_readlink)
+			int ln = LINUX_SYSCALL(__NR_readlink, lo, link, sizeof(link) - 1);
+		#else
+			int ln = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, lo, link, sizeof(link) - 1);
+		#endif
+		if (ln < 0)
+			return ln;
+		link[ln] = '\0';
+
+		char next[4096];
+		if (link[0] == '/')
+		{
+			// absolute target: it is already a guest-absolute path
+			if (ln + 1 > (int)sizeof(next))
+				return -LINUX_ENAMETOOLONG;
+			memcpy(next, link, ln + 1);
+		}
+		else
+		{
+			// relative target: resolve against cur's PARENT dir
+			int slash = -1;
+			for (int i = 0; cur[i]; i++)
+				if (cur[i] == '/') slash = i;
+			int base = (slash <= 0) ? 0 : slash; // keep leading '/'; "" if root-level
+			if (base + 1 + ln + 1 > (int)sizeof(next))
+				return -LINUX_ENAMETOOLONG;
+			memcpy(next, cur, base);
+			next[base] = '/';
+			memcpy(next + base + 1, link, ln + 1);
+		}
+		// loop to materialize the (possibly again-symlinked) target dir
+		memcpy(cur, next, strlen(next) + 1);
+	}
+	return -LINUX_ELOOP; // too many symlink hops
+}
+
 // Copy the guest path's PARENT directory up into the writable upper layer. Used
 // before a create/rename so the new entry lands in the upper, not the template.
 // No-op success if there is no parent (root) or the path is unmanaged.
@@ -1030,8 +1107,11 @@ static int eunion_copyup_parent(const char* guest)
 		return -LINUX_ENAMETOOLONG;
 	memcpy(parent, guest, last);
 	parent[last] = '\0';
-	int r = vchroot_copyup(parent);
-	return (r == -LINUX_ENOENT) ? 0 : r; // absent-in-both parent: a create makes it
+	// Resolve symlinks at the parent so the link's REAL target dir is materialized
+	// in the upper layer, not just a symlink pointing at an absent target (else a
+	// create through the symlinked parent would ENOENT). eunion_copyup_dir_resolved
+	// already treats absent-in-both as success (the create makes it).
+	return eunion_copyup_dir_resolved(parent);
 }
 
 // BEFORE a rename's DESTINATION is committed: ensure the move lands in the upper
