@@ -71,6 +71,22 @@ static char prefix_path[4096] = {0}; // MUST NOT end with '/'
 static int prefix_path_len = -1;
 
 #ifdef EUNION
+// ============================ E-UNION provenance ============================
+// The E-UNION code in this file (all #ifdef EUNION blocks: union resolve,
+// copy-up, whiteout/opaque, readdir-merge, template protection) is new C written
+// for Darling and is covered by this file's existing license. No third-party
+// source code is copied or translated in. The union/copy-up/whiteout/merge
+// ALGORITHMS are independently reimplemented from concepts in:
+//   * gVisor overlay (Apache-2.0) -- https://github.com/google/gvisor
+//       pkg/sentry/fsimpl/overlay/{copy_up,directory,overlay}.go. gVisor is Go;
+//       this is C over raw Linux syscalls with a different cross-process
+//       atomicity model, i.e. an independent reimplementation of the idea, not a
+//       derivative of gVisor's code. Cited inline below for auditability.
+//   * Linux overlayfs docs (Documentation/filesystems/overlayfs.rst) -- semantics.
+// PRoot (GPL-2, https://github.com/proot-me/proot) was reviewed but NO PRoot code
+// or design is used here; the path engine is Darling's own vchroot.
+// ===========================================================================
+//
 // E-UNION (dar-test-infra-sp5.8.4.4): shared read-only system template that
 // the writable per-prefix layer (prefix_path) is unioned over. When a guest
 // path is absent in prefix_path it falls back to libexec_path. Empty/unset
