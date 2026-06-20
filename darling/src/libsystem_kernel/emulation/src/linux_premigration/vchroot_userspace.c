@@ -862,6 +862,9 @@ int vchroot_prepare_write_fd(int fd, char* out, int cap)
 #ifndef LINUX_O_NOFOLLOW
 #define LINUX_O_NOFOLLOW 0400000 // Linux O_NOFOLLOW (x86); re-open the object itself
 #endif
+#ifndef LINUX_O_RDWR
+#define LINUX_O_RDWR 02 // Linux O_RDWR; for content-mutating fd ops (ftruncate)
+#endif
 // High-level helper for the fd-metadata syscall sites (fchmod/fchmod_extended/
 // futimes/fsetxattr/fremovexattr). A metadata op on an fd has no path, so if the
 // fd was opened on a lower-only object the op hits the SHARED template. This
@@ -909,6 +912,43 @@ int vchroot_fd_for_meta_write(int fd)
 
 	int nfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, vc.path,
 		LINUX_O_RDONLY | LINUX_O_NOFOLLOW, 0);
+	if (nfd < 0)
+		return nfd;
+	return nfd;            // != fd: caller applies the op to nfd and closes it
+}
+
+// High-level helper for CONTENT-mutating fd ops (ftruncate). Identical to
+// vchroot_fd_for_meta_write but re-opens the upper copy O_RDWR: unlike fchmod/
+// utimensat/fsetxattr (which only check inode perms and work on an O_RDONLY fd),
+// ftruncate REQUIRES a writable fd (an O_RDONLY fd yields EINVAL). Copy up the
+// fd's object if lower-only and hand back a FRESH writable fd on the upper copy
+// (caller applies the op and closes it). Returns the ORIGINAL fd unchanged if
+// unmanaged/escape/no-copyup, or a negative errno.
+int vchroot_fd_for_content_write(int fd)
+{
+	char guest[4096];
+	int r = vchroot_prepare_write_fd(fd, guest, sizeof(guest));
+	if (r < 0)
+		return r;          // negative errno
+	if (r == 0)
+		return fd;         // unmanaged / escape / no path: use the original fd
+
+	// Copied up; guest now resolves to the UPPER copy. Re-open it O_RDWR so the
+	// caller's content op (ftruncate) has a writable fd. O_NOFOLLOW so we mutate
+	// the object itself, never a symlink target.
+	struct vchroot_expand_args vc;
+	vc.flags = 0;          // do not follow the final symlink
+	vc.dfd = -100;         // AT_FDCWD-equivalent; guest is absolute
+	int gl = (int)strlen(guest);
+	if (gl + 1 > (int)sizeof(vc.path))
+		return -LINUX_ENAMETOOLONG;
+	memcpy(vc.path, guest, gl + 1);
+	int er = vchroot_expand(&vc);
+	if (er < 0)
+		return er;
+
+	int nfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, vc.path,
+		LINUX_O_RDWR | LINUX_O_NOFOLLOW, 0);
 	if (nfd < 0)
 		return nfd;
 	return nfd;            // != fd: caller applies the op to nfd and closes it
