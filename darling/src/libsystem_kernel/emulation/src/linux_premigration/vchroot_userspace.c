@@ -46,16 +46,10 @@ typedef struct stat stat_t;
 
 typedef struct linux_stat stat_t;
 
-struct _xlocale;
-typedef struct _xlocale* locale_t;
-
-#define LC_C_LOCALE ((locale_t)NULL)
-
 extern __SIZE_TYPE__ strlen(const char* s);
 extern char* strcpy(char* dest, const char* src);
 extern int strcmp(const char* str1, const char* str2);
 extern int strncmp(const char* str1, const char* str2, __SIZE_TYPE__ n);
-extern int strncasecmp_l(const char* str1, const char* str2, __SIZE_TYPE__ n, locale_t locale);
 extern int strcasecmp(const char* str1, const char* str2);
 extern char* strcat(char* dest, const char* src);
 extern char *strchr(const char *s, int c);
@@ -1439,6 +1433,28 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 
 static const char EXIT_PATH[] = "/Volumes/SystemRoot";
 
+// ASCII case-insensitive compare of the first n bytes, with NO dependency on a
+// locale_t. The EXIT_PATH escape-hatch check used strncasecmp_l(..., LC_C_LOCALE)
+// where LC_C_LOCALE is ((locale_t)NULL); glibc's strncasecmp_l DEREFERENCES the
+// locale once the compared bytes match, so a NULL locale SEGVs precisely when the
+// path equals EXIT_PATH. EXIT_PATH is a pure-ASCII literal, so the case-fold (kept
+// because the prefix is matched case-insensitively, like HFS+) needs no locale at
+// all -- fold ASCII A-Z here and avoid the deref entirely. Returns 0 on equal.
+static int eunion_ascii_ncasecmp(const char* a, const char* b, __SIZE_TYPE__ n)
+{
+	for (__SIZE_TYPE__ i = 0; i < n; i++) {
+		unsigned char ca = (unsigned char) a[i];
+		unsigned char cb = (unsigned char) b[i];
+		if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+		if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+		if (ca != cb)
+			return (int) ca - (int) cb;
+		if (ca == '\0')
+			break; // both NUL at the same spot -> equal so far, stop
+	}
+	return 0;
+}
+
 #ifndef TEST
 #ifdef VARIANT_DYLD
 #define icase_enabled false
@@ -1946,7 +1962,10 @@ ignore_symlink:
 
 				if (ctxt->current_root_len > 0 && ctxt->current_path_len - ctxt->current_root_len == sizeof(EXIT_PATH)-1)
 				{
-					if (strncasecmp_l(ctxt->current_path + ctxt->current_root_len, EXIT_PATH, sizeof(EXIT_PATH) - 1, LC_C_LOCALE) == 0)
+					// locale-free ASCII case-fold compare: the old strncasecmp_l(...,
+					// LC_C_LOCALE=NULL) deref'd a NULL locale on glibc the instant the
+					// bytes matched -- i.e. exactly here, when the escape hatch fires.
+					if (eunion_ascii_ncasecmp(ctxt->current_path + ctxt->current_root_len, EXIT_PATH, sizeof(EXIT_PATH) - 1) == 0)
 					{
 						// Switch to the real system root
 						ctxt->current_path[0] = '\0';
