@@ -14,6 +14,15 @@ extern char* strcpy(char* dst, const char* src);
 
 long sys_fchownat(int fd, const char* path, int uid, int gid, int flag)
 {
+	// E-UNION HAZARD (dar-test-infra-sp5.8.4.4.8): this stub is SAFE only because
+	// it is disabled (returns 0, no mutation). If it is ever un-stubbed, it becomes
+	// an immediate template-corruption path: the body below vchroot_expand()s the
+	// guest path and chowns it -- but for a lower-only target that expanded path is
+	// the shared LOWER template, so the chown mutates ownership for ALL prefixes.
+	// Before re-enabling, copy the target up first -- vchroot_prepare_write(path)
+	// (path-based copy-up, as the path-based write syscalls already do under EUNION)
+	// -- so vchroot_expand resolves to the writable UPPER copy. Mind AT_SYMLINK_*
+	// flags: copy up the link itself vs its target consistently with `flag`.
 #if 0
 	int ret;
 	struct vchroot_expand_args vc;
