@@ -70,6 +70,11 @@ int vchroot_prepare_write_fd(int fd, char* out, int cap);
 // keeps using it, does not close it), or a negative errno. Used by fchmod/
 // fchmod_extended/futimes/fsetxattr/fremovexattr.
 int vchroot_fd_for_meta_write(int fd);
+// High-level helper for CONTENT-mutating fd ops (ftruncate): like
+// vchroot_fd_for_meta_write but the returned fd is opened O_RDWR (ftruncate needs
+// a writable fd; an O_RDONLY fd yields EINVAL). Returns the original fd if
+// unmanaged, or a negative errno.
+int vchroot_fd_for_content_write(int fd);
 // BEFORE unlink/rmdir: decide policy and tell the caller whether to run the host
 // delete. The lower template is shared+live (not RO), so a lower-only name must
 // be hidden with a whiteout, never deleted on disk.
