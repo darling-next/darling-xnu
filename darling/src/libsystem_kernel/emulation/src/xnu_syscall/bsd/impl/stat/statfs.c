@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/stat/statfs.h>
 
 #include <stddef.h>
+#include <sys/errno.h>
 #include <sys/fcntl.h>
 
 #include <darling/emulation/conversion/stat/common.h>
@@ -39,6 +40,10 @@ long sys_statfs64(const char* path, struct bsd_statfs64* buf)
 	int max_len = 0;
 
 	struct vchroot_expand_args vc;
+
+	if (!path)
+		return -EFAULT;
+
 	vc.flags = 0;
 	vc.dfd = get_perthread_wd();
 
