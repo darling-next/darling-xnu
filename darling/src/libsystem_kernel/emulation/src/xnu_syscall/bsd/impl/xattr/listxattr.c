@@ -1,5 +1,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/listxattr.h>
 
+#include <sys/errno.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -16,6 +17,9 @@ long sys_listxattr(const char* path, char* namebuf, unsigned long size, int opti
 	vc.flags = (options & XATTR_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
 	
+	if (!path)
+		return -EFAULT;
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
