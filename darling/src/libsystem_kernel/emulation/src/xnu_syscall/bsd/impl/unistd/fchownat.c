@@ -22,6 +22,9 @@ long sys_fchownat(int fd, const char* path, int uid, int gid, int flag)
 	vc.flags = VCHROOT_FOLLOW;
 	vc.dfd = atfd(fd);
 	
+	if (!path)
+		return -EFAULT;
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
