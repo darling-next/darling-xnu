@@ -16,6 +16,9 @@ long sys_linkat(int fd, const char* path, int fdlink, const char* link, int flag
 	struct vchroot_expand_args vc, vc2;
 	int linux_flags;
 
+	if (!path || !link)
+		return -EFAULT;
+
 	vc.flags = (flag & BSD_AT_SYMLINK_FOLLOW) ? VCHROOT_FOLLOW : 0;
 	vc.dfd = atfd(fd);
 
