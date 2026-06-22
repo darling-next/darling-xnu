@@ -21,6 +21,9 @@ long sys_unlinkat(int fd, const char* path, int flag)
 	vc.flags = 0;
 	vc.dfd = atfd(fd);
 	
+	if (!path)
+		return -EFAULT;
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
