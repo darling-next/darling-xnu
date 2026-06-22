@@ -23,6 +23,9 @@ long sys_getxattr(const char* path, const char* name, char* value,
 	vc.flags = (options & XATTR_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
 
+	if (!path)
+		return -EFAULT;
+
 	strcpy(vc.path, path);
 	ret = vchroot_expand(&vc);
 
