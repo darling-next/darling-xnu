@@ -1,5 +1,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/chdir.h>
 
+#include <sys/errno.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -15,6 +16,9 @@ long sys_chdir(const char* path)
 	vc.flags = VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
 	
+	if (!path)
+		return -EFAULT;
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
