@@ -61,7 +61,13 @@ static void float_state_to_mcontext(const x86_float_state32_t* s, linux_fpregset
 static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, const void* fstate);
 static void state_to_kernel(struct linux_ucontext* ctxt, void* tstate, void* fstate);
 
-#define DEBUG_SIGEXC
+// DEBUG_SIGEXC routes every kern_printf() in the signal/suspend path through
+// __simple_kprintf(), which is a synchronous RPC round-trip to darlingserver.
+// The sigexc handler and its state save/restore helpers emit dozens of these
+// per signal (dump_gregs alone logs 23 lines), so leaving this on turns any
+// signal-heavy or suspend-heavy workload (e.g. a fork/exec storm) into a flood
+// of thousands of blocking RPCs that collapses guest throughput. Keep it off by
+// default; define it (e.g. via the build) only when actively debugging sigexc.
 #ifdef DEBUG_SIGEXC
 #define kern_printf(...) __simple_kprintf(__VA_ARGS__)
 #else
@@ -177,7 +183,7 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 
 	state_from_kernel(ctxt, &tstate, &fstate);
 	} else if (signum == SIGNAL_S2C) {
-		__simple_kprintf("sigexc: sigrt_handler S2C");
+		kern_printf("sigexc: sigrt_handler S2C");
 
 		int ret = dserver_rpc_s2c_perform();
 		if (ret < 0) {
