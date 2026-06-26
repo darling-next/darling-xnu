@@ -379,8 +379,18 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 						&sa, NULL,
 						sizeof(sa.sa_mask));
 
-				// Resend signal to self
-				LINUX_SYSCALL(__NR_kill, 0, linux_signum);
+				// Resend signal to self. NOTE: kill(0, sig) targets the
+				// CALLER'S ENTIRE PROCESS GROUP, not just this process, so a
+				// fatal default signal (e.g. SIGSEGV from a crashing conftest)
+				// would be broadcast to parent/sibling processes sharing the
+				// pgid and kill them too (observed: gnulib's printf-OOM conftest
+				// taking down its parent bash/configure with a spurious SI_USER
+				// SIGSEGV; dar-gwn.1.5 / dar-gwn.6.4). macOS terminates only the
+				// faulting process. Re-raise to THIS thread (raise() semantics)
+				// via tgkill(pid, tid, sig) so only this process is affected.
+				int self_pid = LINUX_SYSCALL(__NR_getpid);
+				int self_tid = LINUX_SYSCALL(__NR_gettid);
+				LINUX_SYSCALL(__NR_tgkill, self_pid, self_tid, linux_signum);
 			}
 		}
 	}
