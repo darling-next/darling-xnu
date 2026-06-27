@@ -11,6 +11,7 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/bsdthread/cancelable.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/fdpath.h>
+#include <darling/emulation/common/guarded/table.h>
 
 #ifndef O_NOFOLLOW
 #   define O_NOFOLLOW 0x0100
@@ -75,6 +76,15 @@ long sys_fcntl_nocancel(int fd, int cmd, long arg)
 {
 	int ret, linux_cmd = cmd_bsd_to_linux(cmd);
 	long original_arg = arg;
+
+	// dar-6x4.1: the reserved darlingserver RPC fd(s) live at the top of the Linux
+	// table (== getdtablesize()), but XNU reports a lower table size, so to the guest
+	// these fds are out of range. A guest fcntl on one must look like an invalid fd
+	// (EBADF), never touch the live socket. gnulib test-cloexec does
+	// fcntl(getdtablesize(), F_GETFD) / F_DUPFD_CLOEXEC and expects EBADF.
+	if (guard_table_check(fd, guard_flag_prevent_close)) {
+		return -EBADF;
+	}
 
 	switch (cmd)
 	{

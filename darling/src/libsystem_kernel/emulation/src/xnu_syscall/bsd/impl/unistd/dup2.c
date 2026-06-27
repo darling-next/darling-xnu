@@ -1,5 +1,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/dup2.h>
 
+#include <sys/errno.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -14,9 +15,15 @@ long sys_dup2(int fd_from, int fd_to)
 {
 	int ret;
 
-	if (guard_table_check(fd_to, guard_flag_prevent_close)) {
-		__simple_kprintf("*** Someone tried to close a guarded FD (%d) via dup2! ***", fd_to);
-		__simple_abort();
+	// dar-6x4.1: the reserved darlingserver RPC fd(s) sit at the top of the Linux
+	// table (rlim_cur-1 == getdtablesize()), but XNU reports the table size lower so
+	// these fds appear out-of-range to the guest. A guest dup2 onto (or from) one is
+	// therefore an operation on an invalid fd, which macOS answers with EBADF -- it
+	// must not abort the process. gnulib test-dup2/test-getdtablesize do exactly
+	// dup2(fd, getdtablesize()) and expect EBADF.
+	if (guard_table_check(fd_to, guard_flag_prevent_close)
+			|| guard_table_check(fd_from, guard_flag_prevent_close)) {
+		return -EBADF;
 	}
 
 	#if defined(__NR_dup2)
