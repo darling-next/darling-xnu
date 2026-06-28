@@ -19,6 +19,10 @@
 
 #include <rtsig.h>
 
+// perf #9-decompose: guest-side per-callnum recvmsg-sleep accountant. No-op unless the
+// TU is compiled with -DDARLING_RPC_SLEEP_ACCOUNT (diagnostic builds only).
+#include "rpc-sleep-account.h"
+
 #ifndef DSERVER_RPC_HOOKS_ARCHITECTURE
 #define DSERVER_RPC_HOOKS_ARCHITECTURE 1
 enum dserver_rpc_architecture {

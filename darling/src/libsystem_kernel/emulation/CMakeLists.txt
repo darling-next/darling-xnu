@@ -82,6 +82,7 @@ set(linux_premigration_sources
 	src/linux_premigration/ext/uname.c
 	src/linux_premigration/misc/ioctl.c
 	src/linux_premigration/resources/dserver-rpc-defs.c
+	src/linux_premigration/resources/rpc-sleep-account.c
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
@@ -375,6 +376,18 @@ add_darling_object_library(emulation_dyld ${emulation_sources})
 set_target_properties(emulation_dyld PROPERTIES COMPILE_FLAGS "-ffunction-sections -DVARIANT_DYLD")
 add_dependencies(emulation rtsig_h generate_dserver_rpc_wrappers)
 add_dependencies(emulation_dyld rtsig_h generate_dserver_rpc_wrappers)
+
+# perf #9-decompose (dar-dar6x4-perf-5dq): guest-side per-callnum recvmsg-sleep
+# accounting. OFF by default -> the emulation builds byte-identical to baseline (the
+# accounting #ifdef DARLING_RPC_SLEEP_ACCOUNT compiles to nothing). When ON, the
+# generated RPC wrappers time each reply-wait and attribute it per call number, dumped
+# at process exit to DARLING_RPC_SLEEP_ACCOUNT_PATH (default /tmp/darling-rpc-sleep.log).
+# Diagnostic only -- never ship ON.
+option(DARLING_RPC_SLEEP_ACCOUNT "Enable guest-side per-callnum recvmsg-sleep accounting (diagnostic)" OFF)
+if (DARLING_RPC_SLEEP_ACCOUNT)
+	target_compile_definitions(emulation PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
+endif()
 
 # E-UNION (dar-test-infra-sp5.8.4.4): union-by-path-translation in vchroot.
 # OFF by default -> the emulation builds byte-identical to baseline. When ON,
