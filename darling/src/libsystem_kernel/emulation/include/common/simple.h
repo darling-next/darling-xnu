@@ -25,6 +25,23 @@ void __simple_vfprintf(int fd, const char* format, va_list args) __attribute__((
 unsigned long long __simple_atoi(const char* str, const char** endp);
 unsigned long long __simple_atoi16(const char* str, const char** endp);
 
+// perf #9-decompose follow-on (dar-dar6x4-perf-5dq): hot-path kprintf gate.
+// __simple_kprintf is a SYNCHRONOUS RPC round-trip to darlingserver (send + a ~100us
+// recvmsg reply-wait). The guest per-callnum reply-wait breakdown showed unconditional
+// debug traces on hot paths (every exec, a hot ioctl, sigexc init) made kprintf 14.5% of
+// a clean build's total reply-wait -- pure noise paid for on every build. Such traces
+// must use hotpath_kdebug(...) instead of __simple_kprintf(...): it compiles to NOTHING
+// by default (no RPC, no sleep) and restores the trace only when the image is built with
+// -DDARLING_HOTPATH_KPRINTF_DEBUG. (Genuine error/diagnostic kprintf -- failures, guard
+// violations -- stay as __simple_kprintf; only remove cost from traces that fire on the
+// success hot path.) The do{}while(0) keeps it a statement and still type-checks the
+// args (so format mistakes are caught) even when compiled out.
+#ifdef DARLING_HOTPATH_KPRINTF_DEBUG
+	#define hotpath_kdebug(...) __simple_kprintf(__VA_ARGS__)
+#else
+	#define hotpath_kdebug(...) do { if (0) __simple_kprintf(__VA_ARGS__); } while (0)
+#endif
+
 // TODO: Remove this in favor of readline in readline.c?
 struct simple_readline_buf
 {
