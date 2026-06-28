@@ -7,6 +7,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/network/sendto.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/duct_errno.h>
+#include <darling/emulation/conversion/network/duct.h>
 #include <darling/emulation/conversion/network/getsockopt.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
@@ -87,10 +88,69 @@ static long int dserver_rpc_hooks_send_message(int socket, const dserver_rpc_hoo
 #endif
 };
 
+// perf #7-generalize (dar-dar6x4-perf-5dq.14): adaptive recv-spin for the GUEST RPC
+// path. The perf#6 profile showed 57% of a real build's wall-clock is guest threads
+// SLEEPING in recvmsg waiting for an RPC reply (__skb_wait_for_more_packets), and
+// perf#9-decompose attributed most of it to the guest's OWN reply-bearing RPCs
+// (mach_msg_overwrite 19%, mach_reply_port 8.7%, mach_port_deallocate 8.4%, the
+// self-traps, ...). perf#3 added a bounded non-blocking recv spin before blocking, but
+// only to MLDR's copy of this hook -- the guest processes (clang/make/sh) go through
+// THIS dylib copy, which until now did a plain BLOCKING recvmsg with no spin, so none
+// of that 28%+ got the spin. This ports the same mechanism here.
+//
+// When the server replies quickly (the common case -- server-side p50 ~8us after perf
+// #2b), a short bounded non-blocking recv grabs the reply before the thread ever sleeps,
+// saving the full ~200us scheduler sleep/wakeup. On a slow reply we fall through to the
+// normal BLOCKING recvmsg, so we never busy-wait unboundedly (the perf#1 starvation we
+// already fixed on the creator side -- this is the symmetric fix on the guest waiter
+// side). This path is libc-free: the poll is a raw LINUX_MSG_DONTWAIT recvmsg syscall
+// and the relax between polls is a CPU pause (NOT sched_yield: the reply comes from the
+// server on a DIFFERENT core, so pause keeps us on-core for the few us it takes the
+// reply to land instead of donating the core to the whole runqueue). The budget is a
+// compile-time constant so the hot path branches on a constant and we touch no env in
+// the signal-blocked atomic region; tunable / A-B-able via -DDARLING_GUEST_RECVSPIN=N
+// (0 = legacy blocking recvmsg). Default 512 matches perf#3 (validated to cover the
+// server's p99 reply while exiting in a few us on the common fast reply).
+#ifndef DARLING_GUEST_RECVSPIN
+#define DARLING_GUEST_RECVSPIN 512
+#endif
+
+static inline void __dserver_recvspin_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	__builtin_ia32_pause();
+#elif defined(__aarch64__)
+	__asm__ __volatile__("yield");
+#else
+	LINUX_SYSCALL0(__NR_sched_yield);
+#endif
+}
+
 static long int dserver_rpc_hooks_receive_message(int socket, dserver_rpc_hooks_msghdr_t* out_message) {
 	long int ret = 0;
 
 retry:
+#if DARLING_GUEST_RECVSPIN > 0
+	for (int __spin = 0; __spin < (DARLING_GUEST_RECVSPIN); ++__spin) {
+		// Bounded non-blocking poll: catch a fast reply without paying the recvmsg
+		// sleep/wakeup. Capped, so a genuinely slow reply falls through to the real
+		// blocking recvmsg below and never busy-waits unboundedly.
+#ifdef __NR_socketcall
+		ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVMSG, ((long[6]) { socket, out_message, LINUX_MSG_DONTWAIT }));
+#else
+		ret = LINUX_SYSCALL(__NR_recvmsg, socket, out_message, LINUX_MSG_DONTWAIT);
+#endif
+		if (ret >= 0) {
+			goto got_message;
+		}
+		// On Linux EWOULDBLOCK == EAGAIN (11), so EAGAIN alone means "no data yet".
+		if (ret != -LINUX_EAGAIN) {
+			// a real error (not "no data yet") -- bail just like the blocking path would
+			return ret;
+		}
+		__dserver_recvspin_relax();
+	}
+#endif
+
 #ifdef __NR_socketcall
 	ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVMSG, ((long[6]) { socket, out_message, 0 }));
 #else
@@ -99,6 +159,8 @@ retry:
 	if (ret < 0) {
 		return ret;
 	}
+
+got_message:
 
 	if (ret >= sizeof(dserver_s2c_callhdr_t)) {
 		dserver_s2c_callhdr_t* callhdr = out_message->msg_iov->iov_base;
