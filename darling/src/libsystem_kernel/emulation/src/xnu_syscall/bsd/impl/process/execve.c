@@ -57,7 +57,7 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 	strcpy(vc.path, fname);
 
 	ret = vchroot_expand(&vc);
-	__simple_kprintf("execve expand %s -> %s, ret %d", fname, vc.path, ret);
+	hotpath_kdebug("execve expand %s -> %s, ret %d", fname, vc.path, ret);
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
