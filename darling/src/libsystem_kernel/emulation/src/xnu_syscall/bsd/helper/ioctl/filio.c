@@ -60,7 +60,7 @@ int handle_filio(int fd, int cmd, void* arg, int* retval)
 				*retval = -EBADF;
 				return IOCTL_HANDLED;
 			}
-			__simple_kprintf("dtype for fd %d -> %s\n", fd, orig_path);
+			hotpath_kdebug("dtype for fd %d -> %s\n", fd, orig_path);
 
 			*retval = 0;
 			if (strncmp(orig_path, "/dev/pts", 8) == 0

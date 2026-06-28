@@ -207,7 +207,12 @@ void darling_sigexc_self(void)
 {
 	am_i_ptraced = true;
 
-	__simple_kprintf("darling_sigexc_self()\n");
+	// Routed through kern_printf (gated by DEBUG_SIGEXC, off by default) instead of a
+	// bare __simple_kprintf: sigexc_setup() runs on EVERY process startup, so this
+	// once-per-process marker was a synchronous RPC round-trip per process -- part of the
+	// kprintf 14.5% of a build's reply-wait measured by perf #9-decompose. No data, pure
+	// trace; compiled out by default.
+	kern_printf("darling_sigexc_self()\n");
 	// Make sigexc_handler the handler for all signals in the process
 	for (int i = 1; i <= 31; i++)
 	{
