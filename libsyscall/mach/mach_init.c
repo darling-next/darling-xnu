@@ -186,6 +186,13 @@ mach_init_doit(void)
 {
 #ifdef DARLING
 	mach_driver_init(applep);
+
+	// perf #7 (dar-dar6x4-perf-5dq.14): drop the cached task self port BEFORE we re-read
+	// it below. mach_init_doit() runs both at process init and in _mach_fork_child(), so
+	// this is the single point that keeps the self-port cache consistent across fork (a
+	// forked child is a new task with a new self port). Must precede task_self_trap().
+	extern void __darling_reset_cached_self_ports(void);
+	__darling_reset_cached_self_ports();
 #endif
 
 	// Initialize cached mach ports defined in mach_init.h
