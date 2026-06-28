@@ -403,6 +403,23 @@ if (DARLING_RPC_SLEEP_ACCOUNT)
 	target_compile_definitions(emulation_dyld PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
 endif()
 
+# perf #7-generalize (dar-dar6x4-perf-5dq.14): guest-side adaptive recv-spin budget.
+# The dylib RPC receive hook (dserver-rpc-defs.h) does a bounded LINUX_MSG_DONTWAIT
+# spin before the blocking recvmsg, so a fast RPC reply is grabbed before the guest
+# thread sleeps (attacks the perf#6 57% __skb_wait reply-wait for the guest's own RPCs:
+# mach_msg_overwrite, mach_reply_port, ...). The budget is a compile-time constant; the
+# header defaults it to 512 (matches perf#3, validated to cover server p99). This cache
+# variable lets A/B and tuning override it WITHOUT editing the header:
+#   -DDARLING_GUEST_RECVSPIN=0   -> disabled: legacy blocking recvmsg (A/B baseline)
+#   -DDARLING_GUEST_RECVSPIN=N   -> spin up to N non-blocking polls, then block
+# Leave UNSET to take the header default (512, the shipped value). Symmetric to perf#1
+# (creator wait) and perf#3 (mldr checkin recv); bounded so it never busy-waits forever.
+set(DARLING_GUEST_RECVSPIN "" CACHE STRING "Guest RPC recv-spin poll budget (empty = header default 512; 0 = disabled)")
+if (NOT DARLING_GUEST_RECVSPIN STREQUAL "")
+	target_compile_definitions(emulation PRIVATE DARLING_GUEST_RECVSPIN=${DARLING_GUEST_RECVSPIN})
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_GUEST_RECVSPIN=${DARLING_GUEST_RECVSPIN})
+endif()
+
 # E-UNION (dar-test-infra-sp5.8.4.4): union-by-path-translation in vchroot.
 # OFF by default -> the emulation builds byte-identical to baseline. When ON,
 # define EUNION (activates the #ifdef EUNION code) and EUNION_LIBEXEC_PATH (the
