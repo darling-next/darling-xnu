@@ -67,6 +67,35 @@ static dserver_ring_shm_t* gr_cb(void)  { return (dserver_ring_shm_t*)g_ring_map
 static dserver_ring_t* gr_c2s(void)     { return (dserver_ring_t*)((char*)g_ring_map + gr_cb()->c2s_ring_off); }
 static dserver_ring_t* gr_s2c(void)     { return (dserver_ring_t*)((char*)g_ring_map + gr_cb()->s2c_ring_off); }
 
+#ifdef DARLING_RING_PHASE_PROF
+// perf #18 P6 (dar-aw2): guest-side rdtsc phase accountant. Pure diagnostic (default OFF, whole
+// block compiles out). Accumulates TSC cycles for the guest-visible phases of the hot round-trip:
+//   submit    = publish request + conditional doorbell (gr_wake_server)
+//   roundtrip = time from after-submit until the reply is observed (server-side + wakeup latency)
+//   observe   = validate + copy the port out of the reply slot
+// and dumps mean cycles/phase to stderr once GR_PHASE_DUMP_AT samples accrue. Reuses the perf#9
+// in-guest accountant pattern (rdtsc, NOT clock_gettime which wedges the guest this early).
+#include <darling/emulation/common/simple.h>
+#define GR_PHASE_DUMP_AT 5000
+static unsigned long gr_ph_submit = 0, gr_ph_round = 0, gr_ph_observe = 0, gr_ph_total = 0;
+static unsigned long gr_ph_n = 0;
+static inline unsigned long gr_rdtsc(void) {
+#if defined(__x86_64__) || defined(__i386__)
+	unsigned hi, lo;
+	__asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+	return ((unsigned long)hi << 32) | lo;
+#else
+	return 0;
+#endif
+}
+static void gr_phase_maybe_dump(void) {
+	if (gr_ph_n < GR_PHASE_DUMP_AT) return;
+	__simple_fprintf(2, "[gr-phase] n=%lu mean cycles: submit=%lu roundtrip=%lu observe=%lu total=%lu\n",
+		gr_ph_n, gr_ph_submit / gr_ph_n, gr_ph_round / gr_ph_n, gr_ph_observe / gr_ph_n, gr_ph_total / gr_ph_n);
+	gr_ph_submit = gr_ph_round = gr_ph_observe = gr_ph_total = 0; gr_ph_n = 0;
+}
+#endif
+
 static inline void gr_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
 	__builtin_ia32_pause();
@@ -232,6 +261,9 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t0 = gr_rdtsc();
+#endif
 	dserver_ring_t* c2s = gr_c2s();
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
@@ -248,11 +280,17 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 
 	gr_wake_server();
 
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t1 = gr_rdtsc(); // submit done
+#endif
 	dserver_ring_slot_t* rep = gr_wait_reply();
 	if (!rep) {
 		return -1; // gave up waiting -> UDS fallback (the reply may still land; P3 single
 		           // owner means the next attach re-syncs; acceptable for the first op)
 	}
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
+#endif
 
 	// Validate the reply belongs to our request before trusting it.
 	int rc = -1;
@@ -268,6 +306,15 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 		}
 	}
 	dserver_ring_consumer_advance(gr_s2c());
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t3 = gr_rdtsc(); // observe (validate + copy out) done
+	gr_ph_submit  += (_t1 - _t0);
+	gr_ph_round   += (_t2 - _t1);
+	gr_ph_observe += (_t3 - _t2);
+	gr_ph_total   += (_t3 - _t0);
+	++gr_ph_n;
+	gr_phase_maybe_dump();
+#endif
 	return rc;
 }
 
