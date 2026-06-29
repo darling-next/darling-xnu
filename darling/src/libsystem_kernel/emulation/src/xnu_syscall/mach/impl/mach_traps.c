@@ -16,6 +16,7 @@
 #include <darlingserver/rpc.h>
 
 #include <darling/emulation/xnu_syscall/mach/impl/cached_self_ports.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 #define UNIMPLEMENTED_TRAP() { char msg[] = "Called unimplemented Mach trap: "; write(2, msg, sizeof(msg)-1); write(2, __FUNCTION__, sizeof(__FUNCTION__)-1); write(2, "\n", 1); }
 
@@ -722,6 +723,11 @@ kern_return_t syscall_thread_switch_impl(
 static cached_port_name_t __task_self_trap_rpc(void)
 {
 	unsigned int port_name;
+	// perf #18 P3: try the shared-memory ring first; on any failure fall back to the UDS
+	// wrapper. Folded away (always returns -1) unless built with -DDARLING_RING_TRANSPORT.
+	if (__dserver_ring_task_self_trap(&port_name) == 0) {
+		return port_name;
+	}
 	if (dserver_rpc_task_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
