@@ -14,7 +14,9 @@
 //     foreign owner and fall back to UDS (full per-thread rings are P4). This sidesteps
 //     guest TLS (which is fragile this early in the emulation layer) while staying correct:
 //     a non-owner never touches the ring.
-//   * Only task_self_trap rides the ring. The server's C2S service loop allowlists the same.
+//   * Only the no-arg port traps (task_self_trap, mach_reply_port) ride the ring; the server's
+//     C2S service loop allowlists the same. task_self_trap is cached per-process (perf #7) so
+//     it's correctness-first; mach_reply_port is the uncached hot op that exercises the win.
 //   * Adaptive wait: bounded spin (reusing the DARLING_GUEST_RECVSPIN budget) then a
 //     cross-process FUTEX_WAIT on s2c_futex. Server wakes via FUTEX_WAKE (non-private).
 
@@ -192,7 +194,12 @@ static dserver_ring_slot_t* gr_wait_reply(void) {
 	return 0;
 }
 
-int __dserver_ring_task_self_trap(uint32_t* out_port) {
+// Shared fast path for the no-arg, single-uint32-port-reply traps (task_self_trap,
+// mach_reply_port). Publishes an empty-body request for `callnum`, wakes the server, waits for
+// the reply, and validates seq+callnum+length before copying out the port. Returns 0 + writes
+// *out_port on success, negative on any miss (caller UDS-falls-back). The reply convention
+// ({reply_hdr.code, uint32 port}) is identical for both calls, so one helper covers them.
+static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 	if (!__dserver_ring_try_attach()) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
@@ -203,7 +210,7 @@ int __dserver_ring_task_self_trap(uint32_t* out_port) {
 		return -1; // ring full -> UDS fallback
 	}
 	uint32_t seq = g_seq++;
-	req->callnum = (uint32_t)dserver_callnum_task_self_trap;
+	req->callnum = callnum;
 	req->seq = seq;
 	req->length = 0;
 	req->arena_off = 0;
@@ -221,7 +228,7 @@ int __dserver_ring_task_self_trap(uint32_t* out_port) {
 
 	// Validate the reply belongs to our request before trusting it.
 	int rc = -1;
-	if (rep->seq == seq && rep->callnum == (uint32_t)dserver_callnum_task_self_trap) {
+	if (rep->seq == seq && rep->callnum == callnum) {
 		uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
 		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) + sizeof(uint32_t) && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
@@ -234,6 +241,14 @@ int __dserver_ring_task_self_trap(uint32_t* out_port) {
 	}
 	dserver_ring_consumer_advance(gr_s2c());
 	return rc;
+}
+
+int __dserver_ring_task_self_trap(uint32_t* out_port) {
+	return gr_port_trap((uint32_t)dserver_callnum_task_self_trap, out_port);
+}
+
+int __dserver_ring_mach_reply_port(uint32_t* out_port) {
+	return gr_port_trap((uint32_t)dserver_callnum_mach_reply_port, out_port);
 }
 
 #endif // DARLING_RING_TRANSPORT
