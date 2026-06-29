@@ -13,6 +13,7 @@
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
 #include <darling/emulation/common/guarded/table.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 #include <darlingserver/rpc.h>
 
@@ -43,6 +44,9 @@ long sys_fork(void)
 
 		// create a new dserver RPC socket
 		__dserver_per_thread_socket_refresh();
+		// perf #18 P3: the parent's ring mapping + wake fd are meaningless in the child; drop
+		// them so the child re-attaches lazily. No-op unless -DDARLING_RING_TRANSPORT.
+		__dserver_ring_postfork_reset();
 		int newReadFd = __dserver_process_lifetime_pipe_refresh();
 
 		// guard it
