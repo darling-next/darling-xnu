@@ -33,17 +33,18 @@ bool __dserver_ring_try_attach(void);
 int __dserver_ring_task_self_trap(uint32_t* out_port);
 int __dserver_ring_mach_reply_port(uint32_t* out_port);
 
-// perf #18 P5: small-inline-body op with a header-only reply. On a valid ring round-trip writes
-// *out_code (the kern_return_t -- use it verbatim, it may be an error like KERN_INVALID_NAME) and
-// returns 0; returns negative on any transport miss -> caller MUST fall back to the UDS wrapper.
-// The result code and the fall-back signal are SEPARATE (a kern_return_t can be any value).
-int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t right, int32_t delta, int* out_code);
-
-// perf #18 P5-bulk (dar-1il.1): three more port/right bookkeeping ops, all the SAME Tier-1 shape
-// (small inline body in, header-only kern_return_t reply out -- any out-value travels via the
-// guest-memory write the generic Call path already performs, e.g. mach_port_allocate's `name`).
-// Same contract as __dserver_ring_mach_port_mod_refs: 0 + *out_code on a valid ring round-trip,
-// negative on a transport miss -> caller MUST UDS-fall-back. name_ptr (allocate) is the guest VA.
+// perf #18 P5-bulk: small-inline-body ops with a header-only reply. On a valid ring round-trip each
+// writes *out_code (the kern_return_t -- use it verbatim, it may be an error like KERN_INVALID_NAME)
+// and returns 0; returns negative on any transport miss -> caller MUST fall back to the UDS wrapper.
+// The result code and the fall-back signal are SEPARATE (a kern_return_t can be any value). Any
+// out-value travels via the guest-memory write the generic Call path already performs, e.g.
+// mach_port_allocate's `name`; name_ptr (allocate) is the guest VA.
+//
+// NOTE: mach_port_mod_refs has NO ring helper (dar-1il.2) -- it is destroy-capable and was removed
+// from DSERVER_RING_C2S_OPCODES (negative-delta last-ref destroy -> vm munmap S2C upcall to a
+// ring-parked caller -> deadlock; same class as mach_port_deallocate). It is UDS-only. The
+// mach_port_deallocate helper below is likewise dead (deallocate reverted to UDS-only in dar-1il.1)
+// and kept only to minimize that diff.
 int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out_code);
 int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code);
 int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code);
@@ -58,7 +59,6 @@ void __dserver_ring_postfork_reset(void);
 static inline bool __dserver_ring_try_attach(void) { return false; }
 static inline int __dserver_ring_task_self_trap(uint32_t* out_port) { (void)out_port; return -1; }
 static inline int __dserver_ring_mach_reply_port(uint32_t* out_port) { (void)out_port; return -1; }
-static inline int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t right, int32_t delta, int* out_code) { (void)target; (void)name; (void)right; (void)delta; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out_code) { (void)target; (void)name; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code) { (void)target; (void)right; (void)name_ptr; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) { (void)target; (void)name; (void)poly; (void)polyPoly; (void)out_code; return -1; }

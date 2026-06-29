@@ -463,20 +463,20 @@ kern_return_t _kernelrpc_mach_port_mod_refs_trap_impl(
 				mach_port_delta_t delta
 )
 {
-	int code;
-	// perf #18 P5 (dar-1il): mach_port_mod_refs is a high-frequency Mach-right bookkeeping op
-	// (pure ipc_space write-lock + ipc_right_delta -- never blocks). Try the shared-memory ring
-	// first; the server runs the IDENTICAL dtape_mach_port_mod_refs primitive (via the generic
-	// ring datapath -- it carries a body + a header-only reply, so it is NOT a no-arg inline op),
-	// so the returned kern_return_t (incl. errors like KERN_INVALID_NAME / refcount underflow) is
-	// byte-identical to UDS. On any ring miss, fall back to the UDS wrapper. Folded away (always
-	// returns -1) unless built with -DDARLING_RING_TRANSPORT.
-	if (__dserver_ring_mach_port_mod_refs(target, name, right, delta, &code) != 0) {
-		code = dserver_rpc_mach_port_mod_refs(target, name, right, delta);
-	}
+	// perf #18 P5-bulk audit (dar-1il.2): mach_port_mod_refs is DELIBERATELY NOT ring-routed.
+	// It is destroy-CAPABLE: mod_refs(right, delta<0) dropping the last user-ref of a receive right
+	// destroys the port, and destroying a port that backs a mapped region drives a vm munmap
+	// server-to-client (S2C) upcall to THIS thread -- the SAME hazard that sank mach_port_deallocate.
+	// A thread parked on a ring reply is not in a recvmsg and cannot service an S2C call, so the
+	// server microthread would block on the S2C reply while the guest blocks in the ring futex-wait
+	// -> deadlock. The hazard is a SIDE EFFECT of certain (negative-delta, last-ref) args, not the
+	// return code, and cannot be decided before the ipc_space lock is held and the refcount known
+	// (i.e. after mutation begins), so it stays on UDS -- where the caller's recvmsg services the
+	// S2C -- until a proven-safe subset is gated. (See DSERVER_RING_C2S_OPCODES, rpc-supplement.h.)
+	int code = dserver_rpc_mach_port_mod_refs(target, name, right, delta);
 
 	if (code < 0) {
-		__simple_printf("mach_port_deallocate failed (internally): %d\n", code);
+		__simple_printf("mach_port_mod_refs failed (internally): %d\n", code);
 		__simple_abort();
 	}
 
