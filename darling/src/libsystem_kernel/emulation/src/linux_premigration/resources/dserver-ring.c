@@ -326,4 +326,95 @@ int __dserver_ring_mach_reply_port(uint32_t* out_port) {
 	return gr_port_trap((uint32_t)dserver_callnum_mach_reply_port, out_port);
 }
 
+// perf #18 P5 (dar-1il): generic fast path for a small-inline-body op whose reply is HEADER-ONLY
+// (the meaningful result is the reply hdr's `code` = a kern_return_t, no port/body). Unlike
+// gr_port_trap (empty request, port reply), this publishes `bodylen` bytes of request body inline
+// in the slot and copies NOTHING out of the reply but the code. Used by mach_port_mod_refs.
+//
+// Contract mirrors gr_port_trap's transport semantics but splits the result from the
+// fall-back signal: returns 0 on a VALID ring round-trip and writes *out_code (the kern_return_t,
+// which the caller must use verbatim -- it may be KERN_INVALID_NAME etc.); returns -1 on any
+// transport miss (no ring / ring full / bad reply), in which case the caller MUST UDS-fall-back.
+// This separation matters because a kern_return_t can be any value and must never be confused
+// with the "-1 = retry on UDS" sentinel (gr_port_trap could conflate them only because that op's
+// code is always 0).
+static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, int* out_code) {
+	if (!__dserver_ring_try_attach()) {
+		return -1; // no ring for this thread -> UDS fallback
+	}
+
+	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
+	if (bodylen > inlineCap) {
+		return -1; // body won't fit the slot -> UDS fallback (shouldn't happen for our small ops)
+	}
+
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t0 = gr_rdtsc();
+#endif
+	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
+	if (!req) {
+		return -1; // ring full -> UDS fallback
+	}
+	uint32_t seq = g_seq++;
+	req->callnum = callnum;
+	req->seq = seq;
+	req->length = bodylen;
+	req->arena_off = 0;
+	req->arena_len = 0;
+	req->flags = 0;
+	if (bodylen > 0) {
+		memcpy((char*)req + sizeof(dserver_ring_slot_t), body, bodylen);
+	}
+	dserver_ring_producer_publish(c2s);
+
+	gr_wake_server();
+
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t1 = gr_rdtsc(); // submit done
+#endif
+	dserver_ring_slot_t* rep = gr_wait_reply();
+	if (!rep) {
+		return -1; // gave up waiting -> UDS fallback
+	}
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
+#endif
+
+	// Validate the reply belongs to our request before trusting it. The reply is header-only:
+	// length must be exactly the reply hdr (no body), and code is the kern_return_t.
+	int rc = -1;
+	if (rep->seq == seq && rep->callnum == callnum) {
+		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
+			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
+			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
+			if (out_code) *out_code = rh->code;
+			rc = 0; // valid ring round-trip
+		}
+	}
+	dserver_ring_consumer_advance(gr_s2c());
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t3 = gr_rdtsc(); // observe done
+	gr_ph_submit  += (_t1 - _t0);
+	gr_ph_round   += (_t2 - _t1);
+	gr_ph_observe += (_t3 - _t2);
+	gr_ph_total   += (_t3 - _t0);
+	++gr_ph_n;
+	gr_phase_maybe_dump();
+#endif
+	return rc;
+}
+
+int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t right, int32_t delta, int* out_code) {
+	// Body must be byte-identical to dserver_call_mach_port_mod_refs_t {target,name,right,delta}
+	// (the server rebuilds {callhdr, body} and dispatches via callFromMessage exactly as for UDS).
+	struct {
+		uint32_t target;
+		uint32_t name;
+		int32_t  right;
+		int32_t  delta;
+	} body = { target, name, right, delta };
+	return gr_body_trap((uint32_t)dserver_callnum_mach_port_mod_refs, &body, (uint32_t)sizeof(body), out_code);
+}
+
 #endif // DARLING_RING_TRANSPORT
