@@ -22,11 +22,16 @@
 // Returns true if a ring is available for this thread to use, false if it must use UDS.
 bool __dserver_ring_try_attach(void);
 
-// Fast path for task_self_trap over the ring. On success writes *out_port + returns 0 (the
-// same contract as dserver_rpc_task_self_trap). Returns a negative value if the ring is
-// unavailable / the op isn't ring-eligible / anything went wrong -> caller MUST fall back to
-// the UDS wrapper. Never blocks unboundedly: it bounded-spins then FUTEX_WAITs for the reply.
+// Fast path for the no-arg, single-uint32-port-reply traps over the ring. On success writes
+// *out_port + returns 0 (the same contract as the matching dserver_rpc_* wrapper). Returns a
+// negative value if the ring is unavailable / the op isn't ring-eligible / anything went wrong
+// -> caller MUST fall back to the UDS wrapper. Never blocks unboundedly: it bounded-spins then
+// FUTEX_WAITs for the reply.
+//
+// task_self_trap is cached per-process (perf #7) so it's correctness-first; mach_reply_port is
+// the UNCACHED high-frequency op that actually exercises the ring's latency win.
 int __dserver_ring_task_self_trap(uint32_t* out_port);
+int __dserver_ring_mach_reply_port(uint32_t* out_port);
 
 // Reset ring state in the forked child (the parent's ring + wake fd are not valid post-fork;
 // the child re-attaches lazily). Called from the fork path alongside the socket refresh.
@@ -37,6 +42,7 @@ void __dserver_ring_postfork_reset(void);
 // Folded-away stubs so call sites compile to nothing extra when the feature is off.
 static inline bool __dserver_ring_try_attach(void) { return false; }
 static inline int __dserver_ring_task_self_trap(uint32_t* out_port) { (void)out_port; return -1; }
+static inline int __dserver_ring_mach_reply_port(uint32_t* out_port) { (void)out_port; return -1; }
 static inline void __dserver_ring_postfork_reset(void) {}
 
 #endif // DARLING_RING_TRANSPORT
