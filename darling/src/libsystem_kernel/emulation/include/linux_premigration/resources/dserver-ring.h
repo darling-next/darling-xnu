@@ -33,6 +33,12 @@ bool __dserver_ring_try_attach(void);
 int __dserver_ring_task_self_trap(uint32_t* out_port);
 int __dserver_ring_mach_reply_port(uint32_t* out_port);
 
+// perf #18 P5: small-inline-body op with a header-only reply. On a valid ring round-trip writes
+// *out_code (the kern_return_t -- use it verbatim, it may be an error like KERN_INVALID_NAME) and
+// returns 0; returns negative on any transport miss -> caller MUST fall back to the UDS wrapper.
+// The result code and the fall-back signal are SEPARATE (a kern_return_t can be any value).
+int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t right, int32_t delta, int* out_code);
+
 // Reset ring state in the forked child (the parent's ring + wake fd are not valid post-fork;
 // the child re-attaches lazily). Called from the fork path alongside the socket refresh.
 void __dserver_ring_postfork_reset(void);
@@ -43,6 +49,7 @@ void __dserver_ring_postfork_reset(void);
 static inline bool __dserver_ring_try_attach(void) { return false; }
 static inline int __dserver_ring_task_self_trap(uint32_t* out_port) { (void)out_port; return -1; }
 static inline int __dserver_ring_mach_reply_port(uint32_t* out_port) { (void)out_port; return -1; }
+static inline int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t right, int32_t delta, int* out_code) { (void)target; (void)name; (void)right; (void)delta; (void)out_code; return -1; }
 static inline void __dserver_ring_postfork_reset(void) {}
 
 #endif // DARLING_RING_TRANSPORT
