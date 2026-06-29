@@ -84,6 +84,7 @@ set(linux_premigration_sources
 	src/linux_premigration/misc/ioctl.c
 	src/linux_premigration/resources/dserver-rpc-defs.c
 	src/linux_premigration/resources/rpc-sleep-account.c
+	src/linux_premigration/resources/dserver-ring.c
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
@@ -401,6 +402,20 @@ option(DARLING_RPC_SLEEP_ACCOUNT "Enable guest-side per-callnum recvmsg-sleep ac
 if (DARLING_RPC_SLEEP_ACCOUNT)
 	target_compile_definitions(emulation PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
 	target_compile_definitions(emulation_dyld PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
+endif()
+
+# perf #18 (dar-dar6x4-perf-5dq.30): guest-side shared-memory ring transport. OFF by default
+# -> dserver-ring.c compiles to an empty TU and the call-site fast paths (the inline stubs in
+# dserver-ring.h) fold away, so the emulation builds byte-identical to baseline. When ON, the
+# guest builds a memfd ring, negotiates it via ring_attach, and routes eligible calls (P3:
+# task_self_trap) over the ring with a futex wake instead of the UDS round-trip. Compiled into
+# BOTH the dylib (emulation) and dyld (emulation_dyld) since the trap path lives in both
+# (see the perf#7-generalize / gate-hotpath-kprintf lessons about dual-target deploy). The
+# matching server side is darlingserver's -DDSERVER_RING_TRANSPORT; both default OFF.
+option(DARLING_RING_TRANSPORT "Enable guest-side shared-memory ring RPC transport (perf #18)" OFF)
+if (DARLING_RING_TRANSPORT)
+	target_compile_definitions(emulation PRIVATE DARLING_RING_TRANSPORT)
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_RING_TRANSPORT)
 endif()
 
 # perf #7-generalize (dar-dar6x4-perf-5dq.14): guest-side adaptive recv-spin budget.
