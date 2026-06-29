@@ -411,8 +411,11 @@ endif()
 # task_self_trap) over the ring with a futex wake instead of the UDS round-trip. Compiled into
 # BOTH the dylib (emulation) and dyld (emulation_dyld) since the trap path lives in both
 # (see the perf#7-generalize / gate-hotpath-kprintf lessons about dual-target deploy). The
-# matching server side is darlingserver's -DDSERVER_RING_TRANSPORT; both default OFF.
-option(DARLING_RING_TRANSPORT "Enable guest-side shared-memory ring RPC transport (perf #18)" OFF)
+# matching server side is darlingserver's -DDSERVER_RING_TRANSPORT.
+# perf#18 Phase B Stage 1 (2026-06-29): default flipped OFF->ON for dev/nightly (paired with the
+# server option). Frozen op set; rollback = this default back to OFF + rebuild. Release/prod policy
+# is separate and unchanged. See darlingserver tests/PERF18-RING-DEFAULT-ON-DECISION.md.
+option(DARLING_RING_TRANSPORT "Enable guest-side shared-memory ring RPC transport (perf #18)" ON)
 if (DARLING_RING_TRANSPORT)
 	target_compile_definitions(emulation PRIVATE DARLING_RING_TRANSPORT)
 	target_compile_definitions(emulation_dyld PRIVATE DARLING_RING_TRANSPORT)
