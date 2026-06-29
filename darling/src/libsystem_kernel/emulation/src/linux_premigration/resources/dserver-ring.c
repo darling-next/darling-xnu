@@ -417,4 +417,48 @@ int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t ri
 	return gr_body_trap((uint32_t)dserver_callnum_mach_port_mod_refs, &body, (uint32_t)sizeof(body), out_code);
 }
 
+// perf #18 P5-bulk (dar-1il.1): three more port/right bookkeeping ops join the ring. All three are
+// the SAME Tier-1 shape as mach_port_mod_refs: a small inline request body + a HEADER-ONLY reply
+// (the result is the kern_return_t; there is no port/body to copy out). Each body layout below is
+// byte-identical to the generated dserver_call_<name>_t, so the server rebuilds {callhdr, body} and
+// dispatches via callFromMessage -> the identical dtape primitive as over UDS. They ride the
+// GENERIC fiber doWork() path on the server (NOT the no-fiber inline path -- mach_port_mod_refs
+// PROVED these off-fiber-corrupt the thread stack; see call.cpp ringFastPathEligible). Each routes
+// over the ring iff it is in DSERVER_RING_C2S_OPCODES (rpc-supplement.h), the single shared
+// allowlist the server keys off too.
+
+int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out_code) {
+	// dserver_call_mach_port_deallocate_t { uint32_t target; uint32_t name; }
+	struct {
+		uint32_t target;
+		uint32_t name;
+	} body = { target, name };
+	return gr_body_trap((uint32_t)dserver_callnum_mach_port_deallocate, &body, (uint32_t)sizeof(body), out_code);
+}
+
+int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code) {
+	// dserver_call_mach_port_allocate_t { uint32_t target; int32_t right; uint64_t name aligned(8); }
+	// `name` is the GUEST virtual address the kernel writes the allocated port name into; we send the
+	// pointer value verbatim and the server (generic Call path) performs the same guest-memory write
+	// it does over UDS. The reply is header-only (the kern_return_t). The 8-byte alignment of the
+	// uint64_t matches the generated struct's __attribute__((aligned(8))) (offset 8, size 16).
+	struct {
+		uint32_t target;
+		int32_t  right;
+		uint64_t name __attribute__((aligned(8)));
+	} body = { target, right, name_ptr };
+	return gr_body_trap((uint32_t)dserver_callnum_mach_port_allocate, &body, (uint32_t)sizeof(body), out_code);
+}
+
+int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) {
+	// dserver_call_mach_port_insert_right_t { uint32_t target; uint32_t name; uint32_t poly; int32_t polyPoly; }
+	struct {
+		uint32_t target;
+		uint32_t name;
+		uint32_t poly;
+		int32_t  polyPoly;
+	} body = { target, name, poly, polyPoly };
+	return gr_body_trap((uint32_t)dserver_callnum_mach_port_insert_right, &body, (uint32_t)sizeof(body), out_code);
+}
+
 #endif // DARLING_RING_TRANSPORT
