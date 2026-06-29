@@ -141,6 +141,11 @@ bool __dserver_ring_try_attach(void) {
 	cb->s2c_ring_off = (uint32_t)s2c_off;
 	cb->total_size = (uint32_t)total;
 	cb->guest_tid = (int32_t)LINUX_SYSCALL(__NR_gettid); // server cross-checks vs SCM nsid
+	// perf #18 P4 wake-model words. The memfd is zero-filled, so these are already 0, but be
+	// explicit: server_state starts SLEEPING_EPOLL (== 0) so we doorbell until the server first
+	// publishes ACTIVE_POLLING; no guest is parked yet so s2c_waiters starts 0.
+	cb->server_state = DSERVER_RING_SRV_SLEEPING_EPOLL;
+	cb->s2c_waiters = 0;
 
 	// negotiate over UDS: hand the memfd to the server. It validates + maps + returns the
 	// wake eventfd (or a non-zero reject reason).
@@ -166,14 +171,30 @@ bool __dserver_ring_try_attach(void) {
 	return true;
 }
 
-// Wake the server: write the eventfd (the only thing its epoll loop can wait on).
+// Wake the server -- CONDITIONALLY (perf #18 P4). We just published a request. The server only
+// needs a doorbell if it is not actively polling its rings; while it spins (ACTIVE_POLLING) it
+// will see our new c2s tail on its own, so the eventfd write is pure overhead and we skip it.
+// dserver_ring_guest_should_doorbell() reads the server-published state with acquire ordering;
+// a stale read at worst costs one redundant write, never a missed wake (an old/0 value ==
+// SLEEPING_EPOLL == "doorbell", the safe direction).
 static void gr_wake_server(void) {
+	if (!dserver_ring_guest_should_doorbell(gr_cb())) {
+		return; // server is draining rings; it'll pick up our request without a syscall
+	}
 	uint64_t one = 1;
 	LINUX_SYSCALL(__NR_write, g_wake_fd, &one, sizeof(one));
 }
 
 // Wait for a reply on s2c: bounded spin, then cross-process FUTEX_WAIT on s2c_futex.
 // Returns a pointer to the published reply slot (NULL on give-up so the caller UDS-falls-back).
+//
+// perf #18 P4: the hot path is the spin -- if the server replies within DARLING_GUEST_RECVSPIN
+// iterations we return without touching the kernel AND without ever advertising ourselves as a
+// waiter, so the server's conditional FUTEX_WAKE is a no-op too (zero syscalls round-trip). Only
+// when we fall through to the slow path do we set s2c_waiters before parking, so the server knows
+// to wake us; we clear it on the way out. The bit is set BEFORE the pre-sleep ring recheck, so the
+// server can never publish-then-skip-wake while we're committed to sleeping (it reads the bit
+// after publishing; if it sees 0 we hadn't slept yet and are still spinning the recheck).
 static dserver_ring_slot_t* gr_wait_reply(void) {
 	dserver_ring_t* s2c = gr_s2c();
 	for (int i = 0; i < (DARLING_GUEST_RECVSPIN); ++i) {
@@ -181,17 +202,24 @@ static dserver_ring_slot_t* gr_wait_reply(void) {
 		if (rep) return rep;
 		gr_relax();
 	}
-	// Slow path: sleep on the futex until the server bumps it. Re-check after each wake.
+	// Slow path: advertise ourselves as a parked waiter so the server's conditional FUTEX_WAKE
+	// fires, then sleep on the futex until it bumps the word. Re-check after each wake.
 	uint32_t* word = &gr_cb()->s2c_futex;
+	uint32_t* waiters = &gr_cb()->s2c_waiters;
+	__atomic_store_n(waiters, 1u, __ATOMIC_RELEASE);
+	dserver_ring_slot_t* result = 0;
 	for (int guard = 0; guard < 100000; ++guard) {
 		uint32_t observed = __atomic_load_n(word, __ATOMIC_ACQUIRE);
 		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
-		if (rep) return rep;
+		if (rep) { result = rep; break; }
 		// FUTEX_WAIT(word, observed): sleeps only if *word still == observed (no lost wake).
 		long r = LINUX_SYSCALL(__NR_futex, word, GR_FUTEX_WAIT, observed, 0, 0, 0);
 		(void)r; // EAGAIN (value changed) / EINTR -> just re-loop and re-check the ring
 	}
-	return 0;
+	// No longer parked -- the server may stop waking us. (Release so the clear is visible before
+	// any subsequent request we publish.)
+	__atomic_store_n(waiters, 0u, __ATOMIC_RELEASE);
+	return result;
 }
 
 // Shared fast path for the no-arg, single-uint32-port-reply traps (task_self_trap,
