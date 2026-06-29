@@ -450,7 +450,17 @@ kern_return_t _kernelrpc_mach_port_mod_refs_trap_impl(
 				mach_port_delta_t delta
 )
 {
-	int code = dserver_rpc_mach_port_mod_refs(target, name, right, delta);
+	int code;
+	// perf #18 P5 (dar-1il): mach_port_mod_refs is a high-frequency Mach-right bookkeeping op
+	// (pure ipc_space write-lock + ipc_right_delta -- never blocks). Try the shared-memory ring
+	// first; the server runs the IDENTICAL dtape_mach_port_mod_refs primitive (via the generic
+	// ring datapath -- it carries a body + a header-only reply, so it is NOT a no-arg inline op),
+	// so the returned kern_return_t (incl. errors like KERN_INVALID_NAME / refcount underflow) is
+	// byte-identical to UDS. On any ring miss, fall back to the UDS wrapper. Folded away (always
+	// returns -1) unless built with -DDARLING_RING_TRANSPORT.
+	if (__dserver_ring_mach_port_mod_refs(target, name, right, delta, &code) != 0) {
+		code = dserver_rpc_mach_port_mod_refs(target, name, right, delta);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_deallocate failed (internally): %d\n", code);
