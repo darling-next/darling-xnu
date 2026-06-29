@@ -402,7 +402,13 @@ kern_return_t _kernelrpc_mach_port_allocate_trap_impl(
 				mach_port_name_t *name
 )
 {
-	int code = dserver_rpc_mach_port_allocate(target, right, name);
+	int code;
+	// perf #18 P5-bulk (dar-1il.1): ride the ring (Tier-1 generic fiber path) -- byte-identical to
+	// UDS, the allocated name is written into guest memory via `name` exactly as before; the reply
+	// is header-only. On any ring miss, fall back to UDS. Folded away unless -DDARLING_RING_TRANSPORT.
+	if (__dserver_ring_mach_port_allocate(target, right, (uint64_t)(uintptr_t)name, &code) != 0) {
+		code = dserver_rpc_mach_port_allocate(target, right, name);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_allocate failed (internally): %d\n", code);
@@ -433,6 +439,13 @@ kern_return_t _kernelrpc_mach_port_deallocate_trap_impl(
 				mach_port_name_t name
 )
 {
+	// perf #18 P5-bulk (dar-1il.1): mach_port_deallocate is DELIBERATELY NOT ring-routed. Under
+	// launchd's real workload it destroys ports backing mapped regions, which drives a vm munmap
+	// server-to-client (S2C) upcall to THIS thread. A thread parked on a ring reply is not in a
+	// recvmsg and cannot service an S2C call, so the server microthread blocks on the S2C reply
+	// while the guest blocks in the ring futex-wait -> deadlock (observed: launchd wedges before
+	// shellspawn). It stays on UDS, where the caller's recvmsg services the S2C. (See the membership
+	// rule in DSERVER_RING_C2S_OPCODES, rpc-supplement.h.)
 	int code = dserver_rpc_mach_port_deallocate(target, name);
 
 	if (code < 0) {
@@ -493,7 +506,11 @@ kern_return_t _kernelrpc_mach_port_insert_right_trap_impl(
 				mach_msg_type_name_t polyPoly
 )
 {
-	int code = dserver_rpc_mach_port_insert_right(target, name, poly, polyPoly);
+	int code;
+	// perf #18 P5-bulk (dar-1il.1): ring Tier-1 (generic fiber path), UDS fallback on any miss.
+	if (__dserver_ring_mach_port_insert_right(target, name, poly, polyPoly, &code) != 0) {
+		code = dserver_rpc_mach_port_insert_right(target, name, poly, polyPoly);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_insert_right failed (internally): %d\n", code);
