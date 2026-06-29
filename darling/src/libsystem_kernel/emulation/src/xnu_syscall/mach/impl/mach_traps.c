@@ -37,6 +37,13 @@ void __darling_reset_cached_self_ports(void) {
 mach_port_name_t mach_reply_port_impl(void)
 {
 	unsigned int port_name;
+	// perf #18 P3: mach_reply_port is the UNCACHED high-frequency op (every Mach RPC round-trip
+	// needs a reply port), so unlike task_self_trap it actually exercises the ring's latency win.
+	// Try the shared-memory ring first; on any failure fall back to the UDS wrapper. Folded away
+	// (always returns -1) unless built with -DDARLING_RING_TRANSPORT.
+	if (__dserver_ring_mach_reply_port(&port_name) == 0) {
+		return port_name;
+	}
 	if (dserver_rpc_mach_reply_port(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
