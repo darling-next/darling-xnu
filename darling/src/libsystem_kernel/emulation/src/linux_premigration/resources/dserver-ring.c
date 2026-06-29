@@ -170,6 +170,12 @@ bool __dserver_ring_try_attach(void) {
 	cb->s2c_ring_off = (uint32_t)s2c_off;
 	cb->total_size = (uint32_t)total;
 	cb->guest_tid = (int32_t)LINUX_SYSCALL(__NR_gettid); // server cross-checks vs SCM nsid
+	// perf #18 dar-1il.2 item 2: publish OUR compiled C2S opcode set as a hash. The server rejects
+	// the ring (-> reject_opcode_set -> we use UDS for everything) if it doesn't match the set the
+	// SERVER was built with -- so a guest/server build/version skew degrades cleanly to all-UDS
+	// instead of stranding us on the first op the older side doesn't allowlist. Same FNV fold both
+	// sides compute from the IDENTICAL DSERVER_RING_C2S_OPCODES macro.
+	cb->c2s_opcode_hash = dserver_ring_c2s_opcode_hash();
 	// perf #18 P4 wake-model words. The memfd is zero-filled, so these are already 0, but be
 	// explicit: server_state starts SLEEPING_EPOLL (== 0) so we doorbell until the server first
 	// publishes ACTIVE_POLLING; no guest is parked yet so s2c_waiters starts 0.
@@ -405,27 +411,21 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 	return rc;
 }
 
-int __dserver_ring_mach_port_mod_refs(uint32_t target, uint32_t name, int32_t right, int32_t delta, int* out_code) {
-	// Body must be byte-identical to dserver_call_mach_port_mod_refs_t {target,name,right,delta}
-	// (the server rebuilds {callhdr, body} and dispatches via callFromMessage exactly as for UDS).
-	struct {
-		uint32_t target;
-		uint32_t name;
-		int32_t  right;
-		int32_t  delta;
-	} body = { target, name, right, delta };
-	return gr_body_trap((uint32_t)dserver_callnum_mach_port_mod_refs, &body, (uint32_t)sizeof(body), out_code);
-}
+// perf #18 P5-bulk audit (dar-1il.2): mach_port_mod_refs has NO ring helper -- it was removed from
+// DSERVER_RING_C2S_OPCODES because it is destroy-capable (negative-delta last-ref destroy -> vm
+// munmap S2C upcall to a caller parked on the ring -> deadlock; same class as mach_port_deallocate).
+// It routes UDS-only (see mach_traps.c _kernelrpc_mach_port_mod_refs_trap_impl).
 
-// perf #18 P5-bulk (dar-1il.1): three more port/right bookkeeping ops join the ring. All three are
-// the SAME Tier-1 shape as mach_port_mod_refs: a small inline request body + a HEADER-ONLY reply
-// (the result is the kern_return_t; there is no port/body to copy out). Each body layout below is
-// byte-identical to the generated dserver_call_<name>_t, so the server rebuilds {callhdr, body} and
-// dispatches via callFromMessage -> the identical dtape primitive as over UDS. They ride the
-// GENERIC fiber doWork() path on the server (NOT the no-fiber inline path -- mach_port_mod_refs
-// PROVED these off-fiber-corrupt the thread stack; see call.cpp ringFastPathEligible). Each routes
-// over the ring iff it is in DSERVER_RING_C2S_OPCODES (rpc-supplement.h), the single shared
-// allowlist the server keys off too.
+// perf #18 P5-bulk (dar-1il.1): two more port/right bookkeeping ops ride the ring. Both are a
+// Tier-1 shape: a small inline request body + a HEADER-ONLY reply (the result is the kern_return_t;
+// allocate also copies the name out via the existing guest-memory write the generic Call path does).
+// Each body layout below is byte-identical to the generated dserver_call_<name>_t, so the server
+// rebuilds {callhdr, body} and dispatches via callFromMessage -> the identical dtape primitive as
+// over UDS. They ride the GENERIC fiber doWork() path on the server (NOT the no-fiber inline path,
+// which off-fiber-corrupts the thread stack; see call.cpp ringFastPathEligible). Each routes over
+// the ring iff it is in DSERVER_RING_C2S_OPCODES (rpc-supplement.h), the single shared allowlist the
+// server keys off too. (allocate/insert_right are kept; mach_port_deallocate's helper below is dead
+// -- deallocate also reverted to UDS-only in dar-1il.1 -- and left only to minimize that diff.)
 
 int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out_code) {
 	// dserver_call_mach_port_deallocate_t { uint32_t target; uint32_t name; }
