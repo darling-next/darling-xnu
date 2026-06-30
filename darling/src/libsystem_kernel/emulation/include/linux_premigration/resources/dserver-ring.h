@@ -78,6 +78,11 @@ int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* ou
 // the child re-attaches lazily). Called from the fork path alongside the socket refresh.
 void __dserver_ring_postfork_reset(void);
 
+// perf #18 D17 (dar-1il.12): dump this process's per-thread lane stats (acquired / exhausted / reclaimed
+// / held-now) to stderr ONCE on the clean exit path. RECON-only, strict no-op unless DARLING_GUEST_LANE_
+// STATS=1. Mirrors __darling_rpc_sleep_dump's exit-path hook so it's robust without a dylib fini handler.
+void __dserver_ring_lane_stats_dump(void);
+
 // perf #18 P8 D3 (dar-1il.3.1.1): the synthetic DUPLEX-lane selftest. Advertises the SELFTEST duplex
 // capability, publishes the sentinel parent request carrying `arg`, runs the duplex wait-pump (services
 // the S2C upcall mailbox on THIS thread while waiting for the parent's final reply), and on success
@@ -141,6 +146,7 @@ static inline int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit,
 static inline int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code) { (void)buffer; (void)buffer_size; (void)out_length; (void)out_code; return -1; }
 static inline int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code) { (void)buffer; (void)buffer_size; (void)out_length; (void)out_code; return -1; }
 static inline void __dserver_ring_postfork_reset(void) {}
+static inline void __dserver_ring_lane_stats_dump(void) {}
 static inline int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) { (void)arg; (void)out_result; return -1; }
 static inline void __dserver_ring_maybe_run_duplex_selftest(void) {}
 static inline int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code) { (void)target; (void)name; (void)out_code; return -1; }
