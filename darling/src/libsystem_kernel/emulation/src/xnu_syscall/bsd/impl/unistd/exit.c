@@ -12,12 +12,21 @@
 extern void __darling_rpc_sleep_dump(void);
 #endif
 
+#ifdef DARLING_RING_TRANSPORT
+// perf #18 D17 (dar-1il.12): flush this process's per-thread ring lane stats on the clean exit path
+// (RECON-only; strict no-op unless DARLING_GUEST_LANE_STATS=1). Robust without a dylib fini handler.
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
+#endif
+
 long sys_exit(int status)
 {
 	int ret;
 
 #ifdef DARLING_RPC_SLEEP_ACCOUNT
 	__darling_rpc_sleep_dump();
+#endif
+#ifdef DARLING_RING_TRANSPORT
+	__dserver_ring_lane_stats_dump();
 #endif
 
 	native_exit(status);
