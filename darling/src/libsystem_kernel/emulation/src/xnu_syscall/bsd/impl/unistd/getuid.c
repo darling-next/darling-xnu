@@ -8,6 +8,7 @@
 #include <darling/emulation/conversion/errno.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 // the UID and GID related calls are called frequently, so making a server call for them each time is expensive.
 // instead, since the server never changes our UID and GID on its own (we're always the ones that tell it to change it),
@@ -38,7 +39,13 @@ void __getuidgid(int32_t* uid, int32_t* gid) {
 			//       remain locked after returning from a syscall). since the server doesn't even know about
 			//       the `uidgid_rwlock` here, there's no chance of someone holding the task lock in the
 			//       server while wanting the `uidgid_lock`.
-			if (dserver_rpc_uidgid(-1, -1, &stored_uid, &stored_gid) < 0) {
+			// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber) -- byte-identical to UDS,
+			// the old uid/gid come back in the reply body. On any ring miss, fall back to UDS.
+			int code;
+			if (__dserver_ring_uidgid(-1, -1, &stored_uid, &stored_gid, &code) != 0) {
+				code = dserver_rpc_uidgid(-1, -1, &stored_uid, &stored_gid);
+			}
+			if (code < 0) {
 				__simple_abort();
 			}
 		}
@@ -60,7 +67,10 @@ long __setuidgid(int32_t uid, int32_t gid) {
 
 	libsimple_rwlock_lock_write(&uidgid_rwlock);
 	// see note about impossibility of deadlocks in __getuidgid
-	ret = dserver_rpc_uidgid(uid, gid, NULL, NULL);
+	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber); on any ring miss fall back to UDS.
+	if (__dserver_ring_uidgid(uid, gid, NULL, NULL, &ret) != 0) {
+		ret = dserver_rpc_uidgid(uid, gid, NULL, NULL);
+	}
 	if (ret == 0) {
 		if (uid >= 0) {
 			stored_uid = uid;
