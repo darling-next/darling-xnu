@@ -271,7 +271,19 @@ kern_return_t _kernelrpc_mach_vm_deallocate_trap_impl(
 
 	if (target != 0 && target != mach_task_self())
 	{
-		int code = dserver_rpc_mach_vm_deallocate(target, address, size);
+		// perf #18 P8 D5 (dar-1il.3.2.2): vm_deallocate of ANOTHER task's address space goes to the
+		// server, whose vm_map_remove can drive a munmap S2C upcall back to THIS caller -- the exact
+		// caller-S2C shape that wedges a simple-ring-parked thread (dar-1il.1). The DUPLEX lane lets the
+		// caller pump that munmap S2C on its own thread while parked for the final reply. Try it FIRST
+		// (a strict no-op unless the per-command hatch DARLING_GUEST_DUPLEX_VM_DEALLOCATE=1 is set AND the
+		// VM_DEALLOCATE cap is negotiated). On a valid round-trip `code` is the kern_return_t, used
+		// verbatim. On ANY transport miss or a server PRE-MUTATION decline it returns nonzero and we
+		// UDS-fall-back -- safe, because the server declines BEFORE dispatching (the op runs exactly once).
+		// Folded away entirely unless -DDARLING_RING_TRANSPORT.
+		int code;
+		if (__dserver_ring_mach_vm_deallocate_duplex(target, address, size, &code) != 0) {
+			code = dserver_rpc_mach_vm_deallocate(target, address, size);
+		}
 
 		if (code < 0) {
 			__simple_printf("mach_vm_deallocate failed (internally): %d\n", code);
@@ -786,6 +798,11 @@ mach_port_name_t task_self_trap_impl(void)
 	// consumed by the first guest to claim it, so it never perturbs a normal boot. Folds away entirely
 	// when the dylib is built without the ring.
 	__dserver_ring_maybe_run_duplex_selftest();
+	// perf #18 P8 D6 (caller-S2C sideband): one-shot synthetic WARM real-munmap proof, driven here for the
+	// same reason (early trap, ring attached). Strict no-op unless the marker /private/tmp/.dring-d6-munmap-go
+	// exists. `self` is this task's mach_task_self() name -> the server resolves it to current_task() and
+	// frees our just-mapped page = a REAL caller-S2C munmap over the duplex lane.
+	__dserver_ring_maybe_run_d6_munmap_proof(self);
 	return self;
 }
 
