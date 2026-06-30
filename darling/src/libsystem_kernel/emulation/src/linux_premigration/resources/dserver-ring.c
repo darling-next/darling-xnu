@@ -328,6 +328,18 @@ int __dserver_ring_task_self_trap(uint32_t* out_port) {
 	return gr_port_trap((uint32_t)dserver_callnum_task_self_trap, out_port);
 }
 
+// perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap -- the remaining pure-mint self-trap
+// family. Byte-identical transport shape to task_self_trap (empty request, single uint32 port reply),
+// so they reuse gr_port_trap verbatim. Each routes over the ring iff it is in DSERVER_RING_C2S_OPCODES
+// (the shared allowlist the server keys off too); on any transport miss the caller UDS-falls-back.
+int __dserver_ring_thread_self_trap(uint32_t* out_port) {
+	return gr_port_trap((uint32_t)dserver_callnum_thread_self_trap, out_port);
+}
+
+int __dserver_ring_host_self_trap(uint32_t* out_port) {
+	return gr_port_trap((uint32_t)dserver_callnum_host_self_trap, out_port);
+}
+
 int __dserver_ring_mach_reply_port(uint32_t* out_port) {
 	return gr_port_trap((uint32_t)dserver_callnum_mach_reply_port, out_port);
 }
