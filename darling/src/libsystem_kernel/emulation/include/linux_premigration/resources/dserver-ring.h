@@ -53,6 +53,24 @@ int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32
 // the child re-attaches lazily). Called from the fork path alongside the socket refresh.
 void __dserver_ring_postfork_reset(void);
 
+// perf #18 P8 D3 (dar-1il.3.1.1): the synthetic DUPLEX-lane selftest. Advertises the SELFTEST duplex
+// capability, publishes the sentinel parent request carrying `arg`, runs the duplex wait-pump (services
+// the S2C upcall mailbox on THIS thread while waiting for the parent's final reply), and on success
+// writes the echo result (== arg ^ 0x5A5A5A5A) to *out_result + returns 0. Returns negative on any
+// transport miss / server-reported failure. Drives the REAL ring + server _drainDuplexReply + guest
+// pump end-to-end. NO real op rides the duplex lane (deallocate is Phase E, blocked on this being
+// GREEN). Only reached when both sides opt in (server hatch DARLING_SERVER_DUPLEX_SELFTEST=1, and the
+// guest driver __dserver_ring_maybe_run_duplex_selftest below, gated DARLING_GUEST_DUPLEX_SELFTEST=1).
+int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result);
+
+// One-shot guest driver, gated by the env var DARLING_GUEST_DUPLEX_SELFTEST=1. SAFETY DISCIPLINE: the
+// harness sets this env ONLY on the per-command `darling shell` invocation against an ALREADY-WARM
+// server -- NEVER at boot. So daemons (launchd, shellspawn), started before the env existed, never run
+// the selftest; only the explicitly-targeted leaf process does, prints a single stable stderr line the
+// D3 gate greps, and exits. (Setting the env at BOOT inherits it into shellspawn and wedges it -- don't.)
+// A strict no-op when the env is unset. Call it from an early trap (task_self_trap).
+void __dserver_ring_maybe_run_duplex_selftest(void);
+
 #else // !DARLING_RING_TRANSPORT
 
 // Folded-away stubs so call sites compile to nothing extra when the feature is off.
@@ -63,6 +81,8 @@ static inline int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t 
 static inline int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code) { (void)target; (void)right; (void)name_ptr; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) { (void)target; (void)name; (void)poly; (void)polyPoly; (void)out_code; return -1; }
 static inline void __dserver_ring_postfork_reset(void) {}
+static inline int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) { (void)arg; (void)out_result; return -1; }
+static inline void __dserver_ring_maybe_run_duplex_selftest(void) {}
 
 #endif // DARLING_RING_TRANSPORT
 
