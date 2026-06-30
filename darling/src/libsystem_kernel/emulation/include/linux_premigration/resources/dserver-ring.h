@@ -71,6 +71,16 @@ int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result);
 // A strict no-op when the env is unset. Call it from an early trap (task_self_trap).
 void __dserver_ring_maybe_run_duplex_selftest(void);
 
+// perf #18 P8 D4 (dar-1il.3.2.1): try mach_port_deallocate over the DUPLEX lane. The destroy-capable op
+// the duplex lane exists for: dropping the last ref of a mapped-region-backed port drives a vm-munmap
+// S2C upcall to THIS caller, which the caller pumps on its own thread while parked for the final reply
+// (impossible over the simple ring -> the dar-1il.1 deadlock). On a valid ring round-trip writes
+// *out_code (the kern_return_t, verbatim) + returns 0; returns negative on any transport miss OR a
+// server pre-mutation DECLINE -> caller MUST UDS-fall-back (safe: the decline is always pre-mutation, so
+// no double-effect). Routed ONLY behind the per-command hatch DARLING_GUEST_DUPLEX_DEALLOCATE=1 (default
+// OFF, same warm-server discipline as the selftest) AND the negotiated DUPLEX_CAP_DEALLOCATE.
+int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code);
+
 #else // !DARLING_RING_TRANSPORT
 
 // Folded-away stubs so call sites compile to nothing extra when the feature is off.
@@ -83,6 +93,7 @@ static inline int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_
 static inline void __dserver_ring_postfork_reset(void) {}
 static inline int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) { (void)arg; (void)out_result; return -1; }
 static inline void __dserver_ring_maybe_run_duplex_selftest(void) {}
+static inline int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code) { (void)target; (void)name; (void)out_code; return -1; }
 
 #endif // DARLING_RING_TRANSPORT
 
