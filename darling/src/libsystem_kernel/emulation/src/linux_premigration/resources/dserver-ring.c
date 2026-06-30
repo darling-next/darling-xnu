@@ -423,6 +423,149 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 	return rc;
 }
 
+// perf #18 D11 (dar-1il.6): generic fast path for a CLOSED op with a small inline request body AND a
+// small inline reply BODY (not just the kern_return code). Unlike gr_body_trap (header-only reply),
+// this also copies `replylen` bytes of reply body out of the slot into `reply_out` -- the over-the-wire
+// reply body is byte-identical to the UDS dserver_reply_<op>_t struct, because the server publishes
+// everything after the reply hdr onto the ring (_publishReplyToRingLocked). The result code is split
+// from the transport-miss sentinel exactly like gr_body_trap: returns 0 on a VALID ring round-trip and
+// writes *out_code (the kern_return_t, verbatim) + reply_out; returns -1 on ANY transport miss (no ring
+// / full / bad reply / shape mismatch), in which case the caller MUST UDS-fall-back. `replylen` is the
+// EXACT expected reply-body size (0 for a header-only reply -- then reply_out may be NULL); the reply is
+// accepted only if rep->length == sizeof(reply_hdr) + replylen, so a server that sent a different shape
+// (e.g. an error reply for a wrong-shaped request) is treated as a transport miss -> UDS-fall-back.
+static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
+                        void* reply_out, uint32_t replylen, int* out_code) {
+	if (!__dserver_ring_try_attach()) {
+		return -1; // no ring for this thread -> UDS fallback
+	}
+
+	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
+	if (bodylen > inlineCap || (uint32_t)sizeof(dserver_ring_reply_hdr_t) + replylen > inlineCap) {
+		return -1; // body/reply won't fit the slot -> UDS fallback (shouldn't happen for our small ops)
+	}
+
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t0 = gr_rdtsc();
+#endif
+	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
+	if (!req) {
+		return -1; // ring full -> UDS fallback
+	}
+	uint32_t seq = g_seq++;
+	req->callnum = callnum;
+	req->seq = seq;
+	req->length = bodylen;
+	req->arena_off = 0;
+	req->arena_len = 0;
+	req->flags = 0;
+	if (bodylen > 0) {
+		memcpy((char*)req + sizeof(dserver_ring_slot_t), body, bodylen);
+	}
+	dserver_ring_producer_publish(c2s);
+
+	gr_wake_server();
+
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t1 = gr_rdtsc(); // submit done
+#endif
+	dserver_ring_slot_t* rep = gr_wait_reply();
+	if (!rep) {
+		return -1; // gave up waiting -> UDS fallback
+	}
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
+#endif
+
+	// Validate the reply belongs to our request before trusting it. The reply must be EXACTLY
+	// {reply_hdr, replylen-byte body}; a different length means the server replied with a different
+	// shape (error/wrong op) -> treat as a transport miss so the caller UDS-falls-back and re-runs.
+	int rc = -1;
+	if (rep->seq == seq && rep->callnum == callnum) {
+		if (rep->length == (uint32_t)sizeof(dserver_ring_reply_hdr_t) + replylen && rep->length <= inlineCap) {
+			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
+			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
+			if (out_code) *out_code = rh->code;
+			if (replylen > 0 && reply_out) {
+				memcpy(reply_out, payload + sizeof(dserver_ring_reply_hdr_t), replylen);
+			}
+			rc = 0; // valid ring round-trip
+		}
+	}
+	dserver_ring_consumer_advance(gr_s2c());
+#ifdef DARLING_RING_PHASE_PROF
+	unsigned long _t3 = gr_rdtsc(); // observe done
+	gr_ph_submit  += (_t1 - _t0);
+	gr_ph_round   += (_t2 - _t1);
+	gr_ph_observe += (_t3 - _t2);
+	gr_ph_total   += (_t3 - _t0);
+	++gr_ph_n;
+	gr_phase_maybe_dump();
+#endif
+	return rc;
+}
+
+// perf #18 D11 (dar-1il.6): the 5 bulk Lane-1 op wrappers. Each mirrors the matching UDS
+// dserver_rpc_<op> contract: returns 0 + writes the out-params on a valid ring round-trip; returns
+// negative on any transport miss -> caller MUST UDS-fall-back. The request/reply body layouts below
+// are byte-identical to the generated dserver_call_<op>_t / dserver_reply_<op>_t structs (verified
+// against the generated rpc.h), so the server rebuilds {callhdr, body} and dispatches via the SAME
+// generic Call path / dtape primitive as over UDS -- behavior is byte-identical, only the transport
+// differs. None is destroy-capable or caller-S2C (canon rules 1-2 hold); they ride the GENERIC fiber
+// doWork() path (Tier-1, NOT the no-fiber inline fast path).
+
+int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid, int32_t* out_old_gid, int* out_code) {
+	// dserver_call_uidgid_t { int32_t new_uid; int32_t new_gid; } -> dserver_reply_uidgid_t { int32_t old_uid; int32_t old_gid; }
+	struct { int32_t new_uid; int32_t new_gid; } body = { new_uid, new_gid };
+	struct { int32_t old_uid; int32_t old_gid; } reply;
+	int rc = gr_full_trap((uint32_t)dserver_callnum_uidgid, &body, (uint32_t)sizeof(body),
+	                      &reply, (uint32_t)sizeof(reply), out_code);
+	if (rc == 0) {
+		if (out_old_uid) *out_old_uid = reply.old_uid;
+		if (out_old_gid) *out_old_gid = reply.old_gid;
+	}
+	return rc;
+}
+
+int __dserver_ring_set_thread_handles(uint64_t pthread_handle, uint64_t dispatch_qaddr, int* out_code) {
+	// dserver_call_set_thread_handles_t { uint64_t pthread_handle aligned(8); uint64_t dispatch_qaddr aligned(8); } -> header-only reply
+	struct {
+		uint64_t pthread_handle __attribute__((aligned(8)));
+		uint64_t dispatch_qaddr __attribute__((aligned(8)));
+	} body = { pthread_handle, dispatch_qaddr };
+	return gr_full_trap((uint32_t)dserver_callnum_set_thread_handles, &body, (uint32_t)sizeof(body),
+	                    (void*)0, 0, out_code);
+}
+
+int __dserver_ring_started_suspended(bool* out_suspended, int* out_code) {
+	// empty request -> dserver_reply_started_suspended_t { bool suspended; }
+	struct { bool suspended; } reply;
+	int rc = gr_full_trap((uint32_t)dserver_callnum_started_suspended, (void*)0, 0,
+	                      &reply, (uint32_t)sizeof(reply), out_code);
+	if (rc == 0 && out_suspended) *out_suspended = reply.suspended;
+	return rc;
+}
+
+int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code) {
+	// empty request -> dserver_reply_get_tracer_t { int32_t tracer; }
+	struct { int32_t tracer; } reply;
+	int rc = gr_full_trap((uint32_t)dserver_callnum_get_tracer, (void*)0, 0,
+	                      &reply, (uint32_t)sizeof(reply), out_code);
+	if (rc == 0 && out_tracer) *out_tracer = reply.tracer;
+	return rc;
+}
+
+int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code) {
+	// dserver_call_task_is_64_bit_t { int32_t id; } -> dserver_reply_task_is_64_bit_t { bool is_64_bit; }
+	struct { int32_t id; } body = { id };
+	struct { bool is_64_bit; } reply;
+	int rc = gr_full_trap((uint32_t)dserver_callnum_task_is_64_bit, &body, (uint32_t)sizeof(body),
+	                      &reply, (uint32_t)sizeof(reply), out_code);
+	if (rc == 0 && out_is_64_bit) *out_is_64_bit = reply.is_64_bit;
+	return rc;
+}
+
 // perf #18 P5-bulk audit (dar-1il.2): mach_port_mod_refs has NO ring helper -- it was removed from
 // DSERVER_RING_C2S_OPCODES because it is destroy-capable (negative-delta last-ref destroy -> vm
 // munmap S2C upcall to a caller parked on the ring -> deadlock; same class as mach_port_deallocate).

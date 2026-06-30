@@ -55,6 +55,18 @@ int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out
 int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code);
 int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code);
 
+// perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch (generic-fiber Tier-1). Each mirrors the
+// matching UDS dserver_rpc_<op> contract: on a VALID ring round-trip writes the out-params + *out_code
+// (the kern_return_t, verbatim) and returns 0; returns negative on ANY transport miss -> caller MUST
+// UDS-fall-back. Unlike the header-only mach_port_* helpers, these also carry a small FIXED reply BODY
+// (uidgid's old uid/gid, started_suspended's bool, get_tracer's tracer, task_is_64_bit's bool) which
+// the server publishes onto the ring verbatim. None is destroy-capable or caller-S2C (canon rules hold).
+int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid, int32_t* out_old_gid, int* out_code);
+int __dserver_ring_set_thread_handles(uint64_t pthread_handle, uint64_t dispatch_qaddr, int* out_code);
+int __dserver_ring_started_suspended(bool* out_suspended, int* out_code);
+int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code);
+int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code);
+
 // Reset ring state in the forked child (the parent's ring + wake fd are not valid post-fork;
 // the child re-attaches lazily). Called from the fork path alongside the socket refresh.
 void __dserver_ring_postfork_reset(void);
@@ -114,6 +126,11 @@ static inline int __dserver_ring_mach_reply_port(uint32_t* out_port) { (void)out
 static inline int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out_code) { (void)target; (void)name; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code) { (void)target; (void)right; (void)name_ptr; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) { (void)target; (void)name; (void)poly; (void)polyPoly; (void)out_code; return -1; }
+static inline int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid, int32_t* out_old_gid, int* out_code) { (void)new_uid; (void)new_gid; (void)out_old_uid; (void)out_old_gid; (void)out_code; return -1; }
+static inline int __dserver_ring_set_thread_handles(uint64_t pthread_handle, uint64_t dispatch_qaddr, int* out_code) { (void)pthread_handle; (void)dispatch_qaddr; (void)out_code; return -1; }
+static inline int __dserver_ring_started_suspended(bool* out_suspended, int* out_code) { (void)out_suspended; (void)out_code; return -1; }
+static inline int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code) { (void)out_tracer; (void)out_code; return -1; }
+static inline int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code) { (void)id; (void)out_is_64_bit; (void)out_code; return -1; }
 static inline void __dserver_ring_postfork_reset(void) {}
 static inline int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) { (void)arg; (void)out_result; return -1; }
 static inline void __dserver_ring_maybe_run_duplex_selftest(void) {}

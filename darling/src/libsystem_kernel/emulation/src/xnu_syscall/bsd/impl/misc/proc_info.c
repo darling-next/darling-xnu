@@ -31,6 +31,7 @@
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/readline.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 #define LINUX_PR_SET_NAME 15
 
@@ -431,7 +432,12 @@ static long _proc_pidinfo_shortbsdinfo(int32_t pid, void* buffer, int32_t bufsiz
 
 	// 32/64 bit detection
 	bool is_64_bit;
-	if (dserver_rpc_task_is_64_bit(pid, &is_64_bit) < 0) {
+	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber); on any ring miss fall back to UDS.
+	int t64_code;
+	if (__dserver_ring_task_is_64_bit(pid, &is_64_bit, &t64_code) != 0) {
+		t64_code = dserver_rpc_task_is_64_bit(pid, &is_64_bit);
+	}
+	if (t64_code < 0) {
 		is_64_bit = false;
 	}
 	if (is_64_bit)
