@@ -55,17 +55,78 @@ extern int dserver_rpc_ring_attach(int ring_fd, uint64_t mapping_size, uint32_t*
 #define GR_FUTEX_WAIT 0
 #define GR_FUTEX_WAKE 1
 
-// --- process-wide ring state (owned by the first attaching thread) ------------------------
-static int      g_ring_state = 0;        // 0=untried, 1=attached, -1=failed (UDS forever)
-static void*    g_ring_map = 0;
-static uint64_t g_ring_size = 0;
-static int      g_wake_fd = -1;
-static int      g_owner_tid = 0;         // gettid of the thread that owns the ring
-static uint32_t g_seq = 1;               // monotonic request seq (single-owner -> no race)
+// --- PER-THREAD ring lanes (perf #18 D16, dar-1il.11) -------------------------------------
+//
+// P3 shipped ONE process-wide ring owned by the first-attaching TID; every OTHER thread saw a foreign
+// owner and fell back to UDS. D15a measured the cost: ~2053 POST-attach eligible calls scattered to UDS
+// because the eligible-op traffic is multi-thread but the ring was single-thread. D16 gives EACH guest
+// thread its own SPSC lane (its own memfd/mapping/wake-fd/seq), so a non-owner thread's eligible ops ride
+// the ring instead of UDS. Each lane is still strictly SPSC (one guest thread <-> the server); we never
+// share a ring across threads (that would reintroduce the producer race the SPSC correctness depends on
+// NOT having). On lane exhaustion a thread cleanly UDS-falls-back -- never blocks, never shares.
+//
+// STORAGE = a fixed-max process-global TABLE indexed by hashed gettid (NOT __thread). __thread is unsafe
+// this far below libSystem: the perf#9 sleep accountant (rpc-sleep-account.h) records "TLS aborts here
+// pre-pthread", and P3 chose single-owner precisely to dodge guest TLS fragility. A static table keyed by
+// TID keeps the SPSC-per-thread invariant (each live TID maps to exactly one lane) WITHOUT relying on the
+// emulation layer's TLS machinery -- the storage mechanism is an impl detail; the per-thread SPSC lane is
+// the invariant. The bookkeeping (active bit published LAST on acquire, generation bumped on every
+// reclaim) is the contract pinned by tests/ring_multilane_gate_test.c (the dar-my8 exhaustive gate).
+#ifndef GR_MAX_LANES
+#define GR_MAX_LANES 64u   // fixed per-process cap; sized for the homebrew workload's thread fan-out.
+#endif                     // exceeding it -> UDS fallback (logged once), never a shared lane.
 
-static dserver_ring_shm_t* gr_cb(void)  { return (dserver_ring_shm_t*)g_ring_map; }
-static dserver_ring_t* gr_c2s(void)     { return (dserver_ring_t*)((char*)g_ring_map + gr_cb()->c2s_ring_off); }
-static dserver_ring_t* gr_s2c(void)     { return (dserver_ring_t*)((char*)g_ring_map + gr_cb()->s2c_ring_off); }
+typedef struct {
+	// `active` is the free/used marker AND the publish gate: a lane is usable iff active==1, and acquire
+	// sets active=1 LAST (release order) so a concurrent lookup never sees a half-initialized lane.
+	uint32_t active;       // 0 = free, 1 = live (atomic; published last on acquire, cleared first on release)
+	uint32_t generation;   // bumped on every (re)claim so a recycled TID can't match a stale lane epoch
+	int      state;        // 0=untried, 1=attached, -1=this lane failed (UDS for this thread)
+	int      owner_tid;    // gettid of the owning thread
+	void*    map;
+	uint64_t size;
+	int      wake_fd;
+	uint32_t seq;          // monotonic request seq for THIS lane (single-owner -> no race)
+} gr_lane_t;
+
+static gr_lane_t g_lanes[GR_MAX_LANES];
+static int       g_lanes_exhausted_logged = 0;
+
+static dserver_ring_shm_t* gr_cb(gr_lane_t* L)  { return (dserver_ring_shm_t*)L->map; }
+static dserver_ring_t* gr_c2s(gr_lane_t* L)     { return (dserver_ring_t*)((char*)L->map + gr_cb(L)->c2s_ring_off); }
+static dserver_ring_t* gr_s2c(gr_lane_t* L)     { return (dserver_ring_t*)((char*)L->map + gr_cb(L)->s2c_ring_off); }
+
+// Find THIS thread's already-attached lane, or NULL. Probes from a hashed start so distinct TIDs spread
+// across the table. A lane matches iff it is active for our TID (the active read is acquire-ordered, so
+// if we observe active==1 the lane is fully initialized -- the gate's INVARIANT 1).
+static gr_lane_t* gr_find_lane(int tid) {
+	uint32_t start = ((uint32_t)tid * 2654435761u) % GR_MAX_LANES; // Knuth multiplicative hash
+	for (uint32_t i = 0; i < GR_MAX_LANES; ++i) {
+		gr_lane_t* L = &g_lanes[(start + i) % GR_MAX_LANES];
+		if (__atomic_load_n(&L->active, __ATOMIC_ACQUIRE) == 1 && L->owner_tid == tid) {
+			return L;
+		}
+	}
+	return 0;
+}
+
+// Claim a FREE slot for THIS thread (active 0 -> claimed), or NULL if the table is full. The caller then
+// fully initializes the lane and publishes active=1 LAST. Single-threaded per OS thread for its own
+// claim, but two DIFFERENT threads may race for free slots concurrently, so the claim is a CAS on active
+// (0 -> a transient "claiming" sentinel 2) to guarantee distinct slots; we settle it to 1 only after init.
+static gr_lane_t* gr_claim_lane(int tid) {
+	uint32_t start = ((uint32_t)tid * 2654435761u) % GR_MAX_LANES;
+	for (uint32_t i = 0; i < GR_MAX_LANES; ++i) {
+		gr_lane_t* L = &g_lanes[(start + i) % GR_MAX_LANES];
+		uint32_t expected = 0;
+		// CAS 0 -> 2 ("claiming"): wins the slot exclusively without yet advertising it as usable (==1).
+		if (__atomic_compare_exchange_n(&L->active, &expected, 2u, false,
+		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+			return L;
+		}
+	}
+	return 0; // table full -> caller UDS-falls-back
+}
 
 #ifdef DARLING_RING_PHASE_PROF
 // perf #18 P6 (dar-aw2): guest-side rdtsc phase accountant. Pure diagnostic (default OFF, whole
@@ -107,28 +168,49 @@ static inline void gr_relax(void) {
 }
 
 void __dserver_ring_postfork_reset(void) {
-	// the parent's mapping + wake fd do not carry meaningful ownership into the child; drop
-	// everything and let the child re-attach lazily on its next eligible call.
-	if (g_ring_map && g_ring_size) {
-		LINUX_SYSCALL(__NR_munmap, g_ring_map, g_ring_size);
+	// fork() clones the parent's lane mappings + wake fds into the child, but they belong to the PARENT's
+	// server-side threads -- the child must NOT reuse them. Drop EVERY lane (munmap + close), zero the
+	// whole table, and let the child re-attach lazily, per thread, on its next eligible call. (The child
+	// typically has just one thread right after fork; it will claim a fresh lane on demand.)
+	for (uint32_t i = 0; i < GR_MAX_LANES; ++i) {
+		gr_lane_t* L = &g_lanes[i];
+		if (L->map && L->size) {
+			LINUX_SYSCALL(__NR_munmap, L->map, L->size);
+		}
+		if (L->wake_fd >= 0) {
+			LINUX_SYSCALL1(__NR_close, L->wake_fd);
+		}
+		// zero the lane completely: active=0 (free), generation back to 0 (a fresh post-fork epoch space).
+		L->active = 0;
+		L->generation = 0;
+		L->state = 0;
+		L->owner_tid = 0;
+		L->map = 0;
+		L->size = 0;
+		L->wake_fd = -1;
+		L->seq = 1;
 	}
-	if (g_wake_fd >= 0) {
-		LINUX_SYSCALL1(__NR_close, g_wake_fd);
-	}
-	g_ring_state = 0;
-	g_ring_map = 0;
-	g_ring_size = 0;
-	g_wake_fd = -1;
-	g_owner_tid = 0;
-	g_seq = 1;
+	g_lanes_exhausted_logged = 0;
 }
 
-bool __dserver_ring_try_attach(void) {
-	if (g_ring_state == 1) {
-		return (int)LINUX_SYSCALL(__NR_gettid) == g_owner_tid;
-	}
-	if (g_ring_state == -1) {
-		return false;
+// Attach a fresh ring lane for THIS thread: build the memfd, negotiate via ring_attach, and on success
+// fill + PUBLISH the lane (active=1 last). Returns the live lane, or NULL on any failure (no lane / table
+// full / server reject) -> the caller UDS-falls-back. This is the per-thread successor to P3's single
+// shared attach; the body (memfd/mmap/cb fill/RPC) is unchanged -- only the destination is a per-thread
+// lane instead of the g_* globals.
+static gr_lane_t* gr_attach_lane(int tid) {
+	gr_lane_t* L = gr_claim_lane(tid); // CAS-claims a free slot (active 0 -> 2 "claiming")
+	if (!L) {
+		// table full: every lane is in use by another live thread. Fall back to UDS for this thread (never
+		// share a lane -- that would break SPSC). Log once so an undersized GR_MAX_LANES is visible.
+		if (!g_lanes_exhausted_logged) {
+			g_lanes_exhausted_logged = 1;
+#ifdef DARLING_RING_PHASE_PROF
+			__simple_fprintf(2, "[dring] lane table exhausted (GR_MAX_LANES=%u) -- thread %d on UDS\n",
+				(unsigned)GR_MAX_LANES, tid);
+#endif
+		}
+		return 0;
 	}
 
 	// Lay out: [control block][c2s ring][s2c ring], each ring 64-aligned.
@@ -138,12 +220,13 @@ bool __dserver_ring_try_attach(void) {
 	uint64_t s2c_off = (c2s_off + ring_span + 63u) & ~63ull;
 	uint64_t total   = (s2c_off + ring_span + 63u) & ~63ull;
 
+	// On ANY failure below we must RELEASE the claimed slot (active back to 0) so it isn't leaked.
 	// memfd_create("dring", MFD_CLOEXEC=0x1)
 	long memfd = LINUX_SYSCALL(__NR_memfd_create, "dring", 0x1u);
-	if (memfd < 0) { g_ring_state = -1; return false; }
+	if (memfd < 0) { __atomic_store_n(&L->active, 0u, __ATOMIC_RELEASE); return 0; }
 	if (LINUX_SYSCALL(__NR_ftruncate, memfd, total) < 0) {
 		LINUX_SYSCALL1(__NR_close, memfd);
-		g_ring_state = -1; return false;
+		__atomic_store_n(&L->active, 0u, __ATOMIC_RELEASE); return 0;
 	}
 
 	// map RW shared
@@ -154,7 +237,7 @@ bool __dserver_ring_try_attach(void) {
 #endif
 	if ((unsigned long)map > (unsigned long)-4096) {
 		LINUX_SYSCALL1(__NR_close, memfd);
-		g_ring_state = -1; return false;
+		__atomic_store_n(&L->active, 0u, __ATOMIC_RELEASE); return 0;
 	}
 
 	// A freshly ftruncate'd memfd is zero-filled by the kernel, so the rings/control block
@@ -169,7 +252,7 @@ bool __dserver_ring_try_attach(void) {
 	cb->c2s_ring_off = (uint32_t)c2s_off;
 	cb->s2c_ring_off = (uint32_t)s2c_off;
 	cb->total_size = (uint32_t)total;
-	cb->guest_tid = (int32_t)LINUX_SYSCALL(__NR_gettid); // server cross-checks vs SCM nsid
+	cb->guest_tid = (int32_t)tid; // server cross-checks vs SCM nsid; this lane is attached by THIS thread
 	// perf #18 dar-1il.2 item 2: publish OUR compiled C2S opcode set as a hash. The server rejects
 	// the ring (-> reject_opcode_set -> we use UDS for everything) if it doesn't match the set the
 	// SERVER was built with -- so a guest/server build/version skew degrades cleanly to all-UDS
@@ -183,7 +266,9 @@ bool __dserver_ring_try_attach(void) {
 	cb->s2c_waiters = 0;
 
 	// negotiate over UDS: hand the memfd to the server. It validates + maps + returns the
-	// wake eventfd (or a non-zero reject reason).
+	// wake eventfd (or a non-zero reject reason). This is a per-THREAD attach -- the server keys the
+	// ring on this thread's nsid (RingAttach::processCall) and registers it in _ringThreads, so the
+	// main-loop spin phase drains every attached thread's lane independently. (Server already per-thread.)
 	uint32_t reject = 0;
 	int wake_fd = -1;
 	int rc = dserver_rpc_ring_attach((int)memfd, total, &reject, &wake_fd);
@@ -194,30 +279,53 @@ bool __dserver_ring_try_attach(void) {
 	if (rc != 0 || reject != dserver_ring_ok || wake_fd < 0) {
 		LINUX_SYSCALL(__NR_munmap, map, total);
 		if (wake_fd >= 0) LINUX_SYSCALL1(__NR_close, wake_fd);
-		g_ring_state = -1;
-		return false;
+		__atomic_store_n(&L->active, 0u, __ATOMIC_RELEASE); // release the claimed slot on reject
+		return 0;
 	}
 
-	g_ring_map = map;
-	g_ring_size = total;
-	g_wake_fd = wake_fd;
-	g_owner_tid = (int)LINUX_SYSCALL(__NR_gettid);
-	g_ring_state = 1;
-	return true;
+	// INITIALIZE the lane fully, then PUBLISH active=1 LAST (the gate's INVARIANT 1). Bump the generation
+	// on this (re)claim so a recycled TID landing on this slot can never match a prior epoch (INVARIANT 2).
+	L->map = map;
+	L->size = total;
+	L->wake_fd = wake_fd;
+	L->owner_tid = tid;
+	L->seq = 1;
+	L->state = 1;
+	L->generation = L->generation + 1; // distinct epoch for this claim
+	__atomic_store_n(&L->active, 1u, __ATOMIC_RELEASE); // publish LAST: lane now usable + findable
+	return L;
 }
 
-// Wake the server -- CONDITIONALLY (perf #18 P4). We just published a request. The server only
+// Resolve THIS thread's lane: return its already-attached lane, or attach a fresh one, or NULL (no lane
+// for this thread -> UDS fallback). This is the per-thread successor to the P3 single-owner gate.
+static gr_lane_t* gr_lane_for_this_thread(void) {
+	int tid = (int)LINUX_SYSCALL(__NR_gettid);
+	gr_lane_t* L = gr_find_lane(tid);
+	if (L) {
+		return (L->state == 1) ? L : 0;
+	}
+	return gr_attach_lane(tid);
+}
+
+// Back-compat bool wrapper (the duplex selftest entry points still call this to gate themselves). True iff
+// THIS thread has (or just acquired) a usable lane. The lane itself is resolved again by the caller via
+// gr_lane_for_this_thread; this is only the "do I have a ring?" predicate.
+bool __dserver_ring_try_attach(void) {
+	return gr_lane_for_this_thread() != 0;
+}
+
+// Wake the server -- CONDITIONALLY (perf #18 P4). We just published a request on lane L. The server only
 // needs a doorbell if it is not actively polling its rings; while it spins (ACTIVE_POLLING) it
 // will see our new c2s tail on its own, so the eventfd write is pure overhead and we skip it.
 // dserver_ring_guest_should_doorbell() reads the server-published state with acquire ordering;
 // a stale read at worst costs one redundant write, never a missed wake (an old/0 value ==
-// SLEEPING_EPOLL == "doorbell", the safe direction).
-static void gr_wake_server(void) {
-	if (!dserver_ring_guest_should_doorbell(gr_cb())) {
+// SLEEPING_EPOLL == "doorbell", the safe direction). Each lane has its OWN wake fd (per-thread).
+static void gr_wake_server(gr_lane_t* L) {
+	if (!dserver_ring_guest_should_doorbell(gr_cb(L))) {
 		return; // server is draining rings; it'll pick up our request without a syscall
 	}
 	uint64_t one = 1;
-	LINUX_SYSCALL(__NR_write, g_wake_fd, &one, sizeof(one));
+	LINUX_SYSCALL(__NR_write, L->wake_fd, &one, sizeof(one));
 }
 
 // Wait for a reply on s2c: bounded spin, then cross-process FUTEX_WAIT on s2c_futex.
@@ -230,8 +338,8 @@ static void gr_wake_server(void) {
 // to wake us; we clear it on the way out. The bit is set BEFORE the pre-sleep ring recheck, so the
 // server can never publish-then-skip-wake while we're committed to sleeping (it reads the bit
 // after publishing; if it sees 0 we hadn't slept yet and are still spinning the recheck).
-static dserver_ring_slot_t* gr_wait_reply(void) {
-	dserver_ring_t* s2c = gr_s2c();
+static dserver_ring_slot_t* gr_wait_reply(gr_lane_t* L) {
+	dserver_ring_t* s2c = gr_s2c(L);
 	for (int i = 0; i < (DARLING_GUEST_RECVSPIN); ++i) {
 		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
 		if (rep) return rep;
@@ -239,8 +347,8 @@ static dserver_ring_slot_t* gr_wait_reply(void) {
 	}
 	// Slow path: advertise ourselves as a parked waiter so the server's conditional FUTEX_WAKE
 	// fires, then sleep on the futex until it bumps the word. Re-check after each wake.
-	uint32_t* word = &gr_cb()->s2c_futex;
-	uint32_t* waiters = &gr_cb()->s2c_waiters;
+	uint32_t* word = &gr_cb(L)->s2c_futex;
+	uint32_t* waiters = &gr_cb(L)->s2c_waiters;
 	__atomic_store_n(waiters, 1u, __ATOMIC_RELEASE);
 	dserver_ring_slot_t* result = 0;
 	for (int guard = 0; guard < 100000; ++guard) {
@@ -263,19 +371,20 @@ static dserver_ring_slot_t* gr_wait_reply(void) {
 // *out_port on success, negative on any miss (caller UDS-falls-back). The reply convention
 // ({reply_hdr.code, uint32 port}) is identical for both calls, so one helper covers them.
 static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
-	if (!__dserver_ring_try_attach()) {
+	gr_lane_t* L = gr_lane_for_this_thread();
+	if (!L) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t0 = gr_rdtsc();
 #endif
-	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_t* c2s = gr_c2s(L);
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
 		return -1; // ring full -> UDS fallback
 	}
-	uint32_t seq = g_seq++;
+	uint32_t seq = L->seq++;
 	req->callnum = callnum;
 	req->seq = seq;
 	req->length = 0;
@@ -284,15 +393,15 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 	req->flags = 0;
 	dserver_ring_producer_publish(c2s);
 
-	gr_wake_server();
+	gr_wake_server(L);
 
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t1 = gr_rdtsc(); // submit done
 #endif
-	dserver_ring_slot_t* rep = gr_wait_reply();
+	dserver_ring_slot_t* rep = gr_wait_reply(L);
 	if (!rep) {
-		return -1; // gave up waiting -> UDS fallback (the reply may still land; P3 single
-		           // owner means the next attach re-syncs; acceptable for the first op)
+		return -1; // gave up waiting -> UDS fallback (the reply may still land; single
+		           // owner per lane means the next attach re-syncs; acceptable for the first op)
 	}
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
@@ -311,7 +420,7 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 			rc = rh->code;
 		}
 	}
-	dserver_ring_consumer_advance(gr_s2c());
+	dserver_ring_consumer_advance(gr_s2c(L));
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t3 = gr_rdtsc(); // observe (validate + copy out) done
 	gr_ph_submit  += (_t1 - _t0);
@@ -357,7 +466,8 @@ int __dserver_ring_mach_reply_port(uint32_t* out_port) {
 // with the "-1 = retry on UDS" sentinel (gr_port_trap could conflate them only because that op's
 // code is always 0).
 static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, int* out_code) {
-	if (!__dserver_ring_try_attach()) {
+	gr_lane_t* L = gr_lane_for_this_thread();
+	if (!L) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 
@@ -369,12 +479,12 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t0 = gr_rdtsc();
 #endif
-	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_t* c2s = gr_c2s(L);
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
 		return -1; // ring full -> UDS fallback
 	}
-	uint32_t seq = g_seq++;
+	uint32_t seq = L->seq++;
 	req->callnum = callnum;
 	req->seq = seq;
 	req->length = bodylen;
@@ -386,12 +496,12 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 	}
 	dserver_ring_producer_publish(c2s);
 
-	gr_wake_server();
+	gr_wake_server(L);
 
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t1 = gr_rdtsc(); // submit done
 #endif
-	dserver_ring_slot_t* rep = gr_wait_reply();
+	dserver_ring_slot_t* rep = gr_wait_reply(L);
 	if (!rep) {
 		return -1; // gave up waiting -> UDS fallback
 	}
@@ -410,7 +520,7 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 			rc = 0; // valid ring round-trip
 		}
 	}
-	dserver_ring_consumer_advance(gr_s2c());
+	dserver_ring_consumer_advance(gr_s2c(L));
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t3 = gr_rdtsc(); // observe done
 	gr_ph_submit  += (_t1 - _t0);
@@ -436,7 +546,8 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 // (e.g. an error reply for a wrong-shaped request) is treated as a transport miss -> UDS-fall-back.
 static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
                         void* reply_out, uint32_t replylen, int* out_code) {
-	if (!__dserver_ring_try_attach()) {
+	gr_lane_t* L = gr_lane_for_this_thread();
+	if (!L) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 
@@ -448,12 +559,12 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t0 = gr_rdtsc();
 #endif
-	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_t* c2s = gr_c2s(L);
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
 		return -1; // ring full -> UDS fallback
 	}
-	uint32_t seq = g_seq++;
+	uint32_t seq = L->seq++;
 	req->callnum = callnum;
 	req->seq = seq;
 	req->length = bodylen;
@@ -465,12 +576,12 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 	}
 	dserver_ring_producer_publish(c2s);
 
-	gr_wake_server();
+	gr_wake_server(L);
 
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t1 = gr_rdtsc(); // submit done
 #endif
-	dserver_ring_slot_t* rep = gr_wait_reply();
+	dserver_ring_slot_t* rep = gr_wait_reply(L);
 	if (!rep) {
 		return -1; // gave up waiting -> UDS fallback
 	}
@@ -493,7 +604,7 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 			rc = 0; // valid ring round-trip
 		}
 	}
-	dserver_ring_consumer_advance(gr_s2c());
+	dserver_ring_consumer_advance(gr_s2c(L));
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t3 = gr_rdtsc(); // observe done
 	gr_ph_submit  += (_t1 - _t0);
@@ -662,15 +773,16 @@ int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t n
 // published the correlated reply + doorbelled the server), 0 if none was pending. The ECHO shape is
 // the only one the minimal protocol supports; an unknown shape is replied with a nonzero status so the
 // server fails the parent rather than hanging.
-static int gr_duplex_pump_once(void) {
+static int gr_duplex_pump_once(gr_lane_t* L) {
 #ifdef DUPLEX_RED_NO_GUEST_PUMP
+	(void)L;
 	// RED arm for the D3 real-dylib gate: the guest NEVER services the S2C upcall. The parked caller
 	// then sleeps through the upcall forever -> the selftest must FAIL/timeout (the parent reply never
 	// comes) AND the server must NOT wedge (other clients keep making progress). Proves the gate
 	// actually exercises the guest pump + the server's bounded, scoped wait.
 	return 0;
 #else
-	dserver_ring_shm_t* cb = gr_cb();
+	dserver_ring_shm_t* cb = gr_cb(L);
 	if (!dserver_ring_duplex_upcall_available(cb)) {
 		return 0;
 	}
@@ -694,7 +806,7 @@ static int gr_duplex_pump_once(void) {
 			errno_result = 0;
 		}
 		dserver_ring_duplex_publish_munmap_reply(cb, parent, uid, return_value, errno_result);
-		gr_wake_server();
+		gr_wake_server(L);
 		return 1;
 	}
 	uint32_t a      = cb->duplex_upcall_arg;
@@ -708,7 +820,7 @@ static int gr_duplex_pump_once(void) {
 	// publish the reply (this consumes the upcall + advertises the reply, both release-stores).
 	dserver_ring_duplex_publish_reply(cb, parent, uid, status, result);
 	// the reply is server-inbound work; doorbell conditionally so an epoll-sleeping server drains it.
-	gr_wake_server();
+	gr_wake_server(L);
 	return 1;
 #endif // DUPLEX_RED_NO_GUEST_PUMP
 }
@@ -717,11 +829,11 @@ static int gr_duplex_pump_once(void) {
 // a pointer to the published final-reply slot, or NULL on give-up (caller treats as failure). This is
 // gr_wait_reply's structure with the upcall pump interleaved into BOTH the spin and the parked loop, so
 // a parked caller can never sleep through an upcall (the duplex wake model, ring_duplex_wake_gate_test).
-static dserver_ring_slot_t* gr_duplex_wait_reply(void) {
-	dserver_ring_t* s2c = gr_s2c();
+static dserver_ring_slot_t* gr_duplex_wait_reply(gr_lane_t* L) {
+	dserver_ring_t* s2c = gr_s2c(L);
 	for (int i = 0; i < (DARLING_GUEST_RECVSPIN); ++i) {
 		// pump first: an upcall must be serviced before the parent reply can ever arrive.
-		while (gr_duplex_pump_once()) { /* drain all currently-pending upcalls */ }
+		while (gr_duplex_pump_once(L)) { /* drain all currently-pending upcalls */ }
 		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
 		if (rep) return rep;
 		gr_relax();
@@ -736,8 +848,8 @@ static dserver_ring_slot_t* gr_duplex_wait_reply(void) {
 	// are trying to prevent (and, since the selftest can run in launchd, would wedge boot). So we cap
 	// the total parked time and give up -> the caller treats NULL as failure (in a real lane: UDS
 	// fall-back). The cap is generous (a real reply lands in microseconds) so it never trips in GREEN.
-	uint32_t* word = &gr_cb()->s2c_futex;
-	uint32_t* waiters = &gr_cb()->s2c_waiters;
+	uint32_t* word = &gr_cb(L)->s2c_futex;
+	uint32_t* waiters = &gr_cb(L)->s2c_waiters;
 	__atomic_store_n(waiters, 1u, __ATOMIC_RELEASE);
 	dserver_ring_slot_t* result = 0;
 	// 50ms per FUTEX_WAIT * up to 60 rounds = ~3s total worst-case bound before giving up.
@@ -748,7 +860,7 @@ static dserver_ring_slot_t* gr_duplex_wait_reply(void) {
 		// through. The waiter bit is already set, so any reply/upcall the server publishes bumps the
 		// futex word -> our FUTEX_WAIT returns EAGAIN and we re-pump. (duplex wake model: guest pump.)
 #ifndef D6_RED_NO_PUMP
-		while (gr_duplex_pump_once()) { /* drain */ }
+		while (gr_duplex_pump_once(L)) { /* drain */ }
 #endif
 		// D6_RED_NO_PUMP arm: the guest NEVER pumps the S2C upcall. The server's caller-S2C munmap is then
 		// never serviced -> the parent op never completes -> the wait MUST bound out (return NULL) without
@@ -769,19 +881,20 @@ static dserver_ring_slot_t* gr_duplex_wait_reply(void) {
 // bad or error reply) -- in a real lane the caller would UDS-fall-back; here it just signals failure.
 // Drives the REAL transport: real ring publish, real server _drainDuplexReply, real guest pump.
 int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) {
-	if (!__dserver_ring_try_attach()) {
+	gr_lane_t* L = gr_lane_for_this_thread();
+	if (!L) {
 		return -1; // no ring for this thread
 	}
 	// advertise that we can pump the SELFTEST upcall shape; the server's guard requires this cap.
 	// (release so the server sees it before it can observe our sentinel request.)
-	__atomic_store_n(&gr_cb()->duplex_caps, DSERVER_RING_DUPLEX_CAP_SELFTEST, __ATOMIC_RELEASE);
+	__atomic_store_n(&gr_cb(L)->duplex_caps, DSERVER_RING_DUPLEX_CAP_SELFTEST, __ATOMIC_RELEASE);
 
-	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_t* c2s = gr_c2s(L);
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
 		return -2; // ring full
 	}
-	uint32_t seq = g_seq++;
+	uint32_t seq = L->seq++;
 	req->callnum = DSERVER_RING_DUPLEX_SELFTEST_CALLNUM;
 	req->seq = seq;
 	req->length = (uint32_t)sizeof(uint32_t);
@@ -790,9 +903,9 @@ int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) {
 	req->flags = 0;
 	memcpy((char*)req + sizeof(dserver_ring_slot_t), &arg, sizeof(arg));
 	dserver_ring_producer_publish(c2s);
-	gr_wake_server();
+	gr_wake_server(L);
 
-	dserver_ring_slot_t* rep = gr_duplex_wait_reply();
+	dserver_ring_slot_t* rep = gr_duplex_wait_reply(L);
 	if (!rep) {
 		return -3; // gave up waiting for the final reply
 	}
@@ -812,7 +925,7 @@ int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) {
 			}
 		}
 	}
-	dserver_ring_consumer_advance(gr_s2c());
+	dserver_ring_consumer_advance(gr_s2c(L));
 	return rc;
 }
 
@@ -946,12 +1059,13 @@ int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, i
 	if (!gr_dealloc_via_duplex_enabled()) {
 		return -1; // hatch off -> UDS (the default path)
 	}
-	if (!__dserver_ring_try_attach()) {
+	gr_lane_t* L = gr_lane_for_this_thread();
+	if (!L) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 	// advertise that we can pump the munmap S2C upcall shape (the server's duplex guard requires it).
 	// release so the server sees the cap before it can observe our deallocate parent request.
-	__atomic_store_n(&gr_cb()->duplex_caps,
+	__atomic_store_n(&gr_cb(L)->duplex_caps,
 		DSERVER_RING_DUPLEX_CAP_SELFTEST | DSERVER_RING_DUPLEX_CAP_DEALLOCATE, __ATOMIC_RELEASE);
 
 	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
@@ -960,12 +1074,12 @@ int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, i
 	if ((uint32_t)sizeof(body) > inlineCap) {
 		return -1;
 	}
-	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_t* c2s = gr_c2s(L);
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
 		return -1; // ring full -> UDS fallback
 	}
-	uint32_t seq = g_seq++;
+	uint32_t seq = L->seq++;
 	req->callnum = (uint32_t)dserver_callnum_mach_port_deallocate;
 	req->seq = seq;
 	req->length = (uint32_t)sizeof(body);
@@ -974,10 +1088,10 @@ int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, i
 	req->flags = 0;
 	memcpy((char*)req + sizeof(dserver_ring_slot_t), &body, sizeof(body));
 	dserver_ring_producer_publish(c2s);
-	gr_wake_server();
+	gr_wake_server(L);
 
 	// wait for the parent's FINAL reply, pumping any munmap S2C upcalls on THIS thread meanwhile.
-	dserver_ring_slot_t* rep = gr_duplex_wait_reply();
+	dserver_ring_slot_t* rep = gr_duplex_wait_reply(L);
 	if (!rep) {
 		return -1; // gave up (bounded) -> UDS fallback (server declined pre-mutation, so safe)
 	}
@@ -996,7 +1110,7 @@ int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, i
 			}
 		}
 	}
-	dserver_ring_consumer_advance(gr_s2c());
+	dserver_ring_consumer_advance(gr_s2c(L));
 	return rc;
 }
 
@@ -1085,14 +1199,15 @@ int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, 
 	if (!g_d6_proof_force && !gr_vm_dealloc_via_duplex_enabled()) {
 		return -1; // hatch off -> UDS (the default path)
 	}
-	if (!__dserver_ring_try_attach()) {
+	gr_lane_t* L = gr_lane_for_this_thread();
+	if (!L) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 	// advertise that we can pump the munmap S2C upcall shape for a vm_deallocate parent. release so the
 	// server sees the cap before it can observe our vm_deallocate parent request. We OR in (not overwrite)
 	// so a process that already advertised SELFTEST/DEALLOCATE keeps those.
-	uint32_t prev = __atomic_load_n(&gr_cb()->duplex_caps, __ATOMIC_ACQUIRE);
-	__atomic_store_n(&gr_cb()->duplex_caps,
+	uint32_t prev = __atomic_load_n(&gr_cb(L)->duplex_caps, __ATOMIC_ACQUIRE);
+	__atomic_store_n(&gr_cb(L)->duplex_caps,
 		prev | DSERVER_RING_DUPLEX_CAP_SELFTEST | DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE, __ATOMIC_RELEASE);
 
 	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
@@ -1106,12 +1221,12 @@ int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, 
 	if ((uint32_t)sizeof(body) > inlineCap) {
 		return -1;
 	}
-	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_t* c2s = gr_c2s(L);
 	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
 	if (!req) {
 		return -1; // ring full -> UDS fallback
 	}
-	uint32_t seq = g_seq++;
+	uint32_t seq = L->seq++;
 	req->callnum = (uint32_t)dserver_callnum_mach_vm_deallocate;
 	req->seq = seq;
 	req->length = (uint32_t)sizeof(body);
@@ -1120,10 +1235,10 @@ int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, 
 	req->flags = 0;
 	memcpy((char*)req + sizeof(dserver_ring_slot_t), &body, sizeof(body));
 	dserver_ring_producer_publish(c2s);
-	gr_wake_server();
+	gr_wake_server(L);
 
 	// wait for the parent's FINAL reply, pumping any munmap S2C upcalls on THIS thread meanwhile.
-	dserver_ring_slot_t* rep = gr_duplex_wait_reply();
+	dserver_ring_slot_t* rep = gr_duplex_wait_reply(L);
 	if (!rep) {
 		// PUBLISHED-then-TIMEOUT (bounded ~3s). CRITICAL: we have ALREADY published the parent onto the
 		// duplex lane, so the SERVER owns this op now -- it may have already performed the munmap. We must
@@ -1149,7 +1264,7 @@ int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, 
 			}
 		}
 	}
-	dserver_ring_consumer_advance(gr_s2c());
+	dserver_ring_consumer_advance(gr_s2c(L));
 	return rc;
 }
 
