@@ -81,6 +81,22 @@ void __dserver_ring_maybe_run_duplex_selftest(void);
 // OFF, same warm-server discipline as the selftest) AND the negotiated DUPLEX_CAP_DEALLOCATE.
 int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code);
 
+// perf #18 P8 D5 (dar-1il.3.2.2): try mach_vm_deallocate over the DUPLEX lane. THE op that actually drives
+// a real caller munmap S2C in Darling (vm_map_remove -> dtape_hook_task_free_pages -> _munmap ->
+// _s2cPerform), so this is the live caller-S2C cure proof D4 could not get. Reuses the D4 duplex munmap
+// transport verbatim. On a valid ring round-trip writes *out_code (the kern_return_t, verbatim) + returns
+// 0; returns negative on any transport miss OR a server pre-mutation DECLINE -> caller MUST UDS-fall-back
+// (safe: decline is always pre-mutation). Routed ONLY behind the per-command hatch
+// DARLING_GUEST_DUPLEX_VM_DEALLOCATE=1 (default OFF) AND the negotiated DUPLEX_CAP_VM_DEALLOCATE.
+int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, uint64_t size, int* out_code);
+
+// perf #18 P8 D6 (caller-S2C sideband): one-shot synthetic WARM real-munmap proof. Marker-gated
+// (/private/tmp/.dring-d6-munmap-go, consumed once); maps a real page then sends vm_deallocate of it over
+// the duplex ring (target==self_task_name) so the server frees OUR map -> a REAL caller-S2C munmap rides
+// the duplex mailbox = ring_duplex_s2c>0 live. self_task_name is the caller's mach_task_self() port name.
+// Strict no-op unless the marker exists. Driven from task_self_trap_impl (early, ring attached).
+void __dserver_ring_maybe_run_d6_munmap_proof(uint32_t self_task_name);
+
 #else // !DARLING_RING_TRANSPORT
 
 // Folded-away stubs so call sites compile to nothing extra when the feature is off.
@@ -94,6 +110,8 @@ static inline void __dserver_ring_postfork_reset(void) {}
 static inline int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) { (void)arg; (void)out_result; return -1; }
 static inline void __dserver_ring_maybe_run_duplex_selftest(void) {}
 static inline int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code) { (void)target; (void)name; (void)out_code; return -1; }
+static inline int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, uint64_t size, int* out_code) { (void)target; (void)address; (void)size; (void)out_code; return -1; }
+static inline void __dserver_ring_maybe_run_d6_munmap_proof(uint32_t self_task_name) { (void)self_task_name; }
 
 #endif // DARLING_RING_TRANSPORT
 
