@@ -16,6 +16,7 @@
 #include <darling/emulation/common/simple.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 // Support for Darwin debugging.
 // Unlike other Unix-like systems, macOS doesn't use wait() to handle events in the debugged process.
@@ -126,7 +127,11 @@ void sigexc_setup(void)
 
 #ifdef VARIANT_DYLD
 	bool started_suspended;
-	int code = dserver_rpc_started_suspended(&started_suspended);
+	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber); on any ring miss fall back to UDS.
+	int code;
+	if (__dserver_ring_started_suspended(&started_suspended, &code) != 0) {
+		code = dserver_rpc_started_suspended(&started_suspended);
+	}
 	if (code < 0) {
 		__simple_printf("Failed to get started_suspended status: %d\n", code);
 		__simple_abort();
@@ -137,7 +142,10 @@ void sigexc_setup(void)
 		kern_printf("sigexc: start_suspended -> wokenup (ret to %p)\n", __builtin_return_address(0));
 	} else {
 		int32_t tracer;
-		code = dserver_rpc_get_tracer(&tracer);
+		// perf #18 D11 (dar-1il.6): ride the ring; on any ring miss fall back to UDS.
+		if (__dserver_ring_get_tracer(&tracer, &code) != 0) {
+			code = dserver_rpc_get_tracer(&tracer);
+		}
 		if (code < 0) {
 			__simple_printf("Failed to get tracer status: %d\n", code);
 			__simple_abort();
