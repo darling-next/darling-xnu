@@ -25,6 +25,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/write.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 
 #undef memcpy
@@ -46,7 +47,17 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 	uint64_t mldr_path_length;
 	const char* path_to_exec = vc.path;
 
-	ret = dserver_rpc_mldr_path(mldr_path, sizeof(mldr_path), &mldr_path_length);
+	// perf #18 D13 (dar-1il.8): try the ring first (fixed 16B body, 8B reply; the path itself is
+	// delivered by the server's writeMemory on our /proc/mem, transport-agnostic). On any transport
+	// miss (-1) fall back to UDS, preserving this site's exact result semantics.
+	{
+		int t_code;
+		if (__dserver_ring_mldr_path((uint64_t)(uintptr_t)mldr_path, sizeof(mldr_path), &mldr_path_length, &t_code) == 0) {
+			ret = t_code;
+		} else {
+			ret = dserver_rpc_mldr_path(mldr_path, sizeof(mldr_path), &mldr_path_length);
+		}
+	}
 	if (ret < 0) {
 		return errno_linux_to_bsd(ret);
 	}
