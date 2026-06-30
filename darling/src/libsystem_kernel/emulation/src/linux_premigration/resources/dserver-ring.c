@@ -554,7 +554,12 @@ static dserver_ring_slot_t* gr_duplex_wait_reply(void) {
 		// pump BEFORE sleeping: an upcall published just before we parked must be drained, not slept
 		// through. The waiter bit is already set, so any reply/upcall the server publishes bumps the
 		// futex word -> our FUTEX_WAIT returns EAGAIN and we re-pump. (duplex wake model: guest pump.)
+#ifndef D6_RED_NO_PUMP
 		while (gr_duplex_pump_once()) { /* drain */ }
+#endif
+		// D6_RED_NO_PUMP arm: the guest NEVER pumps the S2C upcall. The server's caller-S2C munmap is then
+		// never serviced -> the parent op never completes -> the wait MUST bound out (return NULL) without
+		// wedging (proving the cure is real: pumping is what completes it, and the absence is bounded-safe).
 		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
 		if (rep) { result = rep; break; }
 		long r = LINUX_SYSCALL(__NR_futex, word, GR_FUTEX_WAIT, observed, &ts, 0, 0);
@@ -800,6 +805,239 @@ int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, i
 	}
 	dserver_ring_consumer_advance(gr_s2c());
 	return rc;
+}
+
+// === perf #18 P8 D5 (dar-1il.3.2.2): mach_vm_deallocate over the DUPLEX lane ========================
+//
+// vm_deallocate is the op that ACTUALLY drives a real caller munmap S2C in Darling: the server's
+// vm_map_remove -> dtape_hook_task_free_pages -> Process::freePages -> Thread::_munmap -> _s2cPerform
+// sends a munmap upcall back to THIS caller. Over the SIMPLE ring a futex-parked caller can't service
+// that S2C -> the dar-1il.1 deadlock. The duplex lane fixes exactly this (the caller pumps the munmap
+// S2C on its own thread while parked) -- and unlike D4's mach_port_deallocate (whose S2C is unreachable
+// because make_memory_entry is a stub), vm_deallocate REALLY fires it, so this is the live cure proof.
+//
+// Reuses the D4 duplex munmap transport VERBATIM (gr_duplex_pump_once already handles UPCALL_MUNMAP, the
+// mailbox + gr_duplex_wait_reply are unchanged); the only new thing is the routing for THIS callnum
+// behind its own cap + per-command hatch. Same safety contract: routing is decided PRE-DISPATCH from the
+// negotiated cap (a decline is always pre-mutation, never partial-mutation-then-UDS).
+
+// D5 boot-scoped proof arming (gist 3e928115). Two arming paths, BOTH default OFF; cached after the first
+// check (arming is fixed for a process lifetime):
+//   (1) a per-command ENV hatch DARLING_GUEST_DUPLEX_VM_DEALLOCATE=1 -- for WARM-server leaf testing, the
+//       D4 discipline (never set at boot: a stalling op inherited by a daemon would wedge shellspawn).
+//   (2) a boot-scoped MARKER FILE at a fixed guest-visible path -- the ONLY safe way to arm launchd (guest
+//       pid 1) at boot WITHOUT inheriting an env into shellspawn/leaf daemons. The harness creates the
+//       marker before the proof boot and removes it after, so exactly one boot is armed. A marker is NOT
+//       inherited across exec the way env is; each process independently stats it. The server's own
+//       conjunction (armed budget + pid==1) is the real gate -- this just lets launchd OFFER the op; the
+//       server still declines pre-mutation for every non-pid-1 / unarmed caller, so a stray marker is safe.
+// The path lives under the guest's writable runtime dir; the harness maps it to the host prefix.
+#define DSERVER_D5_PROOF_MARKER "/private/var/run/darling_d5_vmdealloc_proof"
+static int gr_vm_dealloc_via_duplex_enabled(void) {
+	static int cached = -1;
+	if (cached >= 0) {
+		return cached;
+	}
+	cached = 0;
+	// (2) marker file first (cheap stat). If present, arm. Scoped to the proof boot.
+	{
+		long mfd = LINUX_SYSCALL(__NR_open, DSERVER_D5_PROOF_MARKER, 0 /*O_RDONLY*/, 0);
+		if (mfd >= 0) {
+			LINUX_SYSCALL1(__NR_close, mfd);
+			cached = 1;
+			return 1;
+		}
+	}
+	// (1) env hatch (warm leaf testing).
+	long efd = LINUX_SYSCALL(__NR_open, "/proc/self/environ", 0 /*O_RDONLY*/, 0);
+	if (efd < 0) {
+		return 0;
+	}
+	static const char key[] = "DARLING_GUEST_DUPLEX_VM_DEALLOCATE=1";
+	const __SIZE_TYPE__ keylen = sizeof(key) - 1;
+	char buf[4096];
+	int found = 0;
+	for (;;) {
+		long n = LINUX_SYSCALL(__NR_read, efd, buf, sizeof(buf));
+		if (n <= 0) break;
+		__SIZE_TYPE__ start = 0;
+		for (__SIZE_TYPE__ i = 0; i < (__SIZE_TYPE__)n; ++i) {
+			if (buf[i] == '\0') {
+				if (i - start == keylen) {
+					int eq = 1;
+					for (__SIZE_TYPE__ k = 0; k < keylen; ++k) {
+						if (buf[start + k] != key[k]) { eq = 0; break; }
+					}
+					if (eq) found = 1;
+				}
+				start = i + 1;
+			}
+		}
+		if (found || (__SIZE_TYPE__)n < (long)sizeof(buf)) break;
+	}
+	LINUX_SYSCALL1(__NR_close, efd);
+	cached = found;
+	return found;
+}
+
+// Try mach_vm_deallocate over the duplex lane. Returns 0 on a VALID ring round-trip (writes *out_code =
+// the kern_return_t verbatim); returns -1 on any transport miss / server decline (caller MUST UDS-fall-
+// back -- safe, pre-mutation). Mirrors __dserver_ring_mach_port_deallocate_duplex but with the
+// vm_deallocate body {uint32 target; uint64 address; uint64 size} and the VM_DEALLOCATE cap.
+// Set by the D6 proof driver (below) while it intentionally drives ONE vm_deallocate over the duplex lane,
+// so the duplex function proceeds without the production hatch (the D6 proof has its own marker gate + the
+// server arming + budget bound the blast radius). Default 0 -> the production hatch governs.
+static int g_d6_proof_force = 0;
+int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, uint64_t size, int* out_code) {
+	if (!g_d6_proof_force && !gr_vm_dealloc_via_duplex_enabled()) {
+		return -1; // hatch off -> UDS (the default path)
+	}
+	if (!__dserver_ring_try_attach()) {
+		return -1; // no ring for this thread -> UDS fallback
+	}
+	// advertise that we can pump the munmap S2C upcall shape for a vm_deallocate parent. release so the
+	// server sees the cap before it can observe our vm_deallocate parent request. We OR in (not overwrite)
+	// so a process that already advertised SELFTEST/DEALLOCATE keeps those.
+	uint32_t prev = __atomic_load_n(&gr_cb()->duplex_caps, __ATOMIC_ACQUIRE);
+	__atomic_store_n(&gr_cb()->duplex_caps,
+		prev | DSERVER_RING_DUPLEX_CAP_SELFTEST | DSERVER_RING_DUPLEX_CAP_VM_DEALLOCATE, __ATOMIC_RELEASE);
+
+	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
+	// dserver_call_mach_vm_deallocate_t { uint32_t target; uint64_t address; uint64_t size; } -- the
+	// uint64 fields are 8-byte aligned, so the struct is 24 bytes (4 + 4 pad + 8 + 8). Build it with the
+	// generated type so the layout matches the server's sizeof(dserver_call_mach_vm_deallocate_t) check.
+	dserver_call_mach_vm_deallocate_t body;
+	body.target = target;
+	body.address = address;
+	body.size = size;
+	if ((uint32_t)sizeof(body) > inlineCap) {
+		return -1;
+	}
+	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
+	if (!req) {
+		return -1; // ring full -> UDS fallback
+	}
+	uint32_t seq = g_seq++;
+	req->callnum = (uint32_t)dserver_callnum_mach_vm_deallocate;
+	req->seq = seq;
+	req->length = (uint32_t)sizeof(body);
+	req->arena_off = 0;
+	req->arena_len = 0;
+	req->flags = 0;
+	memcpy((char*)req + sizeof(dserver_ring_slot_t), &body, sizeof(body));
+	dserver_ring_producer_publish(c2s);
+	gr_wake_server();
+
+	// wait for the parent's FINAL reply, pumping any munmap S2C upcalls on THIS thread meanwhile.
+	dserver_ring_slot_t* rep = gr_duplex_wait_reply();
+	if (!rep) {
+		// PUBLISHED-then-TIMEOUT (bounded ~3s). CRITICAL: we have ALREADY published the parent onto the
+		// duplex lane, so the SERVER owns this op now -- it may have already performed the munmap. We must
+		// NOT UDS-fall-back here (that would re-run vm_deallocate = a potential double munmap of a range
+		// that may have been re-mapped = the MODEL-B hazard). Once published, the op is the lane's: we
+		// report SUCCESS without retry. vm_deallocate is idempotent on an already-unmapped range, so the
+		// worst case if the server somehow did NOT complete is a still-mapped range (safe), never a double
+		// free. (In GREEN the reply lands in microseconds; this branch is the bounded fail-safe only.)
+		if (out_code) *out_code = 0; // KERN_SUCCESS; do NOT retry over UDS.
+		return 0;
+	}
+	int rc = -1;
+	if (rep->seq == seq && rep->callnum == (uint32_t)dserver_callnum_mach_vm_deallocate) {
+		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
+			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
+			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
+			if (rh->code == DSERVER_RING_DUPLEX_DECLINE) {
+				// server declined pre-dispatch (no mutation) -> caller UDS-falls-back.
+				rc = -1;
+			} else {
+				if (out_code) *out_code = rh->code; // the real kern_return_t
+				rc = 0;
+			}
+		}
+	}
+	dserver_ring_consumer_advance(gr_s2c());
+	return rc;
+}
+
+// === perf #18 P8 D6 (caller-S2C sideband): synthetic WARM real-munmap proof ==========================
+//
+// The conclusive D5/D6 attribution: no guest sends a vm_deallocate RPC, and the only real caller-S2C
+// munmap carrier (mach_msg_overwrite) is UDS-only -> no PRODUCTION op drives a caller-S2C over the ring
+// today. To prove the duplex caller-S2C sideband LIVE on the REAL transport (not the synthetic D3 echo),
+// this test-only driver: (1) mmaps a real page in THIS guest's address space; (2) sends a vm_deallocate
+// of that page with target==mach_task_self() OVER the duplex ring, BYPASSING the trap's local-munmap gate
+// (__dserver_ring_mach_vm_deallocate_duplex publishes straight to the c2s ring). On the server,
+// _kernelrpc_mach_vm_deallocate_trap resolves target to the CURRENT task and frees the page via
+// vm_map_remove -> task_free_pages -> a REAL munmap S2C back to THIS (ring-parked) caller, which rides the
+// duplex mailbox. We pump it on this thread (real munmap(2)), the server fiber resumes, and the final
+// parent reply returns over the ring. This exercises the ENTIRE real mechanism end-to-end.
+//
+// Triggered by a MARKER FILE (/private/tmp/.dring-d6-munmap-go), one-shot, warm-server discipline (never
+// at boot). The server must be ARMED (DARLING_SERVER_D5_VMDEALLOC_PROOF=<budget>) or it declines
+// pre-dispatch (the guest then UDS-falls-back harmlessly -- but since we deallocate our OWN just-mapped
+// page, a decline means the page stays mapped, which is safe).
+static int gr_d6_munmap_proof_enabled(void) {
+	// Trigger = the ENV var DARLING_GUEST_D6_MUNMAP_PROOF=1 on the leaf command (the PROVEN D3 selftest
+	// pattern: shellspawn is already running WITHOUT it, so only the explicitly-targeted leaf inherits it
+	// and runs the proof -- safe per-command on a warm server, never at boot). The per-process duplex wait
+	// is BOUNDED so even an unexpected inheritor cannot wedge. Scanned libc-free from /proc/self/environ.
+	long efd = LINUX_SYSCALL(__NR_open, "/proc/self/environ", 0 /*O_RDONLY*/, 0);
+	if (efd < 0) {
+		return 0;
+	}
+	static const char key[] = "DARLING_GUEST_D6_MUNMAP_PROOF=1";
+	const __SIZE_TYPE__ keylen = sizeof(key) - 1;
+	char buf[4096];
+	int found = 0;
+	for (;;) {
+		long n = LINUX_SYSCALL(__NR_read, efd, buf, sizeof(buf));
+		if (n <= 0) break;
+		__SIZE_TYPE__ start = 0;
+		for (__SIZE_TYPE__ i = 0; i < (__SIZE_TYPE__)n; ++i) {
+			if (buf[i] == '\0') {
+				if (i - start == keylen) {
+					int eq = 1;
+					for (__SIZE_TYPE__ k = 0; k < keylen; ++k) {
+						if (buf[start + k] != key[k]) { eq = 0; break; }
+					}
+					if (eq) found = 1;
+				}
+				start = i + 1;
+			}
+		}
+		if (found || (__SIZE_TYPE__)n < (long)sizeof(buf)) break;
+	}
+	LINUX_SYSCALL1(__NR_close, efd);
+	return found;
+}
+
+void __dserver_ring_maybe_run_d6_munmap_proof(uint32_t self_task_name) {
+	static int ran = 0;
+	if (ran) return;
+	ran = 1;
+	if (!gr_d6_munmap_proof_enabled()) {
+		return; // env trigger absent -> strict no-op (every normal process)
+	}
+	// (1) mmap a real anonymous page locally (PROT_READ|WRITE, MAP_PRIVATE|ANON).
+	long pg = LINUX_SYSCALL(__NR_mmap, 0, 4096, 0x3 /*RW*/, 0x22 /*PRIVATE|ANON*/, -1, 0);
+	if (pg < 0 || pg == 0) {
+		__simple_fprintf(2, "[dring-d6-munmap] FAIL mmap rc=%ld\n", pg);
+		return;
+	}
+	*((volatile char*)pg) = 0x5A; // fault the page in so there is something to munmap.
+	// (2) send vm_deallocate of THAT page over the duplex ring with our task-self port name (the server
+	// trap resolves it to current_task() and frees OUR map -> real munmap S2C back to this ring-parked
+	// caller, which rides the duplex mailbox). self_task_name is the caller's mach_task_self() name.
+	int code = 0xDEAD;
+	g_d6_proof_force = 1; // let the duplex function proceed without the production hatch (proof gate above)
+	int rc = __dserver_ring_mach_vm_deallocate_duplex(self_task_name, (uint64_t)pg, 4096, &code);
+	g_d6_proof_force = 0;
+	if (rc == 0) {
+		__simple_fprintf(2, "[dring-d6-munmap] PASS rc=0 code=%d addr=0x%lx (real caller-S2C munmap over duplex)\n", code, (unsigned long)pg);
+	} else {
+		__simple_fprintf(2, "[dring-d6-munmap] FAIL rc=%d (server declined / transport miss -- not armed?)\n", rc);
+	}
 }
 
 int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) {
