@@ -53,6 +53,12 @@ mach_port_name_t mach_reply_port_impl(void)
 mach_port_name_t thread_self_trap_impl(void)
 {
 	unsigned int port_name;
+	// perf #18 D10 (dar-1il.5): try the shared-memory ring first; on any miss fall back to the UDS
+	// wrapper. Folds away (always returns -1) unless built with -DDARLING_RING_TRANSPORT. Uncached
+	// (per-thread port), unlike task_self_trap.
+	if (__dserver_ring_thread_self_trap(&port_name) == 0) {
+		return port_name;
+	}
 	if (dserver_rpc_thread_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
@@ -62,6 +68,11 @@ mach_port_name_t thread_self_trap_impl(void)
 mach_port_name_t host_self_trap_impl(void)
 {
 	unsigned int port_name;
+	// perf #18 D10 (dar-1il.5): try the ring first, UDS fallback on any miss. Folds away when the ring
+	// is compiled out.
+	if (__dserver_ring_host_self_trap(&port_name) == 0) {
+		return port_name;
+	}
 	if (dserver_rpc_host_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}

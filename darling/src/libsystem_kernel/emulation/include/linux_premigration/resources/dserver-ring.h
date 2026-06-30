@@ -31,6 +31,12 @@ bool __dserver_ring_try_attach(void);
 // task_self_trap is cached per-process (perf #7) so it's correctness-first; mach_reply_port is
 // the UNCACHED high-frequency op that actually exercises the ring's latency win.
 int __dserver_ring_task_self_trap(uint32_t* out_port);
+// perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap, the remaining pure-mint self-trap
+// family (same empty-request/port-reply shape as task_self_trap). Uncached (unlike task_self_trap):
+// thread_self_trap is per-thread, host_self_trap left uncached to keep this bead minimal -- the win is
+// the ring transport, not caching (perf#7, orthogonal). 0 on a valid round-trip; negative -> UDS-fall-back.
+int __dserver_ring_thread_self_trap(uint32_t* out_port);
+int __dserver_ring_host_self_trap(uint32_t* out_port);
 int __dserver_ring_mach_reply_port(uint32_t* out_port);
 
 // perf #18 P5-bulk: small-inline-body ops with a header-only reply. On a valid ring round-trip each
@@ -102,6 +108,8 @@ void __dserver_ring_maybe_run_d6_munmap_proof(uint32_t self_task_name);
 // Folded-away stubs so call sites compile to nothing extra when the feature is off.
 static inline bool __dserver_ring_try_attach(void) { return false; }
 static inline int __dserver_ring_task_self_trap(uint32_t* out_port) { (void)out_port; return -1; }
+static inline int __dserver_ring_thread_self_trap(uint32_t* out_port) { (void)out_port; return -1; }
+static inline int __dserver_ring_host_self_trap(uint32_t* out_port) { (void)out_port; return -1; }
 static inline int __dserver_ring_mach_reply_port(uint32_t* out_port) { (void)out_port; return -1; }
 static inline int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out_code) { (void)target; (void)name; (void)out_code; return -1; }
 static inline int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code) { (void)target; (void)right; (void)name_ptr; (void)out_code; return -1; }
