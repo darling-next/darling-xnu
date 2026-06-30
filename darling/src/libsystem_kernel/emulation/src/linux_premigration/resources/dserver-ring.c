@@ -92,6 +92,17 @@ typedef struct {
 static gr_lane_t g_lanes[GR_MAX_LANES];
 static int       g_lanes_exhausted_logged = 0;
 
+// perf #18 D17 (dar-1il.12): GUEST-side lane stats (RECON-only; plain process-global counters bumped on
+// the slow attach path, NOT the hot publish path). Dumped to stderr once per process at clean exit when
+// DARLING_GUEST_LANE_STATS=1 (the same libc-free stderr discipline as the duplex selftest; default OFF ->
+// the dump function early-returns and these counters are simply never read). They answer the D17 C-vs-A
+// question from the guest side: lanes_acquired (successful attaches in THIS process), lanes_exhausted
+// (claims that found the table full -> UDS fallback = reason C if >0), lanes_reclaimed (a slot reused after
+// a prior epoch -> generation bumped from nonzero).
+static uint64_t g_stat_lanes_acquired = 0;
+static uint64_t g_stat_lanes_exhausted = 0;
+static uint64_t g_stat_lanes_reclaimed = 0;
+
 static dserver_ring_shm_t* gr_cb(gr_lane_t* L)  { return (dserver_ring_shm_t*)L->map; }
 static dserver_ring_t* gr_c2s(gr_lane_t* L)     { return (dserver_ring_t*)((char*)L->map + gr_cb(L)->c2s_ring_off); }
 static dserver_ring_t* gr_s2c(gr_lane_t* L)     { return (dserver_ring_t*)((char*)L->map + gr_cb(L)->s2c_ring_off); }
@@ -201,6 +212,7 @@ void __dserver_ring_postfork_reset(void) {
 static gr_lane_t* gr_attach_lane(int tid) {
 	gr_lane_t* L = gr_claim_lane(tid); // CAS-claims a free slot (active 0 -> 2 "claiming")
 	if (!L) {
+		g_stat_lanes_exhausted++; // D17: a claim that found the table full (reason C if this is ever >0)
 		// table full: every lane is in use by another live thread. Fall back to UDS for this thread (never
 		// share a lane -- that would break SPSC). Log once so an undersized GR_MAX_LANES is visible.
 		if (!g_lanes_exhausted_logged) {
@@ -291,7 +303,11 @@ static gr_lane_t* gr_attach_lane(int tid) {
 	L->owner_tid = tid;
 	L->seq = 1;
 	L->state = 1;
+	if (L->generation != 0) {
+		g_stat_lanes_reclaimed++; // D17: this slot held a prior epoch -> it is being REUSED (not first use)
+	}
 	L->generation = L->generation + 1; // distinct epoch for this claim
+	g_stat_lanes_acquired++; // D17: a successful per-thread attach in this process ("lanes acquired")
 	__atomic_store_n(&L->active, 1u, __ATOMIC_RELEASE); // publish LAST: lane now usable + findable
 	return L;
 }
@@ -312,6 +328,62 @@ static gr_lane_t* gr_lane_for_this_thread(void) {
 // gr_lane_for_this_thread; this is only the "do I have a ring?" predicate.
 bool __dserver_ring_try_attach(void) {
 	return gr_lane_for_this_thread() != 0;
+}
+
+// perf #18 D17 (dar-1il.12): dump this process's per-thread lane stats to stderr, ONCE, on the clean exit
+// path (called from sys_exit, mirroring __darling_rpc_sleep_dump). Default OFF: strict no-op unless the
+// env DARLING_GUEST_LANE_STATS=1 is set (scanned libc-free from /proc/self/environ, same discipline as the
+// other recon hatches -- set per-command on a warm server, NOT at boot, so daemons don't all dump). This
+// surfaces the GUEST-side lane stats the server can't see directly: lanes_exhausted (>0 == reason C),
+// lanes_reclaimed (slot reuse), and a live snapshot of how many lanes this process actually holds.
+static int g_lane_stats_dumped = 0;
+void __dserver_ring_lane_stats_dump(void) {
+	if (g_lane_stats_dumped) {
+		return;
+	}
+	g_lane_stats_dumped = 1;
+	// env gate (libc-free scan of /proc/self/environ for DARLING_GUEST_LANE_STATS=1).
+	long efd = LINUX_SYSCALL(__NR_open, "/proc/self/environ", 0 /*O_RDONLY*/, 0);
+	if (efd < 0) {
+		return;
+	}
+	static const char key[] = "DARLING_GUEST_LANE_STATS=1";
+	const __SIZE_TYPE__ keylen = sizeof(key) - 1;
+	char buf[4096];
+	int found = 0;
+	for (;;) {
+		long n = LINUX_SYSCALL(__NR_read, efd, buf, sizeof(buf));
+		if (n <= 0) break;
+		__SIZE_TYPE__ start = 0;
+		for (__SIZE_TYPE__ i = 0; i < (__SIZE_TYPE__)n; ++i) {
+			if (buf[i] == '\0') {
+				if (i - start == keylen) {
+					int eq = 1;
+					for (__SIZE_TYPE__ k = 0; k < keylen; ++k) {
+						if (buf[start + k] != key[k]) { eq = 0; break; }
+					}
+					if (eq) found = 1;
+				}
+				start = i + 1;
+			}
+		}
+		if (found || (__SIZE_TYPE__)n < (long)sizeof(buf)) break;
+	}
+	LINUX_SYSCALL1(__NR_close, efd);
+	if (!found) {
+		return; // env not set -> strict no-op (every normal process)
+	}
+	// count lanes this process currently holds (active==1) for max-lanes context.
+	unsigned held = 0;
+	for (uint32_t i = 0; i < GR_MAX_LANES; ++i) {
+		if (__atomic_load_n(&g_lanes[i].active, __ATOMIC_RELAXED) == 1) ++held;
+	}
+	__simple_fprintf(2, "[dring-lane-stats] pid=%d acquired=%llu exhausted=%llu reclaimed=%llu held_now=%u max=%u\n",
+		(int)LINUX_SYSCALL(__NR_getpid),
+		(unsigned long long)g_stat_lanes_acquired,
+		(unsigned long long)g_stat_lanes_exhausted,
+		(unsigned long long)g_stat_lanes_reclaimed,
+		held, (unsigned)GR_MAX_LANES);
 }
 
 // Wake the server -- CONDITIONALLY (perf #18 P4). We just published a request on lane L. The server only
