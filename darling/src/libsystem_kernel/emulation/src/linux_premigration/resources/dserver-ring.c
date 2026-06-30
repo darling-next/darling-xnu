@@ -450,6 +450,221 @@ int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t n
 	return gr_body_trap((uint32_t)dserver_callnum_mach_port_allocate, &body, (uint32_t)sizeof(body), out_code);
 }
 
+// === perf #18 P8 D3 (dar-1il.3.1.1): DUPLEX-lane wait-pump + synthetic selftest =====================
+//
+// The duplex lane lets the server deliver an S2C upcall to a caller that is PARKED on the ring (not in
+// recvmsg) -- the deadlock class that kept deallocate/mod_refs on UDS. The minimal D3 proof drives ONE
+// synthetic ECHO upcall end-to-end through the REAL dylib: the guest publishes a sentinel parent
+// request, then runs a wait-pump that, while waiting for the parent's final reply, ALSO services the
+// S2C upcall mailbox -- handling each upcall ON THIS (caller) thread and replying with matching
+// correlation ids. NO real op rides this yet (deallocate is Phase E, blocked on D3 GREEN).
+//
+// Wake discipline mirrors gr_wait_reply (the proven Lane-1 model): bounded spin watching BOTH the s2c
+// reply ring AND the duplex upcall mailbox, then a FUTEX_WAIT on s2c_futex with the waiter bit set
+// before the pre-sleep recheck (no lost wake). After publishing an upcall REPLY we doorbell the server
+// (it may be epoll-sleeping; the reply is server-inbound work just like a request is), conditionally,
+// exactly like gr_wake_server.
+
+// Handle ONE pending duplex S2C upcall on THIS thread, if present. Returns 1 if it handled one (and
+// published the correlated reply + doorbelled the server), 0 if none was pending. The ECHO shape is
+// the only one the minimal protocol supports; an unknown shape is replied with a nonzero status so the
+// server fails the parent rather than hanging.
+static int gr_duplex_pump_once(void) {
+#ifdef DUPLEX_RED_NO_GUEST_PUMP
+	// RED arm for the D3 real-dylib gate: the guest NEVER services the S2C upcall. The parked caller
+	// then sleeps through the upcall forever -> the selftest must FAIL/timeout (the parent reply never
+	// comes) AND the server must NOT wedge (other clients keep making progress). Proves the gate
+	// actually exercises the guest pump + the server's bounded, scoped wait.
+	return 0;
+#else
+	dserver_ring_shm_t* cb = gr_cb();
+	if (!dserver_ring_duplex_upcall_available(cb)) {
+		return 0;
+	}
+	uint32_t op     = cb->duplex_upcall_op;
+	uint32_t parent = cb->duplex_upcall_parent;
+	uint32_t uid    = cb->duplex_upcall_id;
+	uint32_t a      = cb->duplex_upcall_arg;
+	int32_t  status = 0;
+	uint32_t result = 0;
+	if (op == DSERVER_RING_DUPLEX_UPCALL_ECHO) {
+		result = dserver_ring_duplex_echo_transform(a);
+	} else {
+		status = -1; // unsupported shape -> the server fails the parent
+	}
+	// publish the reply (this consumes the upcall + advertises the reply, both release-stores).
+	dserver_ring_duplex_publish_reply(cb, parent, uid, status, result);
+	// the reply is server-inbound work; doorbell conditionally so an epoll-sleeping server drains it.
+	gr_wake_server();
+	return 1;
+#endif // DUPLEX_RED_NO_GUEST_PUMP
+}
+
+// Wait for the sentinel parent's FINAL reply on the s2c ring while pumping duplex S2C upcalls. Returns
+// a pointer to the published final-reply slot, or NULL on give-up (caller treats as failure). This is
+// gr_wait_reply's structure with the upcall pump interleaved into BOTH the spin and the parked loop, so
+// a parked caller can never sleep through an upcall (the duplex wake model, ring_duplex_wake_gate_test).
+static dserver_ring_slot_t* gr_duplex_wait_reply(void) {
+	dserver_ring_t* s2c = gr_s2c();
+	for (int i = 0; i < (DARLING_GUEST_RECVSPIN); ++i) {
+		// pump first: an upcall must be serviced before the parent reply can ever arrive.
+		while (gr_duplex_pump_once()) { /* drain all currently-pending upcalls */ }
+		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
+		if (rep) return rep;
+		gr_relax();
+	}
+	// Slow path: park on the s2c futex. Set the waiter bit BEFORE the recheck so the server's
+	// conditional FUTEX_WAKE fires; re-pump + re-check the ring after every wake.
+	//
+	// CRITICAL (the lane's whole reason to exist): the FUTEX_WAIT is BOUNDED (a per-wait timespec),
+	// NOT an indefinite block. The duplex lane exists to keep a caller-S2C op from DEADLOCKING a parked
+	// guest; if an upcall is somehow never serviced (a bug, a torn-down server, or -- in the D3 RED arm
+	// -- a deliberately disabled pump), an UNBOUNDED FUTEX_WAIT would re-introduce exactly the wedge we
+	// are trying to prevent (and, since the selftest can run in launchd, would wedge boot). So we cap
+	// the total parked time and give up -> the caller treats NULL as failure (in a real lane: UDS
+	// fall-back). The cap is generous (a real reply lands in microseconds) so it never trips in GREEN.
+	uint32_t* word = &gr_cb()->s2c_futex;
+	uint32_t* waiters = &gr_cb()->s2c_waiters;
+	__atomic_store_n(waiters, 1u, __ATOMIC_RELEASE);
+	dserver_ring_slot_t* result = 0;
+	// 50ms per FUTEX_WAIT * up to 60 rounds = ~3s total worst-case bound before giving up.
+	struct { long tv_sec; long tv_nsec; } ts = { 0, 50L * 1000L * 1000L };
+	for (int guard = 0; guard < 60; ++guard) {
+		uint32_t observed = __atomic_load_n(word, __ATOMIC_ACQUIRE);
+		// pump BEFORE sleeping: an upcall published just before we parked must be drained, not slept
+		// through. The waiter bit is already set, so any reply/upcall the server publishes bumps the
+		// futex word -> our FUTEX_WAIT returns EAGAIN and we re-pump. (duplex wake model: guest pump.)
+		while (gr_duplex_pump_once()) { /* drain */ }
+		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
+		if (rep) { result = rep; break; }
+		long r = LINUX_SYSCALL(__NR_futex, word, GR_FUTEX_WAIT, observed, &ts, 0, 0);
+		(void)r; // EAGAIN (word changed) / EINTR / ETIMEDOUT -> re-loop, re-pump, re-check; on a
+		         // persistent no-reply we exhaust the guard and return NULL (bounded, no wedge).
+	}
+	__atomic_store_n(waiters, 0u, __ATOMIC_RELEASE);
+	return result;
+}
+
+// The synthetic selftest entry. Advertises the SELFTEST duplex capability, publishes the sentinel
+// parent request carrying `arg`, runs the duplex wait-pump, and on success writes the final echo
+// result to *out_result and returns 0. Returns negative on any transport miss (no ring / ring full /
+// bad or error reply) -- in a real lane the caller would UDS-fall-back; here it just signals failure.
+// Drives the REAL transport: real ring publish, real server _drainDuplexReply, real guest pump.
+int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) {
+	if (!__dserver_ring_try_attach()) {
+		return -1; // no ring for this thread
+	}
+	// advertise that we can pump the SELFTEST upcall shape; the server's guard requires this cap.
+	// (release so the server sees it before it can observe our sentinel request.)
+	__atomic_store_n(&gr_cb()->duplex_caps, DSERVER_RING_DUPLEX_CAP_SELFTEST, __ATOMIC_RELEASE);
+
+	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
+	if (!req) {
+		return -2; // ring full
+	}
+	uint32_t seq = g_seq++;
+	req->callnum = DSERVER_RING_DUPLEX_SELFTEST_CALLNUM;
+	req->seq = seq;
+	req->length = (uint32_t)sizeof(uint32_t);
+	req->arena_off = 0;
+	req->arena_len = 0;
+	req->flags = 0;
+	memcpy((char*)req + sizeof(dserver_ring_slot_t), &arg, sizeof(arg));
+	dserver_ring_producer_publish(c2s);
+	gr_wake_server();
+
+	dserver_ring_slot_t* rep = gr_duplex_wait_reply();
+	if (!rep) {
+		return -3; // gave up waiting for the final reply
+	}
+	int rc = -4;
+	if (rep->seq == seq && rep->callnum == DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) {
+		uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
+		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
+			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
+			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
+			if (rh->code != 0) {
+				rc = -5; // server reported the parent failed (guard declined / mis-correlation)
+			} else if (rep->length >= sizeof(dserver_ring_reply_hdr_t) + sizeof(uint32_t)) {
+				uint32_t result;
+				memcpy(&result, payload + sizeof(dserver_ring_reply_hdr_t), sizeof(result));
+				if (out_result) *out_result = result;
+				rc = 0;
+			}
+		}
+	}
+	dserver_ring_consumer_advance(gr_s2c());
+	return rc;
+}
+
+// The selftest trigger is a MARKER FILE, not an env var. A marker scopes the selftest to the test run
+// (absent on a normal boot -> strict no-op) without the env-inheritance hazard of disrupting a specific
+// daemon. The TRIGGER is the env var DARLING_GUEST_DUPLEX_SELFTEST=1, scanned libc-free from
+// /proc/self/environ. THE DISCIPLINE THAT MAKES IT SAFE: the harness sets the env ONLY on the
+// per-command `darling shell` invocation against an ALREADY-WARM server -- it does NOT set it at boot.
+// So the long-lived daemons (launchd, shellspawn) were started without it and never run the selftest;
+// only the explicitly-targeted leaf process inherits the env and runs it. (An env set at BOOT time IS
+// inherited by shellspawn and wedges it -- do not do that.) Belt-and-suspenders: we also skip guest
+// pid 1, and the per-process duplex wait is BOUNDED so even an unexpected daemon hit cannot wedge.
+static int gr_duplex_selftest_enabled(void) {
+	long efd = LINUX_SYSCALL(__NR_open, "/proc/self/environ", 0 /*O_RDONLY*/, 0);
+	if (efd < 0) {
+		return 0;
+	}
+	static const char key[] = "DARLING_GUEST_DUPLEX_SELFTEST=1";
+	const __SIZE_TYPE__ keylen = sizeof(key) - 1;
+	char buf[4096];
+	int found = 0;
+	for (;;) {
+		long n = LINUX_SYSCALL(__NR_read, efd, buf, sizeof(buf));
+		if (n <= 0) break;
+		__SIZE_TYPE__ start = 0;
+		for (__SIZE_TYPE__ i = 0; i < (__SIZE_TYPE__)n; ++i) {
+			if (buf[i] == '\0') {
+				if (i - start == keylen) {
+					int eq = 1;
+					for (__SIZE_TYPE__ k = 0; k < keylen; ++k) {
+						if (buf[start + k] != key[k]) { eq = 0; break; }
+					}
+					if (eq) found = 1;
+				}
+				start = i + 1;
+			}
+		}
+		if (found || (__SIZE_TYPE__)n < (long)sizeof(buf)) break;
+	}
+	LINUX_SYSCALL1(__NR_close, efd);
+	return found;
+}
+
+void __dserver_ring_maybe_run_duplex_selftest(void) {
+	static int ran = 0;
+	if (ran) {
+		return; // one-shot per process
+	}
+	ran = 1;
+	if (!gr_duplex_selftest_enabled()) {
+		return; // env not set -> strict no-op (every daemon on a normal boot)
+	}
+	// Skip guest init (launchd == guest-pid 1) defensively.
+	if ((int)LINUX_SYSCALL(__NR_getpid) == 1) {
+		return;
+	}
+	uint32_t arg = 0xC0FFEE42u;
+	uint32_t result = 0;
+	int rc = __dserver_ring_duplex_selftest(arg, &result);
+	uint32_t expect = dserver_ring_duplex_echo_transform(arg);
+	// stable, greppable single line for the D3 gate. PASS only iff rc==0 AND echo matches.
+	if (rc == 0 && result == expect) {
+		__simple_fprintf(2, "[dring-duplex-selftest] PASS rc=0 arg=0x%x result=0x%x expect=0x%x\n",
+			arg, result, expect);
+	} else {
+		__simple_fprintf(2, "[dring-duplex-selftest] FAIL rc=%d arg=0x%x result=0x%x expect=0x%x\n",
+			rc, arg, result, expect);
+	}
+}
+
 int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) {
 	// dserver_call_mach_port_insert_right_t { uint32_t target; uint32_t name; uint32_t poly; int32_t polyPoly; }
 	struct {

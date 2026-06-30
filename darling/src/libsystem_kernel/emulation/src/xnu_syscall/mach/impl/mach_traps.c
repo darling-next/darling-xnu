@@ -772,7 +772,14 @@ mach_port_name_t task_self_trap_impl(void)
 {
 	// perf #7: the task self port is immutable per process; serve it from the cache
 	// (filled by one real RPC, reset on fork via __darling_reset_cached_self_ports).
-	return cached_self_port_get(&__task_self_port_cache, __task_self_trap_rpc);
+	mach_port_name_t self = cached_self_port_get(&__task_self_port_cache, __task_self_trap_rpc);
+	// perf #18 P8 D3 (dar-1il.3.1.1): one-shot DUPLEX-lane selftest, driven here because this is an
+	// early trap with the ring already attached. A strict no-op unless the marker file
+	// /private/tmp/.dring-duplex-go exists (see __dserver_ring_maybe_run_duplex_selftest); it is
+	// consumed by the first guest to claim it, so it never perturbs a normal boot. Folds away entirely
+	// when the dylib is built without the ring.
+	__dserver_ring_maybe_run_duplex_selftest();
+	return self;
 }
 
 /*
