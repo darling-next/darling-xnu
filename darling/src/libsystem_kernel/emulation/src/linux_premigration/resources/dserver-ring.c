@@ -566,6 +566,44 @@ int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code
 	return rc;
 }
 
+// perf #18 D13 (dar-1il.8): the two path-op wrappers. Despite the char*/path UDS signature, the path
+// bytes do NOT travel in the RPC payload -- `buffer` is the GUEST virtual address into which the server
+// writes the path via process_vm_writev (writeMemory) on the guest's /proc/mem, exactly as over UDS.
+// So the ring request body is the FIXED 16B { uint64_t buffer; uint64_t buffer_size; } (byte-identical
+// to dserver_call_<op>_t) and the reply is the 8B { uint64_t length; } (byte-identical to
+// dserver_reply_<op>_t) -- no arena, no variable payload. /proc/mem access is server-side and needs no
+// caller-S2C, and the op is a pure read of server config (no destroy), so all 5 canon rules hold. Each
+// routes over the ring iff it is in DSERVER_RING_C2S_OPCODES; on any transport miss the caller MUST
+// UDS-fall-back. (set_executable_path is NOT migrated: pre-attach mldr-only + NO_REPLY.)
+
+int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code) {
+	// dserver_call_vchroot_path_t { uint64_t buffer aligned(8); uint64_t buffer_size aligned(8); }
+	//   -> dserver_reply_vchroot_path_t { uint64_t length aligned(8); }
+	struct {
+		uint64_t buffer __attribute__((aligned(8)));
+		uint64_t buffer_size __attribute__((aligned(8)));
+	} body = { buffer, buffer_size };
+	struct { uint64_t length __attribute__((aligned(8))); } reply;
+	int rc = gr_full_trap((uint32_t)dserver_callnum_vchroot_path, &body, (uint32_t)sizeof(body),
+	                      &reply, (uint32_t)sizeof(reply), out_code);
+	if (rc == 0 && out_length) *out_length = reply.length;
+	return rc;
+}
+
+int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code) {
+	// dserver_call_mldr_path_t { uint64_t buffer aligned(8); uint64_t buffer_size aligned(8); }
+	//   -> dserver_reply_mldr_path_t { uint64_t length aligned(8); }
+	struct {
+		uint64_t buffer __attribute__((aligned(8)));
+		uint64_t buffer_size __attribute__((aligned(8)));
+	} body = { buffer, buffer_size };
+	struct { uint64_t length __attribute__((aligned(8))); } reply;
+	int rc = gr_full_trap((uint32_t)dserver_callnum_mldr_path, &body, (uint32_t)sizeof(body),
+	                      &reply, (uint32_t)sizeof(reply), out_code);
+	if (rc == 0 && out_length) *out_length = reply.length;
+	return rc;
+}
+
 // perf #18 P5-bulk audit (dar-1il.2): mach_port_mod_refs has NO ring helper -- it was removed from
 // DSERVER_RING_C2S_OPCODES because it is destroy-capable (negative-delta last-ref destroy -> vm
 // munmap S2C upcall to a caller parked on the ring -> deadlock; same class as mach_port_deallocate).
