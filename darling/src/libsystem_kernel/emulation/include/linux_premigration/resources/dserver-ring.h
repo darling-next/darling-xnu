@@ -67,6 +67,13 @@ int __dserver_ring_started_suspended(bool* out_suspended, int* out_code);
 int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code);
 int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code);
 
+// perf #18 D13 (dar-1il.8): path ops. The char*/path is delivered via the server's writeMemory on the
+// guest /proc/mem (transport-agnostic), so the ring body is the FIXED { uint64_t buffer; uint64_t
+// buffer_size; } and the reply is { uint64_t length; } -- NO arena. 0 + *out_length on a valid ring
+// round-trip; negative on any transport miss -> caller MUST UDS-fall-back.
+int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
+int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
+
 // Reset ring state in the forked child (the parent's ring + wake fd are not valid post-fork;
 // the child re-attaches lazily). Called from the fork path alongside the socket refresh.
 void __dserver_ring_postfork_reset(void);
@@ -131,6 +138,8 @@ static inline int __dserver_ring_set_thread_handles(uint64_t pthread_handle, uin
 static inline int __dserver_ring_started_suspended(bool* out_suspended, int* out_code) { (void)out_suspended; (void)out_code; return -1; }
 static inline int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code) { (void)out_tracer; (void)out_code; return -1; }
 static inline int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code) { (void)id; (void)out_is_64_bit; (void)out_code; return -1; }
+static inline int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code) { (void)buffer; (void)buffer_size; (void)out_length; (void)out_code; return -1; }
+static inline int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code) { (void)buffer; (void)buffer_size; (void)out_length; (void)out_code; return -1; }
 static inline void __dserver_ring_postfork_reset(void) {}
 static inline int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) { (void)arg; (void)out_result; return -1; }
 static inline void __dserver_ring_maybe_run_duplex_selftest(void) {}
