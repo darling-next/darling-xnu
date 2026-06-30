@@ -43,6 +43,7 @@ typedef struct stat stat_t;
 #	include <darling/emulation/conversion/common_at.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 typedef struct linux_stat stat_t;
 
@@ -1672,7 +1673,20 @@ int __darling_vchroot_expand(const char* path, char* out)
 static void init_vchroot_path(void)
 {
 	uint64_t tmp_len;
-	int code = dserver_rpc_vchroot_path(prefix_path, sizeof(prefix_path), &tmp_len);
+	int code;
+	// perf #18 D13 (dar-1il.8): warm post-attach site -- try the ring first (fixed 16B body, 8B
+	// reply; the prefix path is delivered by the server's writeMemory on our /proc/mem). On any
+	// transport miss fall back to UDS, preserving this site's exact result semantics. (The OTHER
+	// vchroot_path caller, mldr.c:940, is in the mldr binary which has no ring -> always UDS.)
+#ifndef TEST
+	int t_code;
+	if (__dserver_ring_vchroot_path((uint64_t)(uintptr_t)prefix_path, sizeof(prefix_path), &tmp_len, &t_code) == 0) {
+		code = t_code;
+	} else
+#endif
+	{
+		code = dserver_rpc_vchroot_path(prefix_path, sizeof(prefix_path), &tmp_len);
+	}
 	if (code < 0) {
 		__simple_printf("Failed to get vchroot path: %d\n", code);
 		__simple_abort();
