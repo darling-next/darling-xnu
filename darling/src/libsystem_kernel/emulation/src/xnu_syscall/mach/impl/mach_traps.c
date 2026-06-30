@@ -439,14 +439,21 @@ kern_return_t _kernelrpc_mach_port_deallocate_trap_impl(
 				mach_port_name_t name
 )
 {
-	// perf #18 P5-bulk (dar-1il.1): mach_port_deallocate is DELIBERATELY NOT ring-routed. Under
-	// launchd's real workload it destroys ports backing mapped regions, which drives a vm munmap
-	// server-to-client (S2C) upcall to THIS thread. A thread parked on a ring reply is not in a
-	// recvmsg and cannot service an S2C call, so the server microthread blocks on the S2C reply
-	// while the guest blocks in the ring futex-wait -> deadlock (observed: launchd wedges before
-	// shellspawn). It stays on UDS, where the caller's recvmsg services the S2C. (See the membership
-	// rule in DSERVER_RING_C2S_OPCODES, rpc-supplement.h.)
-	int code = dserver_rpc_mach_port_deallocate(target, name);
+	// perf #18 P5-bulk (dar-1il.1): mach_port_deallocate is NOT on the SIMPLE ring -- destroying a port
+	// backing a mapped region drives a vm-munmap S2C upcall to THIS thread, which a simple-ring-parked
+	// (futex-waiting, non-recvmsg) caller cannot service -> deadlock. (See DSERVER_RING_C2S_OPCODES.)
+	//
+	// perf #18 P8 D4 (dar-1il.3.2.1): the DUPLEX lane fixes exactly that -- the caller pumps the munmap
+	// S2C on its own thread while parked for the final reply. Try the duplex lane FIRST (it is a strict
+	// no-op unless the per-command hatch DARLING_GUEST_DUPLEX_DEALLOCATE=1 is set AND the cap is
+	// negotiated). On a valid duplex round-trip `code` is the kern_return_t and we use it verbatim. On
+	// ANY transport miss or a server PRE-MUTATION decline it returns nonzero and we UDS-fall-back --
+	// safe, because the server declines BEFORE dispatching (no mutation), so the op runs exactly once.
+	// Folded away entirely unless -DDARLING_RING_TRANSPORT.
+	int code;
+	if (__dserver_ring_mach_port_deallocate_duplex(target, name, &code) != 0) {
+		code = dserver_rpc_mach_port_deallocate(target, name);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_deallocate failed (internally): %d\n", code);
