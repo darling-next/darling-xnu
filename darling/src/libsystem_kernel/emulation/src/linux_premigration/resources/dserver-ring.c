@@ -484,6 +484,26 @@ static int gr_duplex_pump_once(void) {
 	uint32_t op     = cb->duplex_upcall_op;
 	uint32_t parent = cb->duplex_upcall_parent;
 	uint32_t uid    = cb->duplex_upcall_id;
+	if (op == DSERVER_RING_DUPLEX_UPCALL_MUNMAP) {
+		// perf #18 P8 D4: the REAL vm-munmap S2C upcall (mach_port_deallocate of a mapped-region-backed
+		// port drives this). Run the SAME munmap(2) the UDS recvmsg S2C path runs (dserver-rpc-defs.h
+		// dserver_s2c_msgnum_munmap) ON THIS (caller) thread, so the side effect is byte-identical to UDS
+		// -- only the transport differs. The reply carries the kernel return_value + errno verbatim.
+		uint64_t addr = cb->duplex_upcall_addr;
+		uint64_t len  = cb->duplex_upcall_len;
+		long call_ret = LINUX_SYSCALL2(__NR_munmap, addr, len);
+		int32_t return_value, errno_result;
+		if (call_ret < 0) {
+			return_value = -1;
+			errno_result = (int32_t)(-call_ret);
+		} else {
+			return_value = (int32_t)call_ret;
+			errno_result = 0;
+		}
+		dserver_ring_duplex_publish_munmap_reply(cb, parent, uid, return_value, errno_result);
+		gr_wake_server();
+		return 1;
+	}
 	uint32_t a      = cb->duplex_upcall_arg;
 	int32_t  status = 0;
 	uint32_t result = 0;
@@ -663,6 +683,123 @@ void __dserver_ring_maybe_run_duplex_selftest(void) {
 		__simple_fprintf(2, "[dring-duplex-selftest] FAIL rc=%d arg=0x%x result=0x%x expect=0x%x\n",
 			rc, arg, result, expect);
 	}
+}
+
+// === perf #18 P8 D4 (dar-1il.3.2.1): mach_port_deallocate over the DUPLEX lane =====================
+//
+// deallocate is destroy-capable: dropping the last ref of a mapped-region-backed port drives a
+// vm-munmap S2C upcall to THIS caller. Over the SIMPLE ring a futex-parked caller can't service that
+// S2C -> deadlock (dar-1il.1), so it stayed UDS-only. The duplex lane fixes exactly this: the caller,
+// while parked for the deallocate's final reply, ALSO pumps the munmap S2C on its own thread.
+//
+// ROUTING (the membership/safety contract): the guest sends deallocate on the duplex lane ONLY behind a
+// per-command hatch (DARLING_GUEST_DUPLEX_DEALLOCATE=1, default OFF, warm-server discipline) AND only
+// after advertising DSERVER_RING_DUPLEX_CAP_DEALLOCATE at attach. This routing decision is made BEFORE
+// the request is published (pre-dispatch) -- so a decline is always pre-mutation and there is never a
+// partial-mutation-then-UDS double-effect. On ANY transport miss (no ring / ring full / give-up / a
+// server decline reply) the caller returns -1 and the trap impl UDS-falls-back, which is safe because
+// the server declines BEFORE dispatching the op (it never began mutating).
+
+// The hatch: scan /proc/self/environ libc-free for DARLING_GUEST_DUPLEX_DEALLOCATE=1. Same discipline
+// as the selftest trigger -- set ONLY per-command on a warm server, never at boot (daemons must not
+// inherit it). Cached after the first scan (the env is fixed for the process lifetime).
+static int gr_dealloc_via_duplex_enabled(void) {
+	static int cached = -1;
+	if (cached >= 0) {
+		return cached;
+	}
+	cached = 0;
+	long efd = LINUX_SYSCALL(__NR_open, "/proc/self/environ", 0 /*O_RDONLY*/, 0);
+	if (efd < 0) {
+		return 0;
+	}
+	static const char key[] = "DARLING_GUEST_DUPLEX_DEALLOCATE=1";
+	const __SIZE_TYPE__ keylen = sizeof(key) - 1;
+	char buf[4096];
+	int found = 0;
+	for (;;) {
+		long n = LINUX_SYSCALL(__NR_read, efd, buf, sizeof(buf));
+		if (n <= 0) break;
+		__SIZE_TYPE__ start = 0;
+		for (__SIZE_TYPE__ i = 0; i < (__SIZE_TYPE__)n; ++i) {
+			if (buf[i] == '\0') {
+				if (i - start == keylen) {
+					int eq = 1;
+					for (__SIZE_TYPE__ k = 0; k < keylen; ++k) {
+						if (buf[start + k] != key[k]) { eq = 0; break; }
+					}
+					if (eq) found = 1;
+				}
+				start = i + 1;
+			}
+		}
+		if (found || (__SIZE_TYPE__)n < (long)sizeof(buf)) break;
+	}
+	LINUX_SYSCALL1(__NR_close, efd);
+	cached = found;
+	return found;
+}
+
+// Try mach_port_deallocate over the duplex lane. Returns 0 on a VALID ring round-trip (writes *out_code
+// = the kern_return_t, which the caller uses verbatim); returns -1 on any transport miss / server
+// decline (caller MUST UDS-fall-back -- safe, pre-mutation). Mirrors gr_body_trap's transport but waits
+// with gr_duplex_wait_reply (which pumps the munmap S2C) and advertises the deallocate duplex cap.
+int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code) {
+	if (!gr_dealloc_via_duplex_enabled()) {
+		return -1; // hatch off -> UDS (the default path)
+	}
+	if (!__dserver_ring_try_attach()) {
+		return -1; // no ring for this thread -> UDS fallback
+	}
+	// advertise that we can pump the munmap S2C upcall shape (the server's duplex guard requires it).
+	// release so the server sees the cap before it can observe our deallocate parent request.
+	__atomic_store_n(&gr_cb()->duplex_caps,
+		DSERVER_RING_DUPLEX_CAP_SELFTEST | DSERVER_RING_DUPLEX_CAP_DEALLOCATE, __ATOMIC_RELEASE);
+
+	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
+	// dserver_call_mach_port_deallocate_t { uint32_t target; uint32_t name; }
+	struct { uint32_t target; uint32_t name; } body = { target, name };
+	if ((uint32_t)sizeof(body) > inlineCap) {
+		return -1;
+	}
+	dserver_ring_t* c2s = gr_c2s();
+	dserver_ring_slot_t* req = dserver_ring_producer_begin(c2s, GR_SLOT_SIZE, GR_SLOT_COUNT);
+	if (!req) {
+		return -1; // ring full -> UDS fallback
+	}
+	uint32_t seq = g_seq++;
+	req->callnum = (uint32_t)dserver_callnum_mach_port_deallocate;
+	req->seq = seq;
+	req->length = (uint32_t)sizeof(body);
+	req->arena_off = 0;
+	req->arena_len = 0;
+	req->flags = 0;
+	memcpy((char*)req + sizeof(dserver_ring_slot_t), &body, sizeof(body));
+	dserver_ring_producer_publish(c2s);
+	gr_wake_server();
+
+	// wait for the parent's FINAL reply, pumping any munmap S2C upcalls on THIS thread meanwhile.
+	dserver_ring_slot_t* rep = gr_duplex_wait_reply();
+	if (!rep) {
+		return -1; // gave up (bounded) -> UDS fallback (server declined pre-mutation, so safe)
+	}
+	int rc = -1;
+	if (rep->seq == seq && rep->callnum == (uint32_t)dserver_callnum_mach_port_deallocate) {
+		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
+			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
+			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
+			if (rh->code == DSERVER_RING_DUPLEX_DECLINE) {
+				// the server declined the duplex deallocate BEFORE dispatching it (no mutation) ->
+				// the caller UDS-falls-back. A reserved sentinel code, distinct from any kern_return_t.
+				rc = -1;
+			} else {
+				if (out_code) *out_code = rh->code; // the real kern_return_t
+				rc = 0;
+			}
+		}
+	}
+	dserver_ring_consumer_advance(gr_s2c());
+	return rc;
 }
 
 int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code) {
