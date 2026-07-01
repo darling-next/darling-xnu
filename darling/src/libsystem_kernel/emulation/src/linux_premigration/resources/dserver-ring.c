@@ -73,8 +73,15 @@ extern int dserver_rpc_ring_attach(int ring_fd, uint64_t mapping_size, uint32_t*
 // the invariant. The bookkeeping (active bit published LAST on acquire, generation bumped on every
 // reclaim) is the contract pinned by tests/ring_multilane_gate_test.c (the dar-my8 exhaustive gate).
 #ifndef GR_MAX_LANES
-#define GR_MAX_LANES 64u   // fixed per-process cap; sized for the homebrew workload's thread fan-out.
+#define GR_MAX_LANES 128u  // fixed per-process cap; sized for the homebrew workload's thread fan-out.
 #endif                     // exceeding it -> UDS fallback (logged once), never a shared lane.
+                           // perf#18 D18a (task #68): raised 64->128. A 96-worker process actually wants
+                           // ~97 lanes (96 workers + 1 runtime helper), so 64 exhausted ~39k eligible ops
+                           // to UDS and 96 still 1202; 128 gives headroom -> exhausted=0, 100% ring, no
+                           // regressions, +~2.5KB BSS/image + a lazy 4KB page per ATTACHED lane only.
+                           // Right-sized, not infinite: >128 concurrent eligible-op threads still fall
+                           // back (a future bead = lane reclaim on thread-exit). Guest-only + ABI-neutral
+                           // (a lane is the same ring ABI attached N times; opcode-hash unaffected).
 
 typedef struct {
 	// `active` is the free/used marker AND the publish gate: a lane is usable iff active==1, and acquire
