@@ -140,6 +140,12 @@ static gr_lane_t* gr_claim_lane(int tid) {
 		// CAS 0 -> 2 ("claiming"): wins the slot exclusively without yet advertising it as usable (==1).
 		if (__atomic_compare_exchange_n(&L->active, &expected, 2u, false,
 		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+			// dar-j7e7: establish the honest "no fd" sentinel the instant we own the slot, BEFORE any
+			// attach failure path can release it. The slot came from zero-init (wake_fd==0 == valid fd 0);
+			// setting -1 now means an attach that bails between claim and fill never leaves a 0 that a
+			// later reader/reset could mistake for a live fd. Fully redundant with the active-gated reset,
+			// but keeps the field's invariant true at every lifecycle point (defence in depth).
+			L->wake_fd = -1;
 			return L;
 		}
 	}
@@ -192,13 +198,22 @@ void __dserver_ring_postfork_reset(void) {
 	// typically has just one thread right after fork; it will claim a fresh lane on demand.)
 	for (uint32_t i = 0; i < GR_MAX_LANES; ++i) {
 		gr_lane_t* L = &g_lanes[i];
-		if (L->map && L->size) {
-			LINUX_SYSCALL(__NR_munmap, L->map, L->size);
-		}
-		if (L->wake_fd >= 0) {
-			LINUX_SYSCALL1(__NR_close, L->wake_fd);
+		// dar-j7e7: free resources gated on the OWNERSHIP MARKER (active==1), NOT on the resource value.
+		// g_lanes is `static` -> zero-initialized -> an un-attached lane has wake_fd==0 (NOT -1). The old
+		// `if (L->wake_fd >= 0) close(...)` therefore ran close(0) for every untouched lane in the fork
+		// child, destroying its stdin ("cannot duplicate fd 0" on the next exec). A lane owns its map +
+		// wake_fd IFF acquire published it (active=1 published LAST); only then may the child release them.
+		// This keys the teardown off the SAME publish marker acquire sets, symmetric to release.
+		if (__atomic_load_n(&L->active, __ATOMIC_ACQUIRE) == 1) {
+			if (L->map && L->size) {
+				LINUX_SYSCALL(__NR_munmap, L->map, L->size);
+			}
+			if (L->wake_fd >= 0) {
+				LINUX_SYSCALL1(__NR_close, L->wake_fd);
+			}
 		}
 		// zero the lane completely: active=0 (free), generation back to 0 (a fresh post-fork epoch space).
+		// wake_fd back to the HONEST -1 sentinel so a later read can never mistake the 0 default for fd 0.
 		L->active = 0;
 		L->generation = 0;
 		L->state = 0;
@@ -301,6 +316,13 @@ static gr_lane_t* gr_attach_lane(int tid) {
 		__atomic_store_n(&L->active, 0u, __ATOMIC_RELEASE); // release the claimed slot on reject
 		return 0;
 	}
+
+	// dar-j7e7: the wake_fd arrived over SCM_RIGHTS with plain recvmsg flags (no MSG_CMSG_CLOEXEC), and the
+	// server handed it out via ::dup() which STRIPS CLOEXEC -- so without this it leaks across execve into
+	// every exec'd child (old code leaked 1 such fd; the per-thread table leaks up to GR_MAX_LANES). Make
+	// the fd self-safe at the receiver: F_SETFD=2, FD_CLOEXEC=1 (fixed Linux ABI values, same raw-constant
+	// idiom as memfd_create(MFD_CLOEXEC=0x1) above). Best-effort: a failure here doesn't invalidate the lane.
+	LINUX_SYSCALL(__NR_fcntl, wake_fd, 2 /*F_SETFD*/, 1 /*FD_CLOEXEC*/);
 
 	// INITIALIZE the lane fully, then PUBLISH active=1 LAST (the gate's INVARIANT 1). Bump the generation
 	// on this (re)claim so a recycled TID landing on this slot can never match a prior epoch (INVARIANT 2).
