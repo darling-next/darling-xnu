@@ -180,7 +180,7 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 
 	kern_printf("sigexc: sigrt_handler SUSPEND\n");
 
-	thread_t thread = mach_thread_self();
+	// z27x.7 (#118) WIP: dead mach_thread_self() removed (unused + thread_self_trap RPC + leaked right).
 	state_to_kernel(ctxt, &tstate, &fstate);
 
 	int ret = dserver_rpc_thread_suspended(&tstate, &fstate);
@@ -303,12 +303,14 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
 
 void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
-	int status = dserver_rpc_interrupt_enter();
-
-	if (status != 0) {
-		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
-		__simple_abort();
-	}
+	// z27x.7 (#118) WIP: interrupt_enter is FOLDED into sigprocess (server runs the enter logic at
+	// the top of Sigprocess::processCall), halving the per-signal RPC count under a pthread_kill
+	// flood. The server pushes the interrupt frame during sigprocess, so interrupt_exit runs IFF
+	// sigprocess ran -- `did_sigprocess` tracks that; SIGCONT/unmapped early-outs skip BOTH (and
+	// save two RPCs). Also drops the dead mach_thread_self() (fix#1: unused + per-signal
+	// thread_self_trap RPC + leaked send-right). NCONS=1 GREEN, NCONS=8 panics (see server WIP).
+	int status;
+	int did_sigprocess = 0;
 
 	kern_printf("sigexc_handler(%d, %p, %p)\n", linux_signum, info, ctxt);
 
@@ -327,8 +329,6 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	kern_printf("sigexc: have RIP 0x%llx\n", ctxt->uc_mcontext.gregs.rip);
 #endif
 
-	thread_t thread = mach_thread_self();
-
 #if defined(__x86_64__)
 	x86_thread_state64_t tstate;
 	x86_float_state64_t fstate;
@@ -338,6 +338,7 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 #endif
 
 	state_to_kernel(ctxt, &tstate, &fstate);
+	did_sigprocess = 1;
 	int ret = dserver_rpc_sigprocess(bsd_signum, linux_signum, info->si_pid, info->si_code, info->si_addr, &tstate, &fstate, &bsd_signum);
 	if (ret < 0) {
 		__simple_printf("sigprocess failed internally while processing Linux signal %d: %d", linux_signum, ret);
@@ -411,6 +412,10 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	kern_printf("sigexc: handler (%d) returning\n", linux_signum);
 
 out:
+	// z27x.7 (#118) WIP: only exit if sigprocess pushed a frame (SIGCONT/unmapped never entered).
+	if (!did_sigprocess)
+		return;
+
 	status = dserver_rpc_interrupt_exit();
 
 	if (status != 0) {
