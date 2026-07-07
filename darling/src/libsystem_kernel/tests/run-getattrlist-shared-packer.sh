@@ -9,18 +9,43 @@ LAUNCH="${DARLING:-darling}"
 : "${DPREFIX:?set DPREFIX to a bootable Darling prefix}"
 
 src="$here/getattrlist_shared_packer_test.c"
-verdict="$DPREFIX/tmp/getattrlist_shared_packer.verdict"
-rm -f "$verdict" 2>/dev/null || true
+verdict="/tmp/getattrlist_shared_packer.verdict"
+rm -f "$DPREFIX/tmp/getattrlist_shared_packer.verdict" 2>/dev/null || true
+cp "$src" "$DPREFIX/tmp/getattrlist_shared_packer_test.c"
+env DPREFIX="$DPREFIX" "$LAUNCH" shell /bin/bash --login -c "rm -f '$verdict'" >/dev/null 2>&1 || true
 
-timeout "${GETATTRLIST_PACKER_TIMEOUT:-60}" env DPREFIX="$DPREFIX" "$LAUNCH" shell /bin/bash --login -c '
-  cat > /tmp/getattrlist_shared_packer_test.c <<"SRCEOF"
-'"$(cat "$src")"'
-SRCEOF
+guest_timeout="${GETATTRLIST_PACKER_TIMEOUT:-60}"
+env DPREFIX="$DPREFIX" "$LAUNCH" shell /bin/bash --login -c '
   clang -O2 -Wall -Wextra -o /tmp/getattrlist_shared_packer_test /tmp/getattrlist_shared_packer_test.c 2>&1
   /tmp/getattrlist_shared_packer_test > /tmp/getattrlist_shared_packer.verdict 2>&1
   echo "ORACLE_RC=$?" >> /tmp/getattrlist_shared_packer.verdict
-' 2>&1 | grep -vE "Xlib|libGL|MESA|X11" || true
+' </dev/null > /tmp/getattrlist_shared_packer.runner.log 2>&1 &
+shell_pid=$!
+
+deadline=$((SECONDS + guest_timeout))
+while [ "$SECONDS" -lt "$deadline" ]; do
+  if env DPREFIX="$DPREFIX" "$LAUNCH" shell /bin/bash --login -c \
+      "test -f '$verdict' && grep -q '^ORACLE_RC=' '$verdict'" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+if ! env DPREFIX="$DPREFIX" "$LAUNCH" shell /bin/bash --login -c \
+    "test -f '$verdict' && grep -q '^ORACLE_RC=' '$verdict'" >/dev/null 2>&1; then
+  kill "$shell_pid" 2>/dev/null || true
+  wait "$shell_pid" 2>/dev/null || true
+  echo "=== runner log ==="
+  grep -vE "Xlib|libGL|MESA|X11" /tmp/getattrlist_shared_packer.runner.log 2>/dev/null || true
+  echo "no verdict produced before timeout"
+  exit 2
+fi
+
+kill "$shell_pid" 2>/dev/null || true
+wait "$shell_pid" 2>/dev/null || true
 
 echo "=== verdict ==="
-cat "$verdict" 2>/dev/null || { echo "no verdict produced"; exit 2; }
-grep -q "^GETATTRLIST_SHARED_PACKER_OK" "$verdict" && grep -q "ORACLE_RC=0" "$verdict"
+guest_verdict="$(env DPREFIX="$DPREFIX" "$LAUNCH" shell /bin/bash --login -c "cat '$verdict'" 2>/dev/null || true)"
+printf '%s\n' "$guest_verdict"
+grep -q "^GETATTRLIST_SHARED_PACKER_OK" <<<"$guest_verdict" &&
+  grep -q "ORACLE_RC=0" <<<"$guest_verdict"
