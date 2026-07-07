@@ -35,6 +35,8 @@
 #include <darlingserver/rpc.h>
 #include <darlingserver/rpc-supplement.h>
 
+#include <mach/kern_return.h>
+
 #include <stdint.h>
 #include <stdbool.h>
 
@@ -113,6 +115,16 @@ static uint64_t g_stat_lanes_reclaimed = 0;
 static dserver_ring_shm_t* gr_cb(gr_lane_t* L)  { return (dserver_ring_shm_t*)L->map; }
 static dserver_ring_t* gr_c2s(gr_lane_t* L)     { return (dserver_ring_t*)((char*)L->map + gr_cb(L)->c2s_ring_off); }
 static dserver_ring_t* gr_s2c(gr_lane_t* L)     { return (dserver_ring_t*)((char*)L->map + gr_cb(L)->s2c_ring_off); }
+
+typedef enum {
+	GR_WAIT_COMPLETED = 0,
+	GR_WAIT_COMMITTED_UNKNOWN = 1,
+} gr_wait_state_t;
+
+typedef struct {
+	gr_wait_state_t state;
+	dserver_ring_slot_t* slot;
+} gr_wait_result_t;
 
 // Find THIS thread's already-attached lane, or NULL. Probes from a hashed start so distinct TIDs spread
 // across the table. A lane matches iff it is active for our TID (the active read is acquire-ordered, so
@@ -429,8 +441,9 @@ static void gr_wake_server(gr_lane_t* L) {
 	LINUX_SYSCALL(__NR_write, L->wake_fd, &one, sizeof(one));
 }
 
-// Wait for a reply on s2c: bounded spin, then cross-process FUTEX_WAIT on s2c_futex.
-// Returns a pointer to the published reply slot (NULL on give-up so the caller UDS-falls-back).
+// Wait for a reply on s2c after the request has been published. Once published, the server may
+// already have performed the operation, so give-up is a committed-or-unknown state, not a UDS retry
+// signal. Only pre-publish failures may fall back to UDS.
 //
 // perf #18 P4: the hot path is the spin -- if the server replies within DARLING_GUEST_RECVSPIN
 // iterations we return without touching the kernel AND without ever advertising ourselves as a
@@ -439,11 +452,11 @@ static void gr_wake_server(gr_lane_t* L) {
 // to wake us; we clear it on the way out. The bit is set BEFORE the pre-sleep ring recheck, so the
 // server can never publish-then-skip-wake while we're committed to sleeping (it reads the bit
 // after publishing; if it sees 0 we hadn't slept yet and are still spinning the recheck).
-static dserver_ring_slot_t* gr_wait_reply(gr_lane_t* L) {
+static gr_wait_result_t gr_wait_reply(gr_lane_t* L) {
 	dserver_ring_t* s2c = gr_s2c(L);
 	for (int i = 0; i < (DARLING_GUEST_RECVSPIN); ++i) {
 		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
-		if (rep) return rep;
+		if (rep) return (gr_wait_result_t){ GR_WAIT_COMPLETED, rep };
 		gr_relax();
 	}
 	// Slow path: advertise ourselves as a parked waiter so the server's conditional FUTEX_WAKE
@@ -463,14 +476,18 @@ static dserver_ring_slot_t* gr_wait_reply(gr_lane_t* L) {
 	// No longer parked -- the server may stop waking us. (Release so the clear is visible before
 	// any subsequent request we publish.)
 	__atomic_store_n(waiters, 0u, __ATOMIC_RELEASE);
-	return result;
+	if (result) {
+		return (gr_wait_result_t){ GR_WAIT_COMPLETED, result };
+	}
+	return (gr_wait_result_t){ GR_WAIT_COMMITTED_UNKNOWN, 0 };
 }
 
 // Shared fast path for the no-arg, single-uint32-port-reply traps (task_self_trap,
 // mach_reply_port). Publishes an empty-body request for `callnum`, wakes the server, waits for
 // the reply, and validates seq+callnum+length before copying out the port. Returns 0 + writes
-// *out_port on success, negative on any miss (caller UDS-falls-back). The reply convention
-// ({reply_hdr.code, uint32 port}) is identical for both calls, so one helper covers them.
+// *out_port on success; returns negative only on a pre-publish miss where UDS fallback is safe.
+// After publish, timeout/bad-reply is committed-unknown and returns KERN_FAILURE without retrying.
+// The reply convention ({reply_hdr.code, uint32 port}) is identical for both calls, so one helper covers them.
 static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 	gr_lane_t* L = gr_lane_for_this_thread();
 	if (!L) {
@@ -499,17 +516,17 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t1 = gr_rdtsc(); // submit done
 #endif
-	dserver_ring_slot_t* rep = gr_wait_reply(L);
-	if (!rep) {
-		return -1; // gave up waiting -> UDS fallback (the reply may still land; single
-		           // owner per lane means the next attach re-syncs; acceptable for the first op)
+	gr_wait_result_t wait = gr_wait_reply(L);
+	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
+		return KERN_FAILURE; // published: do NOT retry over UDS
 	}
+	dserver_ring_slot_t* rep = wait.slot;
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
 #endif
 
 	// Validate the reply belongs to our request before trusting it.
-	int rc = -1;
+	int rc = KERN_FAILURE; // bad/mismatched reply after publish: fail closed, do NOT UDS-retry
 	if (rep->seq == seq && rep->callnum == callnum) {
 		uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
 		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) + sizeof(uint32_t) && rep->length <= inlineCap) {
@@ -562,7 +579,9 @@ int __dserver_ring_mach_reply_port(uint32_t* out_port) {
 // Contract mirrors gr_port_trap's transport semantics but splits the result from the
 // fall-back signal: returns 0 on a VALID ring round-trip and writes *out_code (the kern_return_t,
 // which the caller must use verbatim -- it may be KERN_INVALID_NAME etc.); returns -1 on any
-// transport miss (no ring / ring full / bad reply), in which case the caller MUST UDS-fall-back.
+// transport miss BEFORE publish (no ring / ring full), in which case the caller MUST UDS-fall-back.
+// Once published, timeout/bad-reply is committed-unknown: return 0 with *out_code=KERN_FAILURE so
+// the caller observes failure without re-running the operation over UDS.
 // This separation matters because a kern_return_t can be any value and must never be confused
 // with the "-1 = retry on UDS" sentinel (gr_port_trap could conflate them only because that op's
 // code is always 0).
@@ -602,17 +621,20 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t1 = gr_rdtsc(); // submit done
 #endif
-	dserver_ring_slot_t* rep = gr_wait_reply(L);
-	if (!rep) {
-		return -1; // gave up waiting -> UDS fallback
+	gr_wait_result_t wait = gr_wait_reply(L);
+	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
+		if (out_code) *out_code = KERN_FAILURE;
+		return 0; // published: do NOT retry over UDS
 	}
+	dserver_ring_slot_t* rep = wait.slot;
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
 #endif
 
 	// Validate the reply belongs to our request before trusting it. The reply is header-only:
 	// length must be exactly the reply hdr (no body), and code is the kern_return_t.
-	int rc = -1;
+	int rc = 0;
+	if (out_code) *out_code = KERN_FAILURE; // bad/mismatched reply after publish: no UDS retry
 	if (rep->seq == seq && rep->callnum == callnum) {
 		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
@@ -641,10 +663,11 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 // everything after the reply hdr onto the ring (_publishReplyToRingLocked). The result code is split
 // from the transport-miss sentinel exactly like gr_body_trap: returns 0 on a VALID ring round-trip and
 // writes *out_code (the kern_return_t, verbatim) + reply_out; returns -1 on ANY transport miss (no ring
-// / full / bad reply / shape mismatch), in which case the caller MUST UDS-fall-back. `replylen` is the
-// EXACT expected reply-body size (0 for a header-only reply -- then reply_out may be NULL); the reply is
-// accepted only if rep->length == sizeof(reply_hdr) + replylen, so a server that sent a different shape
-// (e.g. an error reply for a wrong-shaped request) is treated as a transport miss -> UDS-fall-back.
+// / full) in which case the caller MUST UDS-fall-back. Once published, timeout/bad-reply/shape
+// mismatch is committed-unknown: return 0 with *out_code=KERN_FAILURE so the caller observes failure
+// without re-running the operation over UDS. `replylen` is the EXACT expected reply-body size (0 for a
+// header-only reply -- then reply_out may be NULL); the reply is accepted only if rep->length ==
+// sizeof(reply_hdr) + replylen.
 static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
                         void* reply_out, uint32_t replylen, int* out_code) {
 	gr_lane_t* L = gr_lane_for_this_thread();
@@ -682,10 +705,12 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t1 = gr_rdtsc(); // submit done
 #endif
-	dserver_ring_slot_t* rep = gr_wait_reply(L);
-	if (!rep) {
-		return -1; // gave up waiting -> UDS fallback
+	gr_wait_result_t wait = gr_wait_reply(L);
+	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
+		if (out_code) *out_code = KERN_FAILURE;
+		return 0; // published: do NOT retry over UDS
 	}
+	dserver_ring_slot_t* rep = wait.slot;
 #ifdef DARLING_RING_PHASE_PROF
 	unsigned long _t2 = gr_rdtsc(); // reply observed (roundtrip done)
 #endif
@@ -693,7 +718,8 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 	// Validate the reply belongs to our request before trusting it. The reply must be EXACTLY
 	// {reply_hdr, replylen-byte body}; a different length means the server replied with a different
 	// shape (error/wrong op) -> treat as a transport miss so the caller UDS-falls-back and re-runs.
-	int rc = -1;
+	int rc = 0;
+	if (out_code) *out_code = KERN_FAILURE; // bad/mismatched reply after publish: no UDS retry
 	if (rep->seq == seq && rep->callnum == callnum) {
 		if (rep->length == (uint32_t)sizeof(dserver_ring_reply_hdr_t) + replylen && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
@@ -926,17 +952,17 @@ static int gr_duplex_pump_once(gr_lane_t* L) {
 #endif // DUPLEX_RED_NO_GUEST_PUMP
 }
 
-// Wait for the sentinel parent's FINAL reply on the s2c ring while pumping duplex S2C upcalls. Returns
-// a pointer to the published final-reply slot, or NULL on give-up (caller treats as failure). This is
+// Wait for the sentinel parent's FINAL reply on the s2c ring while pumping duplex S2C upcalls. This is
 // gr_wait_reply's structure with the upcall pump interleaved into BOTH the spin and the parked loop, so
 // a parked caller can never sleep through an upcall (the duplex wake model, ring_duplex_wake_gate_test).
-static dserver_ring_slot_t* gr_duplex_wait_reply(gr_lane_t* L) {
+// Give-up after publish is committed-unknown, not a UDS retry signal.
+static gr_wait_result_t gr_duplex_wait_reply(gr_lane_t* L) {
 	dserver_ring_t* s2c = gr_s2c(L);
 	for (int i = 0; i < (DARLING_GUEST_RECVSPIN); ++i) {
 		// pump first: an upcall must be serviced before the parent reply can ever arrive.
 		while (gr_duplex_pump_once(L)) { /* drain all currently-pending upcalls */ }
 		dserver_ring_slot_t* rep = dserver_ring_consumer_begin(s2c, GR_SLOT_SIZE, GR_SLOT_COUNT);
-		if (rep) return rep;
+		if (rep) return (gr_wait_result_t){ GR_WAIT_COMPLETED, rep };
 		gr_relax();
 	}
 	// Slow path: park on the s2c futex. Set the waiter bit BEFORE the recheck so the server's
@@ -947,8 +973,8 @@ static dserver_ring_slot_t* gr_duplex_wait_reply(gr_lane_t* L) {
 	// guest; if an upcall is somehow never serviced (a bug, a torn-down server, or -- in the D3 RED arm
 	// -- a deliberately disabled pump), an UNBOUNDED FUTEX_WAIT would re-introduce exactly the wedge we
 	// are trying to prevent (and, since the selftest can run in launchd, would wedge boot). So we cap
-	// the total parked time and give up -> the caller treats NULL as failure (in a real lane: UDS
-	// fall-back). The cap is generous (a real reply lands in microseconds) so it never trips in GREEN.
+	// the total parked time and give up -> committed-unknown. The cap is generous (a real reply lands
+	// in microseconds) so it never trips in GREEN.
 	uint32_t* word = &gr_cb(L)->s2c_futex;
 	uint32_t* waiters = &gr_cb(L)->s2c_waiters;
 	__atomic_store_n(waiters, 1u, __ATOMIC_RELEASE);
@@ -970,16 +996,19 @@ static dserver_ring_slot_t* gr_duplex_wait_reply(gr_lane_t* L) {
 		if (rep) { result = rep; break; }
 		long r = LINUX_SYSCALL(__NR_futex, word, GR_FUTEX_WAIT, observed, &ts, 0, 0);
 		(void)r; // EAGAIN (word changed) / EINTR / ETIMEDOUT -> re-loop, re-pump, re-check; on a
-		         // persistent no-reply we exhaust the guard and return NULL (bounded, no wedge).
+		         // persistent no-reply we exhaust the guard and return committed-unknown (bounded, no wedge).
 	}
 	__atomic_store_n(waiters, 0u, __ATOMIC_RELEASE);
-	return result;
+	if (result) {
+		return (gr_wait_result_t){ GR_WAIT_COMPLETED, result };
+	}
+	return (gr_wait_result_t){ GR_WAIT_COMMITTED_UNKNOWN, 0 };
 }
 
 // The synthetic selftest entry. Advertises the SELFTEST duplex capability, publishes the sentinel
 // parent request carrying `arg`, runs the duplex wait-pump, and on success writes the final echo
-// result to *out_result and returns 0. Returns negative on any transport miss (no ring / ring full /
-// bad or error reply) -- in a real lane the caller would UDS-fall-back; here it just signals failure.
+// result to *out_result and returns 0. Returns negative on any transport miss/error; this selftest
+// has no UDS retry path, so committed-unknown is only reported as a stable failure code.
 // Drives the REAL transport: real ring publish, real server _drainDuplexReply, real guest pump.
 int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) {
 	gr_lane_t* L = gr_lane_for_this_thread();
@@ -1006,10 +1035,11 @@ int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result) {
 	dserver_ring_producer_publish(c2s);
 	gr_wake_server(L);
 
-	dserver_ring_slot_t* rep = gr_duplex_wait_reply(L);
-	if (!rep) {
-		return -3; // gave up waiting for the final reply
+	gr_wait_result_t wait = gr_duplex_wait_reply(L);
+	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
+		return -3; // published but gave up waiting for the final reply
 	}
+	dserver_ring_slot_t* rep = wait.slot;
 	int rc = -4;
 	if (rep->seq == seq && rep->callnum == DSERVER_RING_DUPLEX_SELFTEST_CALLNUM) {
 		uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
@@ -1153,9 +1183,11 @@ static int gr_dealloc_via_duplex_enabled(void) {
 }
 
 // Try mach_port_deallocate over the duplex lane. Returns 0 on a VALID ring round-trip (writes *out_code
-// = the kern_return_t, which the caller uses verbatim); returns -1 on any transport miss / server
-// decline (caller MUST UDS-fall-back -- safe, pre-mutation). Mirrors gr_body_trap's transport but waits
-// with gr_duplex_wait_reply (which pumps the munmap S2C) and advertises the deallocate duplex cap.
+// = the kern_return_t, which the caller uses verbatim); returns -1 only on a pre-publish miss or an
+// explicit server DECLINE reply (safe, pre-mutation). Once published, timeout/bad-reply is
+// committed-unknown and returns 0 with *out_code=KERN_FAILURE so the caller does NOT UDS-retry.
+// Mirrors gr_body_trap's transport but waits with gr_duplex_wait_reply (which pumps the munmap S2C)
+// and advertises the deallocate duplex cap.
 int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code) {
 	if (!gr_dealloc_via_duplex_enabled()) {
 		return -1; // hatch off -> UDS (the default path)
@@ -1192,11 +1224,14 @@ int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, i
 	gr_wake_server(L);
 
 	// wait for the parent's FINAL reply, pumping any munmap S2C upcalls on THIS thread meanwhile.
-	dserver_ring_slot_t* rep = gr_duplex_wait_reply(L);
-	if (!rep) {
-		return -1; // gave up (bounded) -> UDS fallback (server declined pre-mutation, so safe)
+	gr_wait_result_t wait = gr_duplex_wait_reply(L);
+	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
+		if (out_code) *out_code = KERN_FAILURE;
+		return 0; // published: do NOT retry over UDS
 	}
-	int rc = -1;
+	dserver_ring_slot_t* rep = wait.slot;
+	int rc = 0;
+	if (out_code) *out_code = KERN_FAILURE; // bad/mismatched reply after publish: no UDS retry
 	if (rep->seq == seq && rep->callnum == (uint32_t)dserver_callnum_mach_port_deallocate) {
 		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
@@ -1289,9 +1324,11 @@ static int gr_vm_dealloc_via_duplex_enabled(void) {
 }
 
 // Try mach_vm_deallocate over the duplex lane. Returns 0 on a VALID ring round-trip (writes *out_code =
-// the kern_return_t verbatim); returns -1 on any transport miss / server decline (caller MUST UDS-fall-
-// back -- safe, pre-mutation). Mirrors __dserver_ring_mach_port_deallocate_duplex but with the
-// vm_deallocate body {uint32 target; uint64 address; uint64 size} and the VM_DEALLOCATE cap.
+// the kern_return_t verbatim); returns -1 only on a pre-publish miss or an explicit server DECLINE reply
+// (safe, pre-mutation). Once published, timeout/bad-reply is committed-unknown and returns 0 with
+// *out_code=KERN_FAILURE so the caller does NOT UDS-retry. Mirrors
+// __dserver_ring_mach_port_deallocate_duplex but with the vm_deallocate body
+// {uint32 target; uint64 address; uint64 size} and the VM_DEALLOCATE cap.
 // Set by the D6 proof driver (below) while it intentionally drives ONE vm_deallocate over the duplex lane,
 // so the duplex function proceeds without the production hatch (the D6 proof has its own marker gate + the
 // server arming + budget bound the blast radius). Default 0 -> the production hatch governs.
@@ -1339,19 +1376,19 @@ int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, 
 	gr_wake_server(L);
 
 	// wait for the parent's FINAL reply, pumping any munmap S2C upcalls on THIS thread meanwhile.
-	dserver_ring_slot_t* rep = gr_duplex_wait_reply(L);
-	if (!rep) {
+	gr_wait_result_t wait = gr_duplex_wait_reply(L);
+	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
 		// PUBLISHED-then-TIMEOUT (bounded ~3s). CRITICAL: we have ALREADY published the parent onto the
 		// duplex lane, so the SERVER owns this op now -- it may have already performed the munmap. We must
 		// NOT UDS-fall-back here (that would re-run vm_deallocate = a potential double munmap of a range
-		// that may have been re-mapped = the MODEL-B hazard). Once published, the op is the lane's: we
-		// report SUCCESS without retry. vm_deallocate is idempotent on an already-unmapped range, so the
-		// worst case if the server somehow did NOT complete is a still-mapped range (safe), never a double
-		// free. (In GREEN the reply lands in microseconds; this branch is the bounded fail-safe only.)
-		if (out_code) *out_code = 0; // KERN_SUCCESS; do NOT retry over UDS.
+		// that may have been re-mapped = the MODEL-B hazard). Report a normal kern_return_t failure without
+		// retry; GREEN never trips this branch.
+		if (out_code) *out_code = KERN_FAILURE;
 		return 0;
 	}
-	int rc = -1;
+	dserver_ring_slot_t* rep = wait.slot;
+	int rc = 0;
+	if (out_code) *out_code = KERN_FAILURE; // bad/mismatched reply after publish: no UDS retry
 	if (rep->seq == seq && rep->callnum == (uint32_t)dserver_callnum_mach_vm_deallocate) {
 		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);

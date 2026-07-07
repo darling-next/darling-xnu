@@ -24,9 +24,9 @@ bool __dserver_ring_try_attach(void);
 
 // Fast path for the no-arg, single-uint32-port-reply traps over the ring. On success writes
 // *out_port + returns 0 (the same contract as the matching dserver_rpc_* wrapper). Returns a
-// negative value if the ring is unavailable / the op isn't ring-eligible / anything went wrong
-// -> caller MUST fall back to the UDS wrapper. Never blocks unboundedly: it bounded-spins then
-// FUTEX_WAITs for the reply.
+// negative value only if the request was not published and the caller may safely fall back to the
+// UDS wrapper. Once published, timeout/bad-reply is committed-unknown and returns KERN_FAILURE
+// without retrying. Never blocks unboundedly: it bounded-spins then FUTEX_WAITs for the reply.
 //
 // task_self_trap is cached per-process (perf #7) so it's correctness-first; mach_reply_port is
 // the UNCACHED high-frequency op that actually exercises the ring's latency win.
@@ -34,14 +34,16 @@ int __dserver_ring_task_self_trap(uint32_t* out_port);
 // perf #18 D10 (dar-1il.5): thread_self_trap + host_self_trap, the remaining pure-mint self-trap
 // family (same empty-request/port-reply shape as task_self_trap). Uncached (unlike task_self_trap):
 // thread_self_trap is per-thread, host_self_trap left uncached to keep this bead minimal -- the win is
-// the ring transport, not caching (perf#7, orthogonal). 0 on a valid round-trip; negative -> UDS-fall-back.
+// the ring transport, not caching (perf#7, orthogonal). 0 on a valid round-trip; negative only before publish.
 int __dserver_ring_thread_self_trap(uint32_t* out_port);
 int __dserver_ring_host_self_trap(uint32_t* out_port);
 int __dserver_ring_mach_reply_port(uint32_t* out_port);
 
 // perf #18 P5-bulk: small-inline-body ops with a header-only reply. On a valid ring round-trip each
 // writes *out_code (the kern_return_t -- use it verbatim, it may be an error like KERN_INVALID_NAME)
-// and returns 0; returns negative on any transport miss -> caller MUST fall back to the UDS wrapper.
+// and returns 0; returns negative only if the request was not published and the caller may safely fall
+// back to the UDS wrapper. After publish, timeout/bad-reply returns 0 with *out_code=KERN_FAILURE so the
+// operation is not re-run over UDS.
 // The result code and the fall-back signal are SEPARATE (a kern_return_t can be any value). Any
 // out-value travels via the guest-memory write the generic Call path already performs, e.g.
 // mach_port_allocate's `name`; name_ptr (allocate) is the guest VA.
@@ -57,8 +59,9 @@ int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32
 
 // perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch (generic-fiber Tier-1). Each mirrors the
 // matching UDS dserver_rpc_<op> contract: on a VALID ring round-trip writes the out-params + *out_code
-// (the kern_return_t, verbatim) and returns 0; returns negative on ANY transport miss -> caller MUST
-// UDS-fall-back. Unlike the header-only mach_port_* helpers, these also carry a small FIXED reply BODY
+// (the kern_return_t, verbatim) and returns 0; returns negative only before publish. After publish,
+// timeout/bad-reply returns 0 with *out_code=KERN_FAILURE and never UDS-falls-back. Unlike the
+// header-only mach_port_* helpers, these also carry a small FIXED reply BODY
 // (uidgid's old uid/gid, started_suspended's bool, get_tracer's tracer, task_is_64_bit's bool) which
 // the server publishes onto the ring verbatim. None is destroy-capable or caller-S2C (canon rules hold).
 int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid, int32_t* out_old_gid, int* out_code);
@@ -70,7 +73,8 @@ int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code
 // perf #18 D13 (dar-1il.8): path ops. The char*/path is delivered via the server's writeMemory on the
 // guest /proc/mem (transport-agnostic), so the ring body is the FIXED { uint64_t buffer; uint64_t
 // buffer_size; } and the reply is { uint64_t length; } -- NO arena. 0 + *out_length on a valid ring
-// round-trip; negative on any transport miss -> caller MUST UDS-fall-back.
+// round-trip; negative only before publish. After publish, timeout/bad-reply returns 0 with
+// *out_code=KERN_FAILURE and never UDS-falls-back.
 int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
 int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
 
@@ -86,11 +90,11 @@ void __dserver_ring_lane_stats_dump(void);
 // perf #18 P8 D3 (dar-1il.3.1.1): the synthetic DUPLEX-lane selftest. Advertises the SELFTEST duplex
 // capability, publishes the sentinel parent request carrying `arg`, runs the duplex wait-pump (services
 // the S2C upcall mailbox on THIS thread while waiting for the parent's final reply), and on success
-// writes the echo result (== arg ^ 0x5A5A5A5A) to *out_result + returns 0. Returns negative on any
-// transport miss / server-reported failure. Drives the REAL ring + server _drainDuplexReply + guest
-// pump end-to-end. NO real op rides the duplex lane (deallocate is Phase E, blocked on this being
-// GREEN). Only reached when both sides opt in (server hatch DARLING_SERVER_DUPLEX_SELFTEST=1, and the
-// guest driver __dserver_ring_maybe_run_duplex_selftest below, gated DARLING_GUEST_DUPLEX_SELFTEST=1).
+// writes the echo result (== arg ^ 0x5A5A5A5A) to *out_result + returns 0. Returns negative on
+// transport/server failure; this selftest has no UDS retry path. Drives the REAL ring + server
+// _drainDuplexReply + guest pump end-to-end. Only reached when both sides opt in (server hatch
+// DARLING_SERVER_DUPLEX_SELFTEST=1, and the guest driver __dserver_ring_maybe_run_duplex_selftest
+// below, gated DARLING_GUEST_DUPLEX_SELFTEST=1).
 int __dserver_ring_duplex_selftest(uint32_t arg, uint32_t* out_result);
 
 // One-shot guest driver, gated by the env var DARLING_GUEST_DUPLEX_SELFTEST=1. SAFETY DISCIPLINE: the
@@ -105,18 +109,20 @@ void __dserver_ring_maybe_run_duplex_selftest(void);
 // the duplex lane exists for: dropping the last ref of a mapped-region-backed port drives a vm-munmap
 // S2C upcall to THIS caller, which the caller pumps on its own thread while parked for the final reply
 // (impossible over the simple ring -> the dar-1il.1 deadlock). On a valid ring round-trip writes
-// *out_code (the kern_return_t, verbatim) + returns 0; returns negative on any transport miss OR a
-// server pre-mutation DECLINE -> caller MUST UDS-fall-back (safe: the decline is always pre-mutation, so
-// no double-effect). Routed ONLY behind the per-command hatch DARLING_GUEST_DUPLEX_DEALLOCATE=1 (default
-// OFF, same warm-server discipline as the selftest) AND the negotiated DUPLEX_CAP_DEALLOCATE.
+// *out_code (the kern_return_t, verbatim) + returns 0; returns negative only before publish OR after an
+// explicit server pre-mutation DECLINE reply. After publish, timeout/bad-reply returns 0 with
+// *out_code=KERN_FAILURE and never UDS-falls-back, because retrying could double-apply the destroy.
+// Routed ONLY behind the per-command hatch DARLING_GUEST_DUPLEX_DEALLOCATE=1 (default OFF, same
+// warm-server discipline as the selftest) AND the negotiated DUPLEX_CAP_DEALLOCATE.
 int __dserver_ring_mach_port_deallocate_duplex(uint32_t target, uint32_t name, int* out_code);
 
 // perf #18 P8 D5 (dar-1il.3.2.2): try mach_vm_deallocate over the DUPLEX lane. THE op that actually drives
 // a real caller munmap S2C in Darling (vm_map_remove -> dtape_hook_task_free_pages -> _munmap ->
 // _s2cPerform), so this is the live caller-S2C cure proof D4 could not get. Reuses the D4 duplex munmap
 // transport verbatim. On a valid ring round-trip writes *out_code (the kern_return_t, verbatim) + returns
-// 0; returns negative on any transport miss OR a server pre-mutation DECLINE -> caller MUST UDS-fall-back
-// (safe: decline is always pre-mutation). Routed ONLY behind the per-command hatch
+// 0; returns negative only before publish OR after an explicit server pre-mutation DECLINE reply. After
+// publish, timeout/bad-reply returns 0 with *out_code=KERN_FAILURE and never UDS-falls-back, because
+// retrying could double-apply the deallocation. Routed ONLY behind the per-command hatch
 // DARLING_GUEST_DUPLEX_VM_DEALLOCATE=1 (default OFF) AND the negotiated DUPLEX_CAP_VM_DEALLOCATE.
 int __dserver_ring_mach_vm_deallocate_duplex(uint32_t target, uint64_t address, uint64_t size, int* out_code);
 
