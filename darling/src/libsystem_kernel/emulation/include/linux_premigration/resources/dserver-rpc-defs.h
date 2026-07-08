@@ -338,6 +338,14 @@ got_message:
 
 #define dserver_rpc_hooks_get_broken_pipe_status() (-LINUX_EPIPE)
 
+static int dserver_rpc_hooks_is_disconnect_status(long int status) {
+	return status == -LINUX_EBADF
+		|| status == -LINUX_EPIPE
+		|| status == -LINUX_ECONNRESET
+		|| status == -LINUX_ENOTCONN
+		|| status == -LINUX_ECONNREFUSED;
+}
+
 #define dserver_rpc_hooks_close_fd(fd) ((int)LINUX_SYSCALL1(__NR_close, fd))
 
 #define dserver_rpc_hooks_get_socket mach_driver_get_fd

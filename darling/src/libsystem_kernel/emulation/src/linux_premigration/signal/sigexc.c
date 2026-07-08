@@ -14,6 +14,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/mman/mman.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/kill.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/conversion/duct_errno.h>
 
 #include <darlingserver/rpc.h>
 #include <darling/emulation/linux_premigration/resources/dserver-ring.h>
@@ -27,6 +28,8 @@ static void handle_rt_signal(int signum);
 static void sigexc_fake_suspend(struct linux_ucontext* ctxt);
 extern void sig_restorer(void);
 extern int getpid(void);
+
+static bool sigexc_rpc_endpoint_unavailable(int status);
 
 extern _libkernel_functions_t _libkernel_functions;
 
@@ -165,6 +168,9 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
+		if (sigexc_rpc_endpoint_unavailable(status)) {
+			return;
+		}
 		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
 		__simple_abort();
 	}
@@ -208,6 +214,15 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 		__simple_printf("*** dserver_rpc_interrupt_exit failed with code %d ***\n", status);
 		__simple_abort();
 	}
+}
+
+static bool sigexc_rpc_endpoint_unavailable(int status)
+{
+	return status == -LINUX_EBADF
+		|| status == -LINUX_EPIPE
+		|| status == -LINUX_ECONNRESET
+		|| status == -LINUX_ENOTCONN
+		|| status == -LINUX_ECONNREFUSED;
 }
 
 
@@ -306,6 +321,9 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	int status = dserver_rpc_interrupt_enter();
 
 	if (status != 0) {
+		if (sigexc_rpc_endpoint_unavailable(status)) {
+			return;
+		}
 		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
 		__simple_abort();
 	}
