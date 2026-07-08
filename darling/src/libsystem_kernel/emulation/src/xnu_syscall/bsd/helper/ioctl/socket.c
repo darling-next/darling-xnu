@@ -12,6 +12,19 @@ int handle_socket(int fd, unsigned int cmd, void* arg, int* retval)
 {
 	switch (cmd)
 	{
+		case 0xC00C6924:
+		{
+			struct ifconf* ifc = (struct ifconf*) arg;
+			if (ifc == NULL)
+			{
+				*retval = -EFAULT;
+				return IOCTL_HANDLED;
+			}
+
+			ifc->ifc_len = 0;
+			*retval = 0;
+			return IOCTL_HANDLED;
+		}
 		// TODO: This has to be implemented for container with separate networking
 		case SIOCGIFFLAGS:
 		case SIOCSIFFLAGS:
