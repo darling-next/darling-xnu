@@ -10,15 +10,18 @@
 
 long sys_lchown(const char* path, int uid, int gid)
 {
+	if (!path)
+		return -EFAULT;
+
 	// E-UNION HAZARD (dar-test-infra-sp5.8.4.4.8): this stub is SAFE only because
-	// it is disabled (returns 0, no mutation). If it is ever un-stubbed, it becomes
-	// an immediate template-corruption path: the body below vchroot_expand()s the
-	// guest path and lchowns it -- but for a lower-only target that expanded path is
-	// the shared LOWER template, so the chown mutates ownership for ALL prefixes.
-	// Before re-enabling, copy the target up first -- vchroot_prepare_write(path)
-	// (path-based copy-up). Because lchown operates on the symlink itself (no
-	// follow), the copy-up must materialize the LINK in the upper layer, not its
-	// target.
+	// it is disabled (returns ENOTSUP, no mutation). If it is ever un-stubbed, it
+	// becomes an immediate template-corruption path: the body below
+	// vchroot_expand()s the guest path and lchowns it -- but for a lower-only target
+	// that expanded path is the shared LOWER template, so the chown mutates
+	// ownership for ALL prefixes. Before re-enabling, copy the target up first --
+	// vchroot_prepare_write(path) (path-based copy-up). Because lchown operates on
+	// the symlink itself (no follow), the copy-up must materialize the LINK in the
+	// upper layer, not its target.
 #if 0
 	int ret;
 	struct vchroot_expand_args vc;
@@ -26,9 +29,6 @@ long sys_lchown(const char* path, int uid, int gid)
 	vc.flags = 0;
 	vc.dfd = get_perthread_wd();
 	
-	if (!path)
-		return -EFAULT;
-
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
@@ -45,6 +45,6 @@ long sys_lchown(const char* path, int uid, int gid)
 
 	return ret;
 #else
-	return 0;
+	return -ENOTSUP;
 #endif
 }
