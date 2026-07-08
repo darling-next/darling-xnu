@@ -1,4 +1,5 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/psynch/psynch_cvwait.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/psynch/psynch_return.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -15,11 +16,11 @@ long sys_psynch_cvwait(void* cv, uint64_t cvlsgen, uint32_t cvugen, void * mutex
 
 	if (ret < 0) {
 		if (ret == -LINUX_EINTR) {
-			return -EINTR;
+			return darling_psynch_wait_error(EINTR);
 		}
 		__simple_printf("psynch_cvwait failed internally: %d", ret);
 		__simple_abort();
 	}
 
-	return (ret) ? ret : retval;
+	return darling_psynch_wait_return(ret, retval);
 }
