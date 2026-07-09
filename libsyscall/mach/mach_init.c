@@ -153,6 +153,9 @@ retry:
 		if (result == -LINUX_EINTR) {
 			goto retry;
 		}
+		if (result == -LINUX_ETIMEDOUT) {
+			return 0;
+		}
 		__builtin_unreachable();
 	}
 	return 0;
