@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchownat.h>
 
 #include <sys/errno.h>
+#include <string.h>
 
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/chown.h>
@@ -9,8 +10,6 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
-
-extern char* strcpy(char* dst, const char* src);
 
 long sys_fchownat(int fd, const char* path, int uid, int gid, int flag)
 {
