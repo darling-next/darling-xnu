@@ -1,8 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/getxattr.h>
 
 #include <sys/errno.h>
-
-extern char* strcpy(char* dst, const char* src);
+#include <string.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>

@@ -25,7 +25,6 @@
 #	define O_DIRECTORY 0x100000
 #endif
 
-extern int strcmp(const char *s1, const char *s2);
 long sys_openat(int fd, const char* filename, int flags, unsigned int mode)
 {
 	CANCELATION_POINT();
