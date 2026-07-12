@@ -26,6 +26,21 @@ long sys_unlinkat(int fd, const char* path, int flag)
 
 	strcpy(vc.path, path);
 
+#ifdef EUNION
+	// E-UNION: NEVER delete a lower-only name from the shared template. Decide the
+	// policy BEFORE expand/syscall. SKIP => the name was lower-only and is now
+	// whited-out; report success without touching the template. PROCEED => the
+	// target is in the upper layer; delete it, then whiteout if it also shadows a
+	// template entry. (Absolute guest paths only; relative is left to the syscall.)
+	if (path[0] == '/') {
+		int pol = vchroot_prepare_unlink(path);
+		if (pol < 0)
+			return errno_linux_to_bsd(pol);
+		if (pol == VCHROOT_UNLINK_SKIP)
+			return 0; // hidden via whiteout; the template is untouched
+	}
+#endif
+
 	ret = vchroot_expand(&vc);
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);

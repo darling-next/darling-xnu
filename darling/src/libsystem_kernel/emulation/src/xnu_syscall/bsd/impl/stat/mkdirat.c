@@ -24,22 +24,47 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	vc.dfd = atfd(fd);
 
 #ifdef EUNION
-	// mkdir over a previously-deleted name must clear its whiteout so the new
-	// dir is visible in the merged view.
-	if (path[0] == '/')
-		vchroot_pre_mkdir(path);
+	// copy up the parent dir (so the new dir lands in the upper layer, not the
+	// shared template) and clear any whiteout at the new name (mkdir over a
+	// previously-deleted name resurrects it).
+	int prepared_create_path = 0;
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_create_path(path, vc.path, sizeof(vc.path));
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+		prepared_create_path = wr > 0;
+	}
 #endif
 
-	strcpy(vc.path, path);
+#ifdef EUNION
+	if (!prepared_create_path) {
+#endif
+		strcpy(vc.path, path);
 
-	ret = vchroot_expand(&vc);
-	if (ret < 0)
-		return errno_linux_to_bsd(ret);
+		ret = vchroot_expand(&vc);
+		if (ret < 0)
+			return errno_linux_to_bsd(ret);
+#ifdef EUNION
+	}
+#endif
 
 	ret = LINUX_SYSCALL(__NR_mkdirat, vc.dfd, vc.path, mode);
 
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
+
+#ifdef EUNION
+	// If the new dir shadows a LOWER directory (delete-recreate of a populated
+	// dir), mark it opaque so the stale lower children are not re-merged. Only
+	// meaningful for an absolute guest path; best-effort (a failed opaque-set does
+	// not undo the successful mkdir, but the dir would then leak lower content --
+	// so surface the error to the caller).
+	if (path[0] == '/') {
+		int op = vchroot_post_mkdir(path);
+		if (op < 0)
+			return errno_linux_to_bsd(op);
+	}
+#endif
 
 	return 0;
 }

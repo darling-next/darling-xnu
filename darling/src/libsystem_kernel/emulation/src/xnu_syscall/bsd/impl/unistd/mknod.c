@@ -19,8 +19,13 @@ long sys_mknod(const char* path, int mode, int dev)
 		return -EFAULT;
 
 #ifdef EUNION
-	if (path[0] == '/')
-		vchroot_pre_mkdir(path); // clear any whiteout at the new name
+	// copy up the parent dir (so the node lands in the upper layer, not the
+	// shared template) and clear any whiteout at the new name.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_create(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
 #endif
 
 	strcpy(vc.path, path);
