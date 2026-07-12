@@ -72,6 +72,17 @@ static int marker_status(void* context, const char* path, const char* marker)
 	return length > 0 && value[0] == 'y';
 }
 
+static int path_kind(void* context, const char* path)
+{
+	struct stat st;
+	(void)context;
+	if (lstat(path, &st) != 0)
+		return -errno;
+	return S_ISDIR(st.st_mode)
+		? EUNION_RESOLVER_DIRECTORY
+		: EUNION_RESOLVER_NON_DIRECTORY;
+}
+
 static void join(char* out, size_t cap, const char* root, const char* suffix)
 {
 	if (snprintf(out, cap, "%s%s", root, suffix) >= (int)cap)
@@ -107,6 +118,17 @@ static void expect(const struct eunion_resolver* resolver, const char* guest,
 		fail("unexpected resolver result");
 }
 
+static void expect_error(const struct eunion_resolver* resolver, const char* guest,
+	int error, const char* expected)
+{
+	struct eunion_resolver_result result;
+
+	if (eunion_resolve_path(resolver, guest, &result) != 0 ||
+		result.layer != EUNION_RESOLVER_ERROR || result.error != error ||
+		strcmp(result.host_path, expected) != 0)
+		fail("unexpected resolver error");
+}
+
 int main(void)
 {
 	char upper[EUNION_RESOLVER_PATH_MAX];
@@ -140,6 +162,12 @@ int main(void)
 	join(path, sizeof(path), upper, "/opaque");
 	make_dir(path);
 	set_marker(path, "user.union.opaque");
+	join(path, sizeof(path), upper, "/shadow");
+	make_file(path);
+	join(path, sizeof(path), lower, "/shadow");
+	make_dir(path);
+	join(path, sizeof(path), lower, "/shadow/child");
+	make_file(path);
 
 	resolver = (struct eunion_resolver){
 		.upper_root = upper,
@@ -147,7 +175,8 @@ int main(void)
 		.whiteout_marker = "user.union.whiteout",
 		.opaque_marker = "user.union.opaque",
 		.missing_status = -ENOENT,
-		.ops = { path_status, marker_status },
+		.not_directory_status = -ENOTDIR,
+		.ops = { path_status, marker_status, path_kind },
 	};
 	join(path, sizeof(path), lower, "/lower-only");
 	expect(&resolver, "/lower-only", EUNION_RESOLVER_LOWER, path);
@@ -157,6 +186,8 @@ int main(void)
 	expect(&resolver, "/masked", EUNION_RESOLVER_WHITEOUT, path);
 	join(path, sizeof(path), upper, "/opaque/hidden");
 	expect(&resolver, "/opaque/hidden", EUNION_RESOLVER_MISSING, path);
+	join(path, sizeof(path), upper, "/shadow/child");
+	expect_error(&resolver, "/shadow/child", -ENOTDIR, path);
 	join(path, sizeof(path), upper, "/absent");
 	expect(&resolver, "/absent", EUNION_RESOLVER_MISSING, path);
 	{
