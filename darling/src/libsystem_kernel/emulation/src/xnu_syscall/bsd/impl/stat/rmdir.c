@@ -22,8 +22,22 @@ long sys_rmdir(const char* path)
 
 	vc.flags = 0;
 	vc.dfd = get_perthread_wd();
-	
+
 	strcpy(vc.path, path);
+
+#ifdef EUNION
+	// E-UNION: a lower-only directory must be hidden with a whiteout, never
+	// rmdir'd out of the shared template. SKIP => already whited-out, done.
+	// PROCEED => the dir is in the upper layer; rmdir it, then whiteout if a
+	// template namesake remains. (See vchroot_prepare_unlink.)
+	if (path[0] == '/') {
+		int pol = vchroot_prepare_unlink(path);
+		if (pol < 0)
+			return errno_linux_to_bsd(pol);
+		if (pol == VCHROOT_UNLINK_SKIP)
+			return 0;
+	}
+#endif
 
 	ret = vchroot_expand(&vc);
 	if (ret < 0)

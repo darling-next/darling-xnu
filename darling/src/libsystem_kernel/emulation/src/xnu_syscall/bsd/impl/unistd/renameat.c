@@ -32,16 +32,25 @@ long sys_renameat(int oldfd, const char* oldpath, int newfd, const char* newpath
 	// name must clear any whiteout. After a successful rename the source name is
 	// gone from upper -- if the template still has it, whiteout the origin so it
 	// does not resurrect from the lower layer.
-	// PoC limitation: a lower-only *directory* source only copies up its top dir
-	// here, not its descendants (gVisor F.3 recursion); files and empty dirs are
-	// correct. Tracked in DESIGN.md.
+	// A lower-only DIRECTORY source must be deep-copied (node + ALL descendants):
+	// once the host moves the upper dir and we whiteout the origin, the lazy
+	// lower-merge no longer applies, so any descendant left only in the template
+	// would vanish (gVisor copy_up.go F.3). vchroot_copyup_tree handles files
+	// (single copy), symlinks, and directories (recursive) uniformly.
 	if (oldpath[0] == '/') {
-		int wr = vchroot_prepare_write(oldpath);
+		int wr = vchroot_copyup_tree(oldpath);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
 	}
-	if (newpath[0] == '/')
-		vchroot_pre_mkdir(newpath);
+	// destination side: copy up the dest's parent (so the move lands in the upper
+	// layer, not the template) and whiteout a lower-only dest namesake. Also
+	// clears any stale whiteout at the dest. Replaces the old pre_mkdir, which
+	// only cleared a whiteout and left rename-into-template / dest-overwrite holes.
+	if (newpath[0] == '/') {
+		int wr = vchroot_prepare_rename_dest(newpath);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
 #endif
 
 	ret = vchroot_expand(&vc);
