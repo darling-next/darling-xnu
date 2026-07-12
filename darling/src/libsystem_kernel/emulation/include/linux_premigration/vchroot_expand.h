@@ -63,6 +63,10 @@ int vchroot_prepare_write(const char* guest);
 // guest path. Returns 0 for a path inside the union, 1 for an unmanaged path,
 // or a negative Linux errno. The caller owns `out`.
 int vchroot_canonical_guest_path(int dfd, const char* path, char* out, int cap);
+// Create-path variant: like vchroot_canonical_guest_path(), but permits a
+// missing or whiteouted leaf so create/recreate operations can remove the
+// marker and publish the new upper object.
+int vchroot_canonical_guest_create_path(int dfd, const char* path, char* out, int cap);
 // *at() variant: resolve a dirfd-relative target to a guest-absolute path via
 // the dirfd, then prepare_write. For openat/mkdirat/etc. with a relative path.
 int vchroot_prepare_write_at(int dfd, const char* rel);
