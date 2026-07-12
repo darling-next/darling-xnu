@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/openat.h>
 
 #include <sys/fcntl.h>
+#include <string.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
 #include <darling/emulation/common/base.h>
@@ -25,8 +26,6 @@
 #endif
 
 extern int strcmp(const char *s1, const char *s2);
-extern char* strcpy(char* dst, const char* src);
-
 long sys_openat(int fd, const char* filename, int flags, unsigned int mode)
 {
 	CANCELATION_POINT();
@@ -80,8 +79,11 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 	int mutating = ((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
 		(flags & BSD_O_CREAT) || (flags & BSD_O_TRUNC));
 	if (mutating || filename[0] != '/') {
-		union_path = vchroot_canonical_guest_path(atfd(fd), filename,
-			guest_path, sizeof(guest_path));
+	union_path = (flags & BSD_O_CREAT)
+		? vchroot_canonical_guest_create_path(atfd(fd), filename,
+			guest_path, sizeof(guest_path))
+		: vchroot_canonical_guest_path(atfd(fd), filename,
+		guest_path, sizeof(guest_path));
 		if (union_path < 0)
 			return errno_linux_to_bsd(union_path);
 	}

@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/unlinkat.h>
 
 #include <sys/errno.h>
+#include <string.h>
 
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/base.h>
@@ -9,8 +10,6 @@
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 
-
-extern char* strcpy(char* dst, const char* src);
 
 long sys_unlinkat(int fd, const char* path, int flag)
 {
