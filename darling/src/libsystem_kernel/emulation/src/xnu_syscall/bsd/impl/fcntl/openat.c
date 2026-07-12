@@ -65,36 +65,58 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 		return ret;
 	}
 
+	struct vchroot_expand_args vc;
+	int use_upper_path = 0;
+
 #ifdef EUNION
 	// E-UNION: if this open writes/creates/truncates, materialize the target in
 	// the writable upper layer BEFORE expand so the real syscall never mutates the
 	// shared read-only template. Handles BOTH absolute paths and dirfd-relative
 	// paths (openat into a lower-only dir): prepare_write_at resolves the dirfd to
 	// a guest path and joins the relative target. (Read-only opens are left alone.)
-	if (((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
-	     (flags & BSD_O_CREAT) || (flags & BSD_O_TRUNC))) {
-		int wr = (filename[0] == '/')
-			? vchroot_prepare_write(filename)
-			: vchroot_prepare_write_at(atfd(fd), filename);
+	int union_path = 1;
+	char guest_path[4096];
+	char upper_path[4096];
+	int mutating = ((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
+		(flags & BSD_O_CREAT) || (flags & BSD_O_TRUNC));
+	if (mutating || filename[0] != '/') {
+		union_path = vchroot_canonical_guest_path(atfd(fd), filename,
+			guest_path, sizeof(guest_path));
+		if (union_path < 0)
+			return errno_linux_to_bsd(union_path);
+	}
+	if (union_path == 0 && mutating) {
+		int wr = vchroot_prepare_write(guest_path);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
-		// O_CREAT of a new file in a lower-only directory: prepare_write is a
-		// no-op for an absent target, so also copy up the PARENT dir, or the
-		// create lands inside the shared template. (Absolute paths only.)
-		if ((flags & BSD_O_CREAT) && filename[0] == '/') {
-			wr = vchroot_prepare_create(filename);
+		if (flags & BSD_O_CREAT) {
+			wr = vchroot_prepare_create_path(guest_path, upper_path, sizeof(upper_path));
 			if (wr < 0)
 				return errno_linux_to_bsd(wr);
+			if (wr > 0) {
+				strcpy(vc.path, upper_path);
+				vc.dfd = LINUX_AT_FDCWD;
+				use_upper_path = 1;
+			}
 		}
 	}
 #endif
 
-	struct vchroot_expand_args vc;
 	vc.flags = (flags & BSD_O_SYMLINK || flags & BSD_O_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	vc.dfd = atfd(fd);
 
-	strcpy(vc.path, filename);
-	ret = vchroot_expand(&vc);
+	if (!use_upper_path) {
+#ifdef EUNION
+		if (union_path == 0) {
+			strcpy(vc.path, guest_path);
+			vc.dfd = LINUX_AT_FDCWD;
+		} else
+#endif
+			strcpy(vc.path, filename);
+		ret = vchroot_expand(&vc);
+	} else {
+		ret = 0;
+	}
 	if (ret < 0) {
 		return errno_linux_to_bsd(ret);
 	}

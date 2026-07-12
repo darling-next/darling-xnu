@@ -13,12 +13,18 @@ enum eunion_resolver_layer {
 	EUNION_RESOLVER_ERROR,
 };
 
+enum eunion_resolver_path_kind {
+	EUNION_RESOLVER_DIRECTORY,
+	EUNION_RESOLVER_NON_DIRECTORY,
+};
+
 // Filesystem callbacks return zero for a present path, `missing_status` when
 // absent, and a negative domain error for every other failure. Marker callbacks
 // return one when present, zero when absent, or a negative domain error.
 struct eunion_resolver_ops {
 	int (*path_status)(void* context, const char* host_path);
 	int (*marker_status)(void* context, const char* host_path, const char* marker);
+	int (*path_kind)(void* context, const char* host_path);
 };
 
 struct eunion_resolver {
@@ -27,6 +33,7 @@ struct eunion_resolver {
 	const char* whiteout_marker;
 	const char* opaque_marker;
 	int missing_status;
+	int not_directory_status;
 	void* context;
 	struct eunion_resolver_ops ops;
 };

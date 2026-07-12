@@ -30,6 +30,7 @@
 #	define LINUX_O_RDONLY O_RDONLY
 
 #	define __simple_sprintf sprintf
+#	define __simple_snprintf snprintf
 #	define linux_dirent64 dirent
 typedef struct stat stat_t;
 #else
@@ -177,6 +178,21 @@ static void eunion_init_from_prefix(void)
 #ifndef LINUX_O_EXCL
 #define LINUX_O_EXCL 0200
 #endif
+#ifndef LINUX_EINVAL
+#define LINUX_EINVAL 22
+#endif
+#ifndef LINUX_ENOTDIR
+#define LINUX_ENOTDIR 20
+#endif
+#ifndef LINUX_EIO
+#define LINUX_EIO 5
+#endif
+#ifndef LINUX_EMFILE
+#define LINUX_EMFILE 24
+#endif
+#ifdef TEST
+extern int eunion_test_fail_xattr;
+#endif
 #ifndef LINUX_S_IFDIR
 #define LINUX_S_IFDIR 0040000
 #endif
@@ -186,11 +202,50 @@ static void eunion_init_from_prefix(void)
 
 extern int __simple_sprintf(char* str, const char* fmt, ...);
 
+static int eunion_guest_path_safe(const char* guest)
+{
+	int depth = 0;
+	const char* cursor;
+
+	if (!guest || guest[0] != '/')
+		return -LINUX_EINVAL;
+	for (cursor = guest; *cursor; )
+	{
+		const char* end;
+		int length;
+		while (*cursor == '/')
+			cursor++;
+		if (!*cursor)
+			break;
+		end = cursor;
+		while (*end && *end != '/')
+			end++;
+		length = (int)(end - cursor);
+		if (length == 1 && cursor[0] == '.')
+		{
+			cursor = end;
+			continue;
+		}
+		if (length == 2 && cursor[0] == '.' && cursor[1] == '.')
+		{
+			if (depth == 0)
+				return -LINUX_EINVAL;
+			depth--;
+		}
+		else
+			depth++;
+		cursor = end;
+	}
+	return 0;
+}
+
 // Build the host path for `guest` (a guest-absolute path, no symlink follow)
 // under `root` (prefix_path or libexec_path). Returns length, or -1 on overflow.
 static int eunion_host_path(const char* root, int root_len, const char* guest, char* out, int cap)
 {
 	int glen = (int)strlen(guest);
+	if (eunion_guest_path_safe(guest) < 0)
+		return -1;
 	if (root_len + glen + 1 > cap)
 		return -1;
 	memcpy(out, root, root_len);
@@ -271,15 +326,15 @@ static int eunion_mkparents_upper(const char* guest)
 // and a copy-up must not smuggle privilege into the writable prefix (overlay's
 // userxattr mode and gVisor both clear it on a data copy-up). Overlay-private
 // markers (our user.union.*) are never present on a lower-layer source, so they
-// need no filtering. Best-effort: a failure to copy one xattr does not fail
-// copy-up.
-static void eunion_copy_xattrs(int sfd, int dfd)
+// need no filtering. Any other metadata failure aborts publication: a partial
+// metadata copy is not a valid replacement for the lower object.
+static int eunion_copy_xattrs(int sfd, int dfd)
 {
 #if defined(__NR_flistxattr) && defined(__NR_fgetxattr) && defined(__NR_fsetxattr)
 	char names[4096];
 	int ln = LINUX_SYSCALL(__NR_flistxattr, sfd, names, sizeof(names));
 	if (ln <= 0)
-		return; // none, or list too big for the PoC buffer
+		return ln < 0 ? ln : 0;
 	char val[1024];
 	int off = 0;
 	while (off < ln)
@@ -295,11 +350,15 @@ static void eunion_copy_xattrs(int sfd, int dfd)
 			continue;
 		int vn = LINUX_SYSCALL(__NR_fgetxattr, sfd, name, val, sizeof(val));
 		if (vn < 0)
-			continue;
-		LINUX_SYSCALL(__NR_fsetxattr, dfd, name, val, vn, 0);
+			return vn;
+		int wr = LINUX_SYSCALL(__NR_fsetxattr, dfd, name, val, vn, 0);
+		if (wr < 0)
+			return wr;
 	}
+	return 0;
 #else
 	(void)sfd; (void)dfd;
+	return 0;
 #endif
 }
 
@@ -322,6 +381,17 @@ static void eunion_stat_mtime(const stat_t* st, long* sec, long* nsec)
 #endif
 }
 
+static void eunion_stat_atime(const stat_t* st, long* sec, long* nsec)
+{
+#ifdef TEST
+	*sec  = (long) st->st_atim.tv_sec;
+	*nsec = (long) st->st_atim.tv_nsec;
+#else
+	*sec  = (long) st->st_atime;
+	*nsec = (long) st->st_atime_nsec;
+#endif
+}
+
 static int eunion_copy_regular(const char* src_host, const char* dst_host, const stat_t* src_st)
 {
 	unsigned int mode = (unsigned int) src_st->st_mode;
@@ -331,13 +401,23 @@ static int eunion_copy_regular(const char* src_host, const char* dst_host, const
 
 	// staging path in the upper work dir
 	char work[4096];
-	__simple_sprintf(work, "%s/.union-work", prefix_path);
+	if (__simple_snprintf(work, sizeof(work), "%s/.union-work", prefix_path) < 0 ||
+		(int)strlen(work) >= (int)sizeof(work))
+	{
+		LINUX_SYSCALL(__NR_close, sfd);
+		return -LINUX_ENAMETOOLONG;
+	}
 	eunion_mkdir(work, 0700); // best-effort; EEXIST ok
 
 	char tmp[4096];
 	static unsigned long seq = 0;
 	int tid = (int)LINUX_SYSCALL(__NR_gettid);
-	__simple_sprintf(tmp, "%s/.union-work/cu.%d.%lu", prefix_path, tid, (unsigned long)(seq++));
+	if (__simple_snprintf(tmp, sizeof(tmp), "%s/.union-work/cu.%d.%lu", prefix_path,
+		tid, (unsigned long)(seq++)) < 0 || (int)strlen(tmp) >= (int)sizeof(tmp))
+	{
+		LINUX_SYSCALL(__NR_close, sfd);
+		return -LINUX_ENAMETOOLONG;
+	}
 
 	// strip setid: create with permission bits only (mode & 0777), never 07777.
 	int dfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, tmp,
@@ -387,7 +467,20 @@ static int eunion_copy_regular(const char* src_host, const char* dst_host, const
 	// carry xattrs over before publishing (while both fds are open). NOTE:
 	// eunion_copy_xattrs deliberately drops security.capability so a file
 	// capability cannot survive a copy-up either (it is setuid-equivalent).
-	eunion_copy_xattrs(sfd, dfd);
+	{
+		int xr;
+#ifdef TEST
+		if (eunion_test_fail_xattr > 0) {
+			eunion_test_fail_xattr--;
+			xr = -LINUX_EIO;
+		} else
+#endif
+			xr = eunion_copy_xattrs(sfd, dfd);
+		if (xr < 0) {
+			rv = xr;
+			goto done;
+		}
+	}
 	// Preserve mtime (overlay keeps the source mtime; resetting it to "now" breaks
 	// make/ninja/ccache staleness checks). atime is set to the source atime too;
 	// ctime cannot be set and will reflect the copy, which matches overlay. The
@@ -395,9 +488,10 @@ static int eunion_copy_regular(const char* src_host, const char* dst_host, const
 	if (rv == 0)
 	{
 		struct { long tv_sec; long tv_nsec; } ts[2];
-		long msec, mnsec;
+		long asec, ansec, msec, mnsec;
+		eunion_stat_atime(src_st, &asec, &ansec);
 		eunion_stat_mtime(src_st, &msec, &mnsec);
-		ts[0].tv_sec = msec; ts[0].tv_nsec = mnsec; // atime <- source mtime
+		ts[0].tv_sec = asec; ts[0].tv_nsec = ansec;
 		ts[1].tv_sec = msec; ts[1].tv_nsec = mnsec; // mtime <- source mtime
 #if defined(__NR_utimensat)
 		LINUX_SYSCALL(__NR_utimensat, dfd, (const char*)0, ts, 0);
@@ -588,6 +682,11 @@ int vchroot_copyup_tree(const char* guest)
 static const char EUNION_WH_XATTR[]     = "user.union.whiteout";
 static const char EUNION_OPAQUE_XATTR[] = "user.union.opaque";
 
+#ifdef TEST
+int eunion_test_fail_whiteout;
+int eunion_test_fail_xattr;
+#endif
+
 // E-UNION reserves the `user.union.` xattr namespace for its own overlay-private
 // markers (whiteout/opaque). The guest must never be able to FORGE a marker (a
 // setxattr/removexattr that would fabricate or clear a whiteout/opaque and so
@@ -640,6 +739,17 @@ static int eunion_resolver_marker_status(void* context, const char* host,
 	return eunion_has_marker(host, marker);
 }
 
+static int eunion_resolver_path_kind(void* context, const char* host)
+{
+	stat_t st;
+	(void)context;
+	if (eunion_lstat(host, &st) < 0)
+		return -LINUX_ENOENT;
+	return (st.st_mode & LINUX_S_IFMT) == LINUX_S_IFDIR
+		? EUNION_RESOLVER_DIRECTORY
+		: EUNION_RESOLVER_NON_DIRECTORY;
+}
+
 static struct eunion_resolver eunion_current_resolver(void)
 {
 	return (struct eunion_resolver) {
@@ -648,9 +758,11 @@ static struct eunion_resolver eunion_current_resolver(void)
 		.whiteout_marker = EUNION_WH_XATTR,
 		.opaque_marker = EUNION_OPAQUE_XATTR,
 		.missing_status = -LINUX_ENOENT,
+		.not_directory_status = -LINUX_ENOTDIR,
 		.ops = {
 			.path_status = eunion_resolver_path_status,
 			.marker_status = eunion_resolver_marker_status,
+			.path_kind = eunion_resolver_path_kind,
 		},
 	};
 }
@@ -683,6 +795,13 @@ int vchroot_whiteout(const char* guest)
 {
 	if (prefix_path_len < 0)
 		return -LINUX_ENOENT;
+#ifdef TEST
+	if (eunion_test_fail_whiteout > 0)
+	{
+		eunion_test_fail_whiteout--;
+		return -LINUX_EIO;
+	}
+#endif
 
 	int r = eunion_mkparents_upper(guest);
 	if (r < 0)
@@ -822,6 +941,35 @@ int vchroot_prepare_write(const char* guest)
 	return r; // 0 if copied up or already upper; negative on real error
 }
 
+// Canonicalize a syscall path through the real vchroot resolver and convert the
+// resulting host path back to a guest path. AT_FDCWD cannot be passed to
+// vchroot_fdpath(), so it must go through vchroot_expand() using the process cwd.
+// Returning 1 means the path is outside both union layers and is intentionally
+// unmanaged; returning 0 means `out` contains an absolute guest path.
+int vchroot_canonical_guest_path(int dfd, const char* path, char* out, int cap)
+{
+	struct vchroot_expand_args expanded;
+	struct eunion_resolver resolver;
+	int status;
+
+	if (!path || !out || cap <= 0)
+		return -LINUX_EINVAL;
+	if ((int)strlen(path) + 1 > (int)sizeof(expanded.path))
+		return -LINUX_ENAMETOOLONG;
+	memcpy(expanded.path, path, strlen(path) + 1);
+	expanded.flags = 0;
+	expanded.dfd = dfd;
+	status = vchroot_expand(&expanded);
+	if (status < 0)
+		return status;
+
+	resolver = eunion_current_resolver();
+	status = eunion_guest_path_from_host(&resolver, expanded.path, out, cap);
+	if (status < 0)
+		return -LINUX_ENAMETOOLONG;
+	return status;
+}
+
 // *at() variant: the mutating target is addressed RELATIVE to a directory fd
 // (openat/mkdirat/...). The plain vchroot_prepare_write only acts on absolute
 // guest paths, so a dirfd-relative write into a lower-only dir would otherwise
@@ -837,9 +985,21 @@ int vchroot_prepare_write_at(int dfd, const char* rel)
 	if (rel[0] == '/')
 		return vchroot_prepare_write(rel); // already absolute
 
-	// need a real dir fd to resolve against
+	// AT_FDCWD is represented by -100 and has no /proc/self/fd entry. Resolve it
+	// through the process cwd instead of silently skipping copy-up.
+	if (dfd == -100)
+	{
+		char guest[4096];
+		int status = vchroot_canonical_guest_path(dfd, rel, guest, sizeof(guest));
+		if (status < 0)
+			return status;
+		return status > 0 ? 0 : vchroot_prepare_write(guest);
+	}
+
+	// Other negative descriptors are invalid for a relative path. Preserve the
+	// existing unmanaged behavior rather than guessing a base directory.
 	if (dfd < 0)
-		return 0; // AT_FDCWD/relative without a base we can map: PoC no-op
+		return 0;
 
 	char base[4096];
 	struct vchroot_fdpath_args fp;
@@ -1118,6 +1278,8 @@ static int eunion_copyup_dir_resolved(const char* dir)
 			next[base] = '/';
 			memcpy(next + base + 1, link, ln + 1);
 		}
+		if (eunion_guest_path_safe(next) < 0)
+			return -LINUX_EINVAL;
 		// loop to materialize the (possibly again-symlinked) target dir
 		memcpy(cur, next, strlen(next) + 1);
 	}
@@ -1195,6 +1357,17 @@ int vchroot_prepare_rename_dest(const char* guest)
 		return vchroot_whiteout(guest);
 
 	return 0; // absent in both: a plain create-in-upper
+}
+
+int vchroot_upper_guest_path(const char* guest, char* out, int cap)
+{
+	if (!out || cap <= 0)
+		return -LINUX_EINVAL;
+	if (!eunion_manage(guest))
+		return 1;
+	if (eunion_host_path(prefix_path, prefix_path_len, guest, out, cap) < 0)
+		return -LINUX_ENAMETOOLONG;
+	return 0;
 }
 
 // BEFORE creating a new entry (mkdir/mknod/mkfifo/symlink/...): ensure the
@@ -1443,6 +1616,11 @@ void vchroot_dir_closed(int fd)
 	s->ready = 0;
 }
 
+void vchroot_dir_rewind(int fd)
+{
+	vchroot_dir_closed(fd);
+}
+
 static struct eunion_dir_state* eunion_dir_alloc(int fd)
 {
 	struct eunion_dir_state* s = eunion_dir_find(fd);
@@ -1452,11 +1630,28 @@ static struct eunion_dir_state* eunion_dir_alloc(int fd)
 			if (eunion_dirs[i].fd == -1) { s = &eunion_dirs[i]; break; }
 	}
 	if (!s)
-		return 0; // table full: caller degrades to plain upper stream
+		return 0; // caller reports explicit capacity exhaustion
 	s->fd = fd;
 	s->ready = 0;
 	s->count = s->cursor = s->used = 0;
 	return s;
+}
+
+int vchroot_dir_dup(int oldfd, int newfd)
+{
+	struct eunion_dir_state* source = eunion_dir_find(oldfd);
+	struct eunion_dir_state* target;
+
+	if (!source)
+		return 0;
+	target = eunion_dir_find(newfd);
+	if (!target)
+		target = eunion_dir_alloc(newfd);
+	if (!target)
+		return -LINUX_EMFILE;
+	memcpy(target, source, sizeof(*target));
+	target->fd = newfd;
+	return 0;
 }
 
 // append one linux_dirent64 record for `name` into out; returns bytes used or
@@ -1566,8 +1761,8 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 	if (!s)
 	{
 		s = eunion_dir_alloc(fd);
-		if (!s) // table full: degrade gracefully to plain upper stream
-			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		if (!s)
+			return -LINUX_EMFILE;
 	}
 
 	if (!s->ready)
@@ -1581,8 +1776,8 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
 
 		int n = vchroot_readdir_merge(guest, s->names, sizeof(s->names));
-		if (n < 0) // fall back to the raw stream on any merge error
-			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		if (n < 0)
+			return n;
 
 		// remember the guest dir path so the emitter can lstat each entry for a
 		// real d_type/d_ino (overlay presents valid types, not DT_UNKNOWN).
@@ -1889,7 +2084,7 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 					return -LINUX_ENOENT;
 				
 				// Append the component
-				const int prevlen = ctxt->current_path_len;
+				int prevlen = ctxt->current_path_len;
 
 				memcpy(ctxt->current_path + ctxt->current_path_len, input_path, len);
 				ctxt->current_path_len += len;
@@ -1939,6 +2134,8 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 								return -LINUX_ENAMETOOLONG;
 							if (resolution.layer == EUNION_RESOLVER_WHITEOUT)
 								return -LINUX_ENOENT;
+							if (resolution.layer == EUNION_RESOLVER_ERROR)
+								return resolution.error;
 
 							if (resolution.layer == EUNION_RESOLVER_LOWER)
 							{
@@ -1953,6 +2150,11 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 							root_len = (int)strlen(resolution.host_path);
 							memcpy(ctxt->current_path, resolution.host_path, root_len + 1);
 							ctxt->current_path_len = root_len;
+							// The resolver result contains the complete candidate path,
+							// while `prevlen` still points into the pre-resolution lower
+							// path. Keep case-insensitive lookup anchored at the final
+							// component after switching roots.
+							prevlen = root_len - (int)len;
 							status = resolution.layer == EUNION_RESOLVER_ERROR
 								? resolution.error
 								: resolution.layer == EUNION_RESOLVER_MISSING

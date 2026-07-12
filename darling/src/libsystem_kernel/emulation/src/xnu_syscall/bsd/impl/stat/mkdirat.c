@@ -28,8 +28,13 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	// shared template) and clear any whiteout at the new name (mkdir over a
 	// previously-deleted name resurrects it).
 	int prepared_create_path = 0;
-	if (path[0] == '/') {
-		int wr = vchroot_prepare_create_path(path, vc.path, sizeof(vc.path));
+	char guest_path[4096];
+	int union_path = vchroot_canonical_guest_path(vc.dfd, path,
+		guest_path, sizeof(guest_path));
+	if (union_path < 0)
+		return errno_linux_to_bsd(union_path);
+	if (union_path == 0) {
+		int wr = vchroot_prepare_create_path(guest_path, vc.path, sizeof(vc.path));
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
 		prepared_create_path = wr > 0;
@@ -59,8 +64,8 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	// meaningful for an absolute guest path; best-effort (a failed opaque-set does
 	// not undo the successful mkdir, but the dir would then leak lower content --
 	// so surface the error to the caller).
-	if (path[0] == '/') {
-		int op = vchroot_post_mkdir(path);
+	if (union_path == 0) {
+		int op = vchroot_post_mkdir(guest_path);
 		if (op < 0)
 			return errno_linux_to_bsd(op);
 	}
