@@ -132,21 +132,50 @@ int eunion_resolve_path(const struct eunion_resolver* resolver,
 		if (eunion_join(resolver->upper_root, parent, upper_parent,
 			sizeof(upper_parent)) != 0)
 			return -1;
-		status = resolver->ops.marker_status(resolver->context, upper_parent,
-			resolver->opaque_marker);
-		if (status < 0)
+		status = resolver->ops.path_status(resolver->context, upper_parent);
+		if (status != 0 && status != resolver->missing_status)
 		{
 			result->layer = EUNION_RESOLVER_ERROR;
 			result->error = status;
 			strcpy(result->host_path, upper);
 			return 0;
 		}
-		if (status > 0)
+		if (status == 0)
 		{
-			result->layer = EUNION_RESOLVER_MISSING;
-			strcpy(result->host_path, upper);
-			result->error = resolver->missing_status;
-			return 0;
+			status = resolver->ops.marker_status(resolver->context, upper_parent,
+				resolver->opaque_marker);
+			if (status < 0)
+			{
+				result->layer = EUNION_RESOLVER_ERROR;
+				result->error = status;
+				strcpy(result->host_path, upper);
+				return 0;
+			}
+			if (status > 0)
+			{
+				result->layer = EUNION_RESOLVER_MISSING;
+				strcpy(result->host_path, upper);
+				result->error = resolver->missing_status;
+				return 0;
+			}
+			if (resolver->ops.path_kind)
+			{
+				int kind = resolver->ops.path_kind(resolver->context, upper_parent);
+				if (kind < 0)
+				{
+					result->layer = EUNION_RESOLVER_ERROR;
+					result->error = kind;
+					strcpy(result->host_path, upper);
+					return 0;
+				}
+				if (kind == EUNION_RESOLVER_NON_DIRECTORY)
+				{
+					result->layer = EUNION_RESOLVER_ERROR;
+					result->error = resolver->not_directory_status;
+					strcpy(result->host_path, upper);
+					return 0;
+				}
+			}
 		}
 	}
 
