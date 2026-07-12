@@ -6,6 +6,9 @@
 #include <darling/emulation/conversion/dirent/getdirentries.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#ifdef EUNION
+#include <darling/emulation/linux_premigration/vchroot_expand.h>
+#endif
 
 #define LINUX_SEEK_SET 0
 #define LINUX_SEEK_CUR 1
@@ -48,7 +51,13 @@ long sys_getdirentries(int fd, char* ibuf, unsigned int len, long* basep)
 	if (basep)
 		*basep = 0;
 
+#ifdef EUNION
+	// E-UNION: merged listing (upper + lower template, whiteouts subtracted,
+	// opaque honoured). Per-fd state is freed by close() via vchroot_dir_closed.
+	ret = vchroot_getdents_merge(fd, buf, sizeof(buf));
+#else
 	ret = LINUX_SYSCALL(__NR_getdents64, fd, buf, sizeof(buf));
+#endif
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
@@ -98,7 +107,11 @@ long sys_getdirentries64(int fd, char* ibuf, unsigned int len, long* basep)
 	if (basep)
 		*basep = 0;
 
+#ifdef EUNION
+	ret = vchroot_getdents_merge(fd, buf, sizeof(buf));
+#else
 	ret = LINUX_SYSCALL(__NR_getdents64, fd, buf, sizeof(buf));
+#endif
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
