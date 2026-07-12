@@ -16,6 +16,7 @@ add_definitions(-DBSDTHREAD_WRAP_LINUX_PTHREAD
 
 # include src/startup for rtsig.h
 include_directories(
+	${CMAKE_CURRENT_SOURCE_DIR}/include
 	${CMAKE_BINARY_DIR}/src/startup
 	${CMAKE_BINARY_DIR}/src/external/xnu/darling/src/libsystem_kernel/libsyscall
 	${CMAKE_CURRENT_BINARY_DIR}/src/other
@@ -85,9 +86,22 @@ set(linux_premigration_sources
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
+	src/linux_premigration/eunion_resolver.c
 	src/linux_premigration/linux-syscall.S
 	src/linux_premigration/vchroot_userspace.c
 )
+
+if (BUILD_TESTING)
+	add_executable(eunion_resolver_test
+		tests/eunion_resolver_test.c
+		src/linux_premigration/eunion_resolver.c
+	)
+	target_include_directories(eunion_resolver_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_resolver_test COMMAND eunion_resolver_test)
+	set_tests_properties(eunion_resolver_test PROPERTIES LABELS eunion-host)
+endif()
 
 set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/bsd_syscall_table.c
@@ -390,4 +404,3 @@ endif()
 
 make_fat(emulation)
 make_fat(emulation_dyld)
-
