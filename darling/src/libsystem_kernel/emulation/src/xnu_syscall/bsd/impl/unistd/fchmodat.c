@@ -69,6 +69,16 @@ long sys_fchmodat(int fd, const char* path, int mode, int flag)
 	if (!path)
 		return -EFAULT;
 
+#ifdef EUNION
+	// chmod mutates metadata: copy up from the template first so the change lands
+	// on the per-prefix upper copy, not the shared lower file.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_write(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+#endif
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);

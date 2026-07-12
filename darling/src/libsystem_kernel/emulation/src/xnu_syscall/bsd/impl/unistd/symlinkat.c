@@ -17,7 +17,13 @@ long sys_symlinkat(const char* path, int fd, const char* link)
 
 	vc.flags = 0;
 	vc.dfd = get_perthread_wd();
-	
+
+#ifdef EUNION
+	// creating a symlink at `link`: clear any whiteout so the new name is visible.
+	if (link[0] == '/')
+		vchroot_pre_mkdir(link);
+#endif
+
 	strcpy(vc.path, link);
 
 	ret = vchroot_expand(&vc);

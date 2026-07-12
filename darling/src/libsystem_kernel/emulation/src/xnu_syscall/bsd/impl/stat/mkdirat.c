@@ -22,7 +22,14 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 
 	vc.flags = 0;
 	vc.dfd = atfd(fd);
-	
+
+#ifdef EUNION
+	// mkdir over a previously-deleted name must clear its whiteout so the new
+	// dir is visible in the merged view.
+	if (path[0] == '/')
+		vchroot_pre_mkdir(path);
+#endif
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
