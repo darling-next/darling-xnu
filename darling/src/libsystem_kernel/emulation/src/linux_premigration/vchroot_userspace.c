@@ -49,13 +49,13 @@ typedef struct stat stat_t;
 #	include <darling/emulation/conversion/stat/common.h>
 #	include <darling/emulation/xnu_syscall/bsd/impl/dirent/getdirentries.h>
 #	include <darling/emulation/conversion/common_at.h>
+#	include <string.h>
 
 #include <darlingserver/rpc.h>
 
 typedef struct linux_stat stat_t;
 
 extern __SIZE_TYPE__ strlen(const char* s);
-extern char* strcpy(char* dest, const char* src);
 extern int strcmp(const char* str1, const char* str2);
 extern int strncmp(const char* str1, const char* str2, __SIZE_TYPE__ n);
 extern int strcasecmp(const char* str1, const char* str2);
@@ -968,6 +968,68 @@ int vchroot_canonical_guest_path(int dfd, const char* path, char* out, int cap)
 	if (status < 0)
 		return -LINUX_ENAMETOOLONG;
 	return status;
+}
+
+int vchroot_canonical_guest_create_path(int dfd, const char* path, char* out, int cap)
+{
+	int status = vchroot_canonical_guest_path(dfd, path, out, cap);
+	if (status != -LINUX_ENOENT)
+		return status;
+
+	// A whiteouted absolute leaf cannot be expanded through the resolver. The
+	// guest spelling is still the canonical create target; prepare_create() will
+	// clear its marker after the parent policy has been applied.
+	if (path[0] == '/')
+	{
+		if (eunion_guest_path_safe(path) < 0)
+			return -LINUX_EINVAL;
+		if ((int)strlen(path) + 1 > cap)
+			return -LINUX_ENAMETOOLONG;
+		memcpy(out, path, strlen(path) + 1);
+		return eunion_manage(path) ? 0 : 1;
+	}
+
+	// For a relative target, canonicalize the parent and append the leaf. This
+	// preserves dirfd semantics while allowing only the final component to be
+	// absent or whiteouted.
+	int length = (int)strlen(path);
+	int last_slash = -1;
+	for (int index = 0; index < length; index++)
+		if (path[index] == '/')
+			last_slash = index;
+	char parent[4096];
+	char leaf[4096];
+	if (last_slash < 0)
+	{
+		memcpy(parent, ".", 2);
+		memcpy(leaf, path, length + 1);
+	}
+	else
+	{
+		if (last_slash >= (int)sizeof(parent) ||
+			length - last_slash > (int)sizeof(leaf))
+			return -LINUX_ENAMETOOLONG;
+		memcpy(parent, path, last_slash);
+		parent[last_slash] = '\0';
+		memcpy(leaf, path + last_slash + 1, length - last_slash);
+	}
+	char canonical_parent[4096];
+	status = vchroot_canonical_guest_path(dfd, parent,
+		canonical_parent, sizeof(canonical_parent));
+	if (status != 0)
+		return status;
+	int parent_length = (int)strlen(canonical_parent);
+	int leaf_length = (int)strlen(leaf);
+	int separator = parent_length > 1 ? 1 : 0;
+	if (parent_length + separator + leaf_length + 1 > cap)
+		return -LINUX_ENAMETOOLONG;
+	memcpy(out, canonical_parent, parent_length);
+	if (separator)
+		out[parent_length++] = '/';
+	memcpy(out + parent_length, leaf, leaf_length + 1);
+	if (eunion_guest_path_safe(out) < 0)
+		return -LINUX_EINVAL;
+	return eunion_manage(out) ? 0 : 1;
 }
 
 // *at() variant: the mutating target is addressed RELATIVE to a directory fd

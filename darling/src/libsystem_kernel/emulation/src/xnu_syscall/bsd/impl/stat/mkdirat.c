@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/stat/mkdirat.h>
 
 #include <sys/errno.h>
+#include <string.h>
 
 #include <darling/emulation/conversion/stat/common.h>
 #include <darling/emulation/common/base.h>
@@ -9,8 +10,6 @@
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 #include <darling/emulation/other/mach/lkm.h>
-
-extern char* strcpy(char* dst, const char* src);
 
 long sys_mkdirat(int fd, const char* path, unsigned int mode)
 {
@@ -29,7 +28,7 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	// previously-deleted name resurrects it).
 	int prepared_create_path = 0;
 	char guest_path[4096];
-	int union_path = vchroot_canonical_guest_path(vc.dfd, path,
+	int union_path = vchroot_canonical_guest_create_path(vc.dfd, path,
 		guest_path, sizeof(guest_path));
 	if (union_path < 0)
 		return errno_linux_to_bsd(union_path);
