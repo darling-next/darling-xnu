@@ -34,5 +34,12 @@ long sys_rmdir(const char* path)
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
+#ifdef EUNION
+	// the upper dir was removed; if the lower template still has it, whiteout so
+	// the merged view keeps it deleted instead of resurrecting the template dir.
+	if (path[0] == '/')
+		vchroot_post_unlink(path);
+#endif
+
 	return 0;
 }
