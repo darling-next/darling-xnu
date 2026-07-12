@@ -52,11 +52,17 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap);
 // MUST be called from close()/closedir() so the per-fd state is freed.
 int vchroot_getdents_merge(int fd, char* out, int cap);
 void vchroot_dir_closed(int fd);
+void vchroot_dir_rewind(int fd);
+int vchroot_dir_dup(int oldfd, int newfd);
 // Thin policy helpers the syscall-emulation sites call (see vchroot_userspace.c):
 //   vchroot_prepare_write(guest) BEFORE a write/mutate (expand then hits upper);
 //   vchroot_post_unlink(guest)   AFTER a successful unlink/rmdir;
 //   vchroot_pre_mkdir(guest)     BEFORE re-creating a possibly-deleted name.
 int vchroot_prepare_write(const char* guest);
+// Convert an absolute or dirfd-relative syscall path into a canonical absolute
+// guest path. Returns 0 for a path inside the union, 1 for an unmanaged path,
+// or a negative Linux errno. The caller owns `out`.
+int vchroot_canonical_guest_path(int dfd, const char* path, char* out, int cap);
 // *at() variant: resolve a dirfd-relative target to a guest-absolute path via
 // the dirfd, then prepare_write. For openat/mkdirat/etc. with a relative path.
 int vchroot_prepare_write_at(int dfd, const char* rel);
@@ -85,6 +91,11 @@ int vchroot_prepare_unlink(const char* guest);
 // whiteout a lower-only dest namesake, so the host rename lands in the upper
 // layer and never moves into / overwrites the shared template.
 int vchroot_prepare_rename_dest(const char* guest);
+// Return the concrete writable host path for a managed guest path. This is used
+// after a mutation transaction has prepared an upper destination (for example,
+// a rename over a lower-only name that now carries a whiteout). Returns zero for
+// a managed path, one for an unmanaged path, or a negative Linux errno.
+int vchroot_upper_guest_path(const char* guest, char* out, int cap);
 // BEFORE a create (mkdir/mknod/mkfifo/symlink): copy up the parent dir so the
 // new entry lands in the upper layer, and clear any whiteout at the new name.
 int vchroot_prepare_create(const char* guest);

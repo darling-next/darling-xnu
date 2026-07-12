@@ -31,13 +31,20 @@ long sys_unlinkat(int fd, const char* path, int flag)
 	// policy BEFORE expand/syscall. SKIP => the name was lower-only and is now
 	// whited-out; report success without touching the template. PROCEED => the
 	// target is in the upper layer; delete it, then whiteout if it also shadows a
-	// template entry. (Absolute guest paths only; relative is left to the syscall.)
-	if (path[0] == '/') {
-		int pol = vchroot_prepare_unlink(path);
+	// template entry.
+	char guest_path[4096];
+	int union_path = vchroot_canonical_guest_path(vc.dfd, path,
+		guest_path, sizeof(guest_path));
+	if (union_path < 0)
+		return errno_linux_to_bsd(union_path);
+	if (union_path == 0) {
+		int pol = vchroot_prepare_unlink(guest_path);
 		if (pol < 0)
 			return errno_linux_to_bsd(pol);
 		if (pol == VCHROOT_UNLINK_SKIP)
 			return 0; // hidden via whiteout; the template is untouched
+		vc.dfd = -100;
+		strcpy(vc.path, guest_path);
 	}
 #endif
 
@@ -56,8 +63,11 @@ long sys_unlinkat(int fd, const char* path, int flag)
 #ifdef EUNION
 	// the upper object was removed; if the name still exists in the lower
 	// template, drop a whiteout so the merged view keeps it deleted.
-	if (ret == 0 && path[0] == '/')
-		vchroot_post_unlink(path);
+	if (ret == 0 && union_path == 0) {
+		int post = vchroot_post_unlink(guest_path);
+		if (post < 0)
+			return errno_linux_to_bsd(post);
+	}
 #endif
 
 	return ret;

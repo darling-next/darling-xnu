@@ -12,6 +12,8 @@
 
 #define LINUX_AT_REMOVEDIR	0x200
 
+extern char* strcpy(char* dst, const char* src);
+
 long sys_rmdir(const char* path)
 {
 	int ret;
@@ -30,12 +32,19 @@ long sys_rmdir(const char* path)
 	// rmdir'd out of the shared template. SKIP => already whited-out, done.
 	// PROCEED => the dir is in the upper layer; rmdir it, then whiteout if a
 	// template namesake remains. (See vchroot_prepare_unlink.)
-	if (path[0] == '/') {
-		int pol = vchroot_prepare_unlink(path);
+	char guest_path[4096];
+	int union_path = vchroot_canonical_guest_path(vc.dfd, path,
+		guest_path, sizeof(guest_path));
+	if (union_path < 0)
+		return errno_linux_to_bsd(union_path);
+	if (union_path == 0) {
+		int pol = vchroot_prepare_unlink(guest_path);
 		if (pol < 0)
 			return errno_linux_to_bsd(pol);
 		if (pol == VCHROOT_UNLINK_SKIP)
 			return 0;
+		vc.dfd = -100;
+		strcpy(vc.path, guest_path);
 	}
 #endif
 
@@ -51,8 +60,11 @@ long sys_rmdir(const char* path)
 #ifdef EUNION
 	// the upper dir was removed; if the lower template still has it, whiteout so
 	// the merged view keeps it deleted instead of resurrecting the template dir.
-	if (path[0] == '/')
-		vchroot_post_unlink(path);
+	if (union_path == 0) {
+		int post = vchroot_post_unlink(guest_path);
+		if (post < 0)
+			return errno_linux_to_bsd(post);
+	}
 #endif
 
 	return 0;
