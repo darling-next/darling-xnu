@@ -14,6 +14,7 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/bsdthread/cancelable.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/misc/fdpath.h>
+#include <darling/emulation/common/guarded/table.h>
 
 #ifndef O_NOFOLLOW
 #   define O_NOFOLLOW 0x0100
@@ -78,6 +79,8 @@ long sys_fcntl_nocancel(int fd, int cmd, long arg)
 {
 	int ret, linux_cmd = cmd_bsd_to_linux(cmd);
 	long original_arg = arg;
+	if (guard_table_check(fd, guard_flag_prevent_close))
+		return -EBADF;
 
 	switch (cmd)
 	{
