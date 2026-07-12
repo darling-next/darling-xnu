@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/renameat.h>
 
 #include <sys/errno.h>
+#include <string.h>
 
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/base.h>
@@ -8,8 +9,6 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
-
-extern char* strcpy(char* dst, const char* src);
 
 long sys_renameat(int oldfd, const char* oldpath, int newfd, const char* newpath)
 {
@@ -42,7 +41,7 @@ long sys_renameat(int oldfd, const char* oldpath, int newfd, const char* newpath
 	int new_path_prepared = 0;
 	int old_union = vchroot_canonical_guest_path(vc.dfd, oldpath,
 		old_guest_path, sizeof(old_guest_path));
-	int new_union = vchroot_canonical_guest_path(vc2.dfd, newpath,
+	int new_union = vchroot_canonical_guest_create_path(vc2.dfd, newpath,
 		new_guest_path, sizeof(new_guest_path));
 	if (old_union < 0)
 		return errno_linux_to_bsd(old_union);
