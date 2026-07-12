@@ -1,10 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/listxattr.h>
 
 #include <sys/errno.h>
-
-#ifdef EUNION
-extern void* memmove(void* dest, const void* src, __SIZE_TYPE__ n);
-#endif
+#include <string.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
