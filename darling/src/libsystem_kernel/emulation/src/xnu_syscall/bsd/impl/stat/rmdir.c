@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/stat/rmdir.h>
 
 #include <sys/errno.h>
+#include <string.h>
 
 #include <darling/emulation/conversion/stat/common.h>
 #include <darling/emulation/common/base.h>
@@ -11,8 +12,6 @@
 #include <darling/emulation/other/mach/lkm.h>
 
 #define LINUX_AT_REMOVEDIR	0x200
-
-extern char* strcpy(char* dst, const char* src);
 
 long sys_rmdir(const char* path)
 {
