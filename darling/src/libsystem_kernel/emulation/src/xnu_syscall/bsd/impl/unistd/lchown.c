@@ -10,8 +10,12 @@
 
 long sys_lchown(const char* path, int uid, int gid)
 {
+	if (!path)
+		return -EFAULT;
+
 	// E-UNION HAZARD (dar-test-infra-sp5.8.4.4.8): this stub is SAFE only because
-	// it is disabled (returns 0, no mutation). If it is ever un-stubbed, it becomes
+	// it is disabled (returns ENOTSUP, no mutation). If it is ever un-stubbed, it
+	// becomes
 	// an immediate template-corruption path: the body below vchroot_expand()s the
 	// guest path and lchowns it -- but for a lower-only target that expanded path is
 	// the shared LOWER template, so the chown mutates ownership for ALL prefixes.
@@ -26,9 +30,6 @@ long sys_lchown(const char* path, int uid, int gid)
 	vc.flags = 0;
 	vc.dfd = get_perthread_wd();
 	
-	if (!path)
-		return -EFAULT;
-
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
@@ -45,6 +46,6 @@ long sys_lchown(const char* path, int uid, int gid)
 
 	return ret;
 #else
-	return 0;
+	return -ENOTSUP;
 #endif
 }
