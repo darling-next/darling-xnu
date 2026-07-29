@@ -86,6 +86,8 @@ set(linux_premigration_sources
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
+	src/linux_premigration/eunion_remove.c
+	src/linux_premigration/eunion_remove_runtime.c
 	src/linux_premigration/eunion_resolver.c
 	src/linux_premigration/linux-syscall.S
 	src/linux_premigration/vchroot_userspace.c
@@ -101,6 +103,30 @@ if (BUILD_TESTING)
 	)
 	add_test(NAME eunion_resolver_test COMMAND eunion_resolver_test)
 	set_tests_properties(eunion_resolver_test PROPERTIES LABELS eunion-host)
+
+	add_executable(eunion_remove_test
+		tests/eunion_remove_test.c
+		src/linux_premigration/eunion_remove.c
+	)
+	target_include_directories(eunion_remove_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_remove_test COMMAND eunion_remove_test)
+	set_tests_properties(eunion_remove_test PROPERTIES LABELS eunion-remove-v2)
+
+	add_executable(eunion_remove_runtime_test
+		tests/eunion_remove_runtime_test.c
+		src/linux_premigration/eunion_remove.c
+		src/linux_premigration/eunion_remove_runtime.c
+	)
+	target_compile_definitions(eunion_remove_runtime_test PRIVATE TEST=1)
+	target_include_directories(eunion_remove_runtime_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_remove_runtime_test COMMAND eunion_remove_runtime_test)
+	set_tests_properties(eunion_remove_runtime_test PROPERTIES
+		LABELS eunion-remove-v2
+	)
 endif()
 
 set(xnu_syscall_bsd_sources

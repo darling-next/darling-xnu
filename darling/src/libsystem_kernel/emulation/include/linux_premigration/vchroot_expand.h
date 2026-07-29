@@ -85,12 +85,11 @@ int vchroot_fd_for_meta_write(int fd);
 // a writable fd; an O_RDONLY fd yields EINVAL). Returns the original fd if
 // unmanaged, or a negative errno.
 int vchroot_fd_for_content_write(int fd);
-// BEFORE unlink/rmdir: decide policy and tell the caller whether to run the host
-// delete. The lower template is shared+live (not RO), so a lower-only name must
-// be hidden with a whiteout, never deleted on disk.
-#define VCHROOT_UNLINK_PROCEED 0  // caller runs the host delete
-#define VCHROOT_UNLINK_SKIP    1  // caller must NOT delete (whiteout already set)
-int vchroot_prepare_unlink(const char* guest);
+// Perform an E-UNION unlink/rmdir through the fd-relative typed remove
+// lifecycle. `handled` is set only for a managed union path; unmanaged paths
+// retain the ordinary syscall path.
+int vchroot_remove_at(int dfd, const char* path, int remove_directory,
+	int* handled);
 // BEFORE a rename destination is committed: copy up the dest's parent dir and
 // whiteout a lower-only dest namesake, so the host rename lands in the upper
 // layer and never moves into / overwrites the shared template.
