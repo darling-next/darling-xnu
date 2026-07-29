@@ -1,6 +1,7 @@
 
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 #ifdef EUNION
+#include <linux_premigration/eunion_remove_runtime.h>
 #include <linux_premigration/eunion_resolver.h>
 #endif
 #ifdef TEST
@@ -1218,46 +1219,32 @@ int vchroot_fd_for_content_write(int fd)
 	return nfd;            // != fd: caller applies the op to nfd and closes it
 }
 
-// BEFORE an unlink/rmdir: decide the union policy and tell the caller whether to
-// run the host delete syscall. The lower template is a SHARED live directory
-// (not a read-only mount), so a delete that reaches a lower host path would
-// physically remove the object from the template for EVERY prefix. We must never
-// let the real syscall touch a lower-only name.
-//
-//   lower-only name  -> drop a whiteout, return VCHROOT_UNLINK_SKIP: the caller
-//                       must NOT call the host syscall (the name is now hidden).
-//   upper present    -> return VCHROOT_UNLINK_PROCEED: the caller deletes the
-//                       upper object, then calls vchroot_post_unlink() to drop a
-//                       whiteout if the name also exists in the template.
-//   absent in both / unmanaged -> VCHROOT_UNLINK_PROCEED (let the syscall ENOENT
-//                       naturally; nothing to hide).
-int vchroot_prepare_unlink(const char* guest)
+int vchroot_remove_at(int dfd, const char* path, int remove_directory,
+	int* handled)
 {
-	if (!eunion_manage(guest))
-		return VCHROOT_UNLINK_PROCEED;
+	char guest[4096];
+	struct eunion_remove_runtime runtime;
+	int result;
 
-	// upper object present? then the real delete targets the upper copy -> proceed
-	char up[4096];
-	if (eunion_host_path(prefix_path, prefix_path_len, guest, up, sizeof(up)) < 0)
-		return -LINUX_ENAMETOOLONG;
-	stat_t ust;
-	if (eunion_lstat(up, &ust) == 0)
-		return VCHROOT_UNLINK_PROCEED; // delete the upper; post_unlink handles lower
+	if (!handled)
+		return -LINUX_EINVAL;
+	*handled = 0;
+	result = vchroot_canonical_guest_create_path(dfd, path, guest,
+		(int)sizeof(guest));
+	if (result < 0)
+		return result;
+	if (result != 0 || !eunion_manage(guest))
+		return 0;
 
-	// no upper object. is it in the lower template?
-	char lo[4096];
-	if (eunion_host_path(libexec_path, libexec_path_len, guest, lo, sizeof(lo)) < 0)
-		return -LINUX_ENAMETOOLONG;
-	stat_t lst;
-	if (eunion_lstat(lo, &lst) != 0)
-		return VCHROOT_UNLINK_PROCEED; // absent in both: let the syscall ENOENT
-
-	// lower-only: NEVER delete from the shared template. Hide it with a whiteout
-	// and tell the caller to skip the host delete entirely.
-	int r = vchroot_whiteout(guest);
-	if (r < 0)
-		return r;
-	return VCHROOT_UNLINK_SKIP;
+	runtime = (struct eunion_remove_runtime) {
+		.upper_root = prefix_path,
+		.lower_root = libexec_path,
+		.whiteout_marker = EUNION_WH_XATTR,
+	};
+	*handled = 1;
+	return eunion_remove_path(&runtime, guest,
+		remove_directory ? EUNION_INTENT_REMOVE_DIRECTORY
+			: EUNION_INTENT_REMOVE_FILE);
 }
 
 // Materialize a guest DIRECTORY path in the upper layer, following any symlink at
