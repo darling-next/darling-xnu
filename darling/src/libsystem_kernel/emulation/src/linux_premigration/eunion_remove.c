@@ -72,12 +72,39 @@ struct eunion_remove_plan eunion_plan_remove(
 			return reject(-EIO);
 	}
 
+	switch (request.state.ancestor_visibility)
+	{
+		case EUNION_ANCESTORS_VISIBLE:
+			break;
+		case EUNION_ANCESTOR_OPAQUE:
+			if (request.state.presence == EUNION_PRESENCE_LOWER_ONLY ||
+				request.state.presence == EUNION_PRESENCE_MERGED)
+				return reject(-EIO);
+			break;
+		case EUNION_ANCESTORS_INVALID:
+		default:
+			return reject(-EIO);
+	}
+
+	if (request.state.visible_kind == EUNION_NODE_DIRECTORY)
+	{
+		if (request.state.directory_view != EUNION_DIRECTORY_EMPTY &&
+			request.state.directory_view != EUNION_DIRECTORY_NONEMPTY)
+			return reject(-EIO);
+	}
+	else if (request.state.directory_view !=
+		EUNION_DIRECTORY_NOT_APPLICABLE)
+		return reject(-EIO);
+
 	if (request.intent == EUNION_INTENT_REMOVE_FILE &&
 		request.state.visible_kind == EUNION_NODE_DIRECTORY)
 		return reject(-EISDIR);
 	if (request.intent == EUNION_INTENT_REMOVE_DIRECTORY &&
 		request.state.visible_kind != EUNION_NODE_DIRECTORY)
 		return reject(-ENOTDIR);
+	if (request.intent == EUNION_INTENT_REMOVE_DIRECTORY &&
+		request.state.directory_view == EUNION_DIRECTORY_NONEMPTY)
+		return reject(-ENOTEMPTY);
 
 	switch (request.state.presence)
 	{

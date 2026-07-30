@@ -26,6 +26,10 @@ static void expect_action(enum eunion_operation_intent intent,
 			.state = {
 				.presence = presence,
 				.visible_kind = visible_kind,
+				.ancestor_visibility = EUNION_ANCESTORS_VISIBLE,
+				.directory_view = visible_kind == EUNION_NODE_DIRECTORY
+					? EUNION_DIRECTORY_EMPTY
+					: EUNION_DIRECTORY_NOT_APPLICABLE,
 			},
 		}
 	);
@@ -100,6 +104,39 @@ int main(void)
 		EUNION_NODE_DIRECTORY, EUNION_REMOVE_REJECT, -EISDIR);
 	expect_action(EUNION_INTENT_REMOVE_DIRECTORY, EUNION_PRESENCE_MERGED,
 		EUNION_NODE_SYMLINK, EUNION_REMOVE_REJECT, -ENOTDIR);
+
+	{
+		struct eunion_remove_plan result = eunion_plan_remove(
+			(struct eunion_remove_request) {
+				.intent = EUNION_INTENT_REMOVE_DIRECTORY,
+				.state = {
+					.presence = EUNION_PRESENCE_MERGED,
+					.visible_kind = EUNION_NODE_DIRECTORY,
+					.ancestor_visibility = EUNION_ANCESTORS_VISIBLE,
+					.directory_view = EUNION_DIRECTORY_NONEMPTY,
+				},
+			});
+		require(result.action == EUNION_REMOVE_REJECT,
+			"non-empty union directory rejected");
+		require(result.error == -ENOTEMPTY,
+			"non-empty union directory reports ENOTEMPTY");
+	}
+	{
+		struct eunion_remove_plan result = eunion_plan_remove(
+			(struct eunion_remove_request) {
+				.intent = EUNION_INTENT_REMOVE_FILE,
+				.state = {
+					.presence = EUNION_PRESENCE_LOWER_ONLY,
+					.visible_kind = EUNION_NODE_REGULAR,
+					.ancestor_visibility = EUNION_ANCESTOR_OPAQUE,
+					.directory_view = EUNION_DIRECTORY_NOT_APPLICABLE,
+				},
+			});
+		require(result.action == EUNION_REMOVE_REJECT,
+			"opaque ancestor cannot expose lower-only target");
+		require(result.error == -EIO,
+			"impossible opaque-ancestor state fails closed");
+	}
 
 	expect_action((enum eunion_operation_intent)999,
 		EUNION_PRESENCE_LOWER_ONLY, EUNION_NODE_REGULAR,

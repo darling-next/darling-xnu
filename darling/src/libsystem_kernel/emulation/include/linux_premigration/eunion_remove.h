@@ -34,6 +34,19 @@ enum eunion_node_kind {
 	EUNION_NODE_INVALID,
 };
 
+enum eunion_ancestor_visibility {
+	EUNION_ANCESTORS_VISIBLE = 0,
+	EUNION_ANCESTOR_OPAQUE,
+	EUNION_ANCESTORS_INVALID,
+};
+
+enum eunion_directory_view {
+	EUNION_DIRECTORY_NOT_APPLICABLE = 0,
+	EUNION_DIRECTORY_EMPTY,
+	EUNION_DIRECTORY_NONEMPTY,
+	EUNION_DIRECTORY_INVALID,
+};
+
 enum eunion_remove_action {
 	EUNION_REMOVE_REJECT = 0,
 	EUNION_REMOVE_UPPER,
@@ -45,6 +58,8 @@ enum eunion_remove_action {
 struct eunion_resolved_remove_state {
 	enum eunion_resolved_presence presence;
 	enum eunion_node_kind visible_kind;
+	enum eunion_ancestor_visibility ancestor_visibility;
+	enum eunion_directory_view directory_view;
 };
 
 struct eunion_remove_request {
