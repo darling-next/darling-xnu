@@ -68,7 +68,7 @@ static int marker_status(void* context, const char* path, const char* marker)
 	(void)context;
 	length = lgetxattr(path, marker, value, sizeof(value));
 	if (length < 0)
-		return errno == ENODATA ? 0 : -errno;
+		return errno == ENODATA || errno == ENOENT ? 0 : -errno;
 	return length > 0 && value[0] == 'y';
 }
 

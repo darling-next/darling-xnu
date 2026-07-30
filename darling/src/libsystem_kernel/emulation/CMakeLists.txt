@@ -86,9 +86,8 @@ set(linux_premigration_sources
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
-	src/linux_premigration/eunion_remove.c
-	src/linux_premigration/eunion_remove_runtime.c
 	src/linux_premigration/eunion_resolver.c
+	src/linux_premigration/eunion_sidecar.c
 	src/linux_premigration/linux-syscall.S
 	src/linux_premigration/vchroot_userspace.c
 )
@@ -126,6 +125,160 @@ if (BUILD_TESTING)
 	add_test(NAME eunion_remove_runtime_test COMMAND eunion_remove_runtime_test)
 	set_tests_properties(eunion_remove_runtime_test PROPERTIES
 		LABELS eunion-remove-v2
+	)
+
+	add_executable(eunion_sidecar_contract_test
+		tests/eunion_sidecar_contract_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_contract_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_contract_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_contract_test
+		COMMAND eunion_sidecar_contract_test)
+	set_tests_properties(eunion_sidecar_contract_test PROPERTIES
+		LABELS "eunion-remove-v2;eunion-sidecar-v1"
+	)
+
+	add_executable(eunion_sidecar_state_test
+		tests/eunion_sidecar_state_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_include_directories(eunion_sidecar_state_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_state_test COMMAND eunion_sidecar_state_test)
+	set_tests_properties(eunion_sidecar_state_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_storage_test
+		tests/eunion_sidecar_storage_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_storage_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_storage_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_storage_test
+		COMMAND eunion_sidecar_storage_test)
+	set_tests_properties(eunion_sidecar_storage_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_prefix_format_test
+		tests/eunion_sidecar_prefix_format_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_prefix_format_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_prefix_format_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_prefix_format_test
+		COMMAND eunion_sidecar_prefix_format_test)
+	set_tests_properties(eunion_sidecar_prefix_format_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_recovery_test
+		tests/eunion_sidecar_recovery_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_recovery_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_recovery_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_recovery_test
+		COMMAND eunion_sidecar_recovery_test)
+	set_tests_properties(eunion_sidecar_recovery_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_lock_test
+		tests/eunion_sidecar_lock_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_lock_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_lock_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_lock_test COMMAND eunion_sidecar_lock_test)
+	set_tests_properties(eunion_sidecar_lock_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_concurrency_test
+		tests/eunion_sidecar_concurrency_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_concurrency_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_concurrency_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_concurrency_test
+		COMMAND eunion_sidecar_concurrency_test)
+	set_tests_properties(eunion_sidecar_concurrency_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_fault_matrix_test
+		tests/eunion_sidecar_fault_matrix_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_fault_matrix_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_fault_matrix_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_fault_matrix_test
+		COMMAND eunion_sidecar_fault_matrix_test)
+	set_tests_properties(eunion_sidecar_fault_matrix_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_swap_test
+		tests/eunion_sidecar_swap_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_swap_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_swap_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_swap_test
+		COMMAND eunion_sidecar_swap_test)
+	set_tests_properties(eunion_sidecar_swap_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_corruption_test
+		tests/eunion_sidecar_corruption_test.c
+		src/linux_premigration/eunion_sidecar.c
+	)
+	target_compile_definitions(eunion_sidecar_corruption_test PRIVATE TEST=1)
+	target_include_directories(eunion_sidecar_corruption_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_corruption_test
+		COMMAND eunion_sidecar_corruption_test)
+	set_tests_properties(eunion_sidecar_corruption_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
+
+	add_executable(eunion_sidecar_vchroot_test
+		tests/eunion_sidecar_vchroot_test.c
+		src/linux_premigration/eunion_sidecar.c
+		src/linux_premigration/eunion_resolver.c
+	)
+	target_compile_definitions(eunion_sidecar_vchroot_test PRIVATE
+		TEST=1 EUNION=1
+	)
+	target_include_directories(eunion_sidecar_vchroot_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_sidecar_vchroot_test
+		COMMAND eunion_sidecar_vchroot_test)
+	set_tests_properties(eunion_sidecar_vchroot_test PROPERTIES
+		LABELS eunion-sidecar-v1
 	)
 endif()
 

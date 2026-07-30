@@ -24,12 +24,18 @@ long sys_mkfifo(const char* path, unsigned int mode)
 	vc.dfd = get_perthread_wd();
 
 #ifdef EUNION
-	// copy up the parent dir (so the fifo lands in the upper layer, not the
-	// shared template) and clear any whiteout at the new name.
-	if (path[0] == '/') {
-		int wr = vchroot_prepare_create(path);
+	char guest_path[4096];
+	int union_path = vchroot_canonical_guest_create_path(
+		vc.dfd, path, guest_path, sizeof(guest_path));
+	if (union_path < 0)
+		return errno_linux_to_bsd(union_path);
+	if (union_path == 0) {
+		int wr = vchroot_prepare_create(guest_path);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
+		ret = vchroot_mknod_create(
+			guest_path, mode | LINUX_S_IFIFO, 0);
+		return ret < 0 ? errno_linux_to_bsd(ret) : 0;
 	}
 #endif
 

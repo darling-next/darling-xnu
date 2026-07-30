@@ -16,15 +16,22 @@ long sys_symlinkat(const char* path, int fd, const char* link)
 	struct vchroot_expand_args vc;
 
 	vc.flags = 0;
-	vc.dfd = get_perthread_wd();
+	vc.dfd = atfd(fd);
 
 #ifdef EUNION
-	// creating a symlink at `link`: copy up its parent dir (so the link lands in
-	// the upper layer, not the shared template) and clear any whiteout at the name.
-	if (link[0] == '/') {
-		int wr = vchroot_prepare_create(link);
+	char guest_path[4096];
+	int union_path = vchroot_canonical_guest_create_path(
+		vc.dfd, link, guest_path, sizeof(guest_path));
+	if (union_path < 0)
+		return errno_linux_to_bsd(union_path);
+	if (union_path == 0) {
+		int wr = vchroot_prepare_create(guest_path);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
+		ret = vchroot_symlink_create(path, guest_path, 0);
+		if (ret < 0)
+			return errno_linux_to_bsd(ret);
+		return 0;
 	}
 #endif
 

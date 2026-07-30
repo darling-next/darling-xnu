@@ -237,6 +237,7 @@ void (*eunion_test_remove_checkpoint_hook)(
 	enum eunion_remove_test_checkpoint checkpoint,
 	const char* guest_path
 );
+void (*eunion_test_remove_permission_lift_hook)(void);
 #endif
 
 static int eunion_fsync(int descriptor)
@@ -406,7 +407,13 @@ static int eunion_open_directory_readable_at(int parent, const char* name,
 				result = LINUX_SYSCALL(__NR_fchmodat2, pinned, "",
 					relaxed_mode, LINUX_AT_EMPTY_PATH);
 			if (result >= 0)
+			{
 				lifted = 1;
+#ifdef TEST
+				if (eunion_test_remove_permission_lift_hook)
+					eunion_test_remove_permission_lift_hook();
+#endif
+			}
 		}
 		if (result >= 0)
 		{
