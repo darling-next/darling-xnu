@@ -176,6 +176,13 @@ struct eunion_directory_chain {
 	struct eunion_inode_identity identity[EUNION_REMOVE_COMPONENT_MAX + 1];
 };
 
+struct eunion_readable_directory {
+	int descriptor;
+	int pinned_descriptor;
+	unsigned int original_mode;
+	int permission_lifted;
+};
+
 struct eunion_remove_capability_storage {
 	enum eunion_remove_phase phase;
 	const struct eunion_remove_runtime* runtime;
@@ -188,7 +195,7 @@ struct eunion_remove_capability_storage {
 	int upper_parent_complete;
 	int lower_parent_complete;
 	int lower_hidden_by_opaque_ancestor;
-	int directory_view_deferred;
+	int upper_ancestor_opacity_unknown;
 	unsigned char created_upper_parent[EUNION_REMOVE_COMPONENT_MAX];
 	struct eunion_inode_identity upper_leaf;
 	struct eunion_inode_identity lower_leaf;
@@ -353,11 +360,143 @@ static int eunion_marker_descriptor(int descriptor, const char* marker)
 	return result;
 }
 
+static void eunion_readable_directory_init(
+	struct eunion_readable_directory* directory)
+{
+	directory->descriptor = -1;
+	directory->pinned_descriptor = -1;
+	directory->original_mode = 0;
+	directory->permission_lifted = 0;
+}
+
+static int eunion_close_readable_directory(
+	struct eunion_readable_directory* directory);
+
+static int eunion_open_directory_readable_at(int parent, const char* name,
+	const struct eunion_inode_identity* expected,
+	unsigned int required_permissions,
+	struct eunion_readable_directory* directory)
+{
+	eunion_readable_directory_init(directory);
+	int descriptor = LINUX_SYSCALL(__NR_openat, parent, name,
+		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+		LINUX_O_CLOEXEC, 0);
+	if (descriptor == -LINUX_EACCES && required_permissions != 0)
+	{
+		int lifted = 0;
+		int pinned = LINUX_SYSCALL(__NR_openat, parent, name,
+			LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+			LINUX_O_CLOEXEC, 0);
+		if (pinned < 0)
+			return pinned;
+		struct eunion_inode_identity pinned_identity =
+			eunion_absent_identity();
+		int result = eunion_fstat_identity(pinned, &pinned_identity);
+		if (result >= 0 && expected &&
+			!eunion_same_object(&pinned_identity, expected))
+			result = -LINUX_EAGAIN;
+		if (result >= 0)
+		{
+			unsigned int relaxed_mode =
+				(pinned_identity.mode & 07777) | required_permissions;
+			if ((pinned_identity.mode & required_permissions) ==
+				required_permissions)
+				result = -LINUX_EACCES;
+			else
+				result = LINUX_SYSCALL(__NR_fchmodat2, pinned, "",
+					relaxed_mode, LINUX_AT_EMPTY_PATH);
+			if (result >= 0)
+				lifted = 1;
+		}
+		if (result >= 0)
+		{
+			descriptor = LINUX_SYSCALL(__NR_openat, pinned, ".",
+				LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_CLOEXEC, 0);
+			result = descriptor;
+		}
+		if (result < 0)
+		{
+			if (descriptor >= 0)
+				LINUX_SYSCALL(__NR_close, descriptor);
+			if (lifted)
+				LINUX_SYSCALL(__NR_fchmodat2, pinned, "",
+					pinned_identity.mode & 07777, LINUX_AT_EMPTY_PATH);
+			LINUX_SYSCALL(__NR_close, pinned);
+			return result;
+		}
+		directory->pinned_descriptor = pinned;
+		directory->original_mode = pinned_identity.mode;
+		directory->permission_lifted = lifted;
+	}
+	if (descriptor < 0)
+		return descriptor;
+	if (expected)
+	{
+		struct eunion_inode_identity observed;
+		int result = eunion_fstat_identity(descriptor, &observed);
+		if (result >= 0 && directory->permission_lifted)
+			observed.mode = (observed.mode & ~07777U) |
+				(directory->original_mode & 07777);
+		if (result >= 0 && !eunion_same_object(&observed, expected))
+			result = -LINUX_EAGAIN;
+		if (result < 0)
+		{
+			if (directory->descriptor < 0)
+				directory->descriptor = descriptor;
+			eunion_close_readable_directory(directory);
+			return result;
+		}
+	}
+	directory->descriptor = descriptor;
+	return 0;
+}
+
+static int eunion_close_readable_directory(
+	struct eunion_readable_directory* directory)
+{
+	int result = 0;
+	if (directory->permission_lifted)
+	{
+		result = LINUX_SYSCALL(__NR_fchmodat2,
+			directory->pinned_descriptor, "",
+			directory->original_mode & 07777, LINUX_AT_EMPTY_PATH);
+		directory->permission_lifted = 0;
+	}
+	if (directory->descriptor >= 0)
+	{
+		int close_result =
+			LINUX_SYSCALL(__NR_close, directory->descriptor);
+		if (result >= 0 && close_result < 0)
+			result = close_result;
+		directory->descriptor = -1;
+	}
+	if (directory->pinned_descriptor >= 0)
+	{
+		int close_result =
+			LINUX_SYSCALL(__NR_close, directory->pinned_descriptor);
+		if (result >= 0 && close_result < 0)
+			result = close_result;
+		directory->pinned_descriptor = -1;
+	}
+	return result;
+}
+
 static int eunion_marker_at(int parent, const char* name,
 	const char* marker, const struct eunion_inode_identity* identity)
 {
 	int descriptor = LINUX_SYSCALL(__NR_openat, parent, name,
 		LINUX_O_RDONLY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
+	struct eunion_readable_directory directory;
+	eunion_readable_directory_init(&directory);
+	if (descriptor == -LINUX_EACCES && identity &&
+		eunion_node_kind(identity->mode) == EUNION_NODE_DIRECTORY)
+	{
+		int result = eunion_open_directory_readable_at(parent, name,
+			identity, 0500, &directory);
+		if (result < 0)
+			return result;
+		descriptor = directory.descriptor;
+	}
 	if (descriptor == -LINUX_ELOOP)
 		return 0;
 	// Marker files created by this implementation are regular mode 0600
@@ -371,7 +510,11 @@ static int eunion_marker_at(int parent, const char* name,
 	if (descriptor < 0)
 		return descriptor;
 	int result = eunion_marker_descriptor(descriptor, marker);
-	int close_result = LINUX_SYSCALL(__NR_close, descriptor);
+	int close_result;
+	if (directory.descriptor >= 0)
+		close_result = eunion_close_readable_directory(&directory);
+	else
+		close_result = LINUX_SYSCALL(__NR_close, descriptor);
 	if (result >= 0 && close_result < 0)
 		return close_result;
 	return result;
@@ -617,6 +760,16 @@ static int eunion_open_parent_chains(eunion_remove_capability capability,
 					capability->upper.descriptor[
 						capability->upper.count - 1],
 					"user.union.opaque");
+				if (opaque == -LINUX_EBADF)
+				{
+					// O_PATH is intentionally used when the guest grants
+					// search but not read permission. Do not mutate a retained
+					// ancestor merely to inspect its xattrs. The leaf resolver
+					// may proceed only when lower visibility cannot affect the
+					// selected remove action.
+					capability->upper_ancestor_opacity_unknown = 1;
+					opaque = 0;
+				}
 				if (opaque < 0)
 					return opaque;
 				if (opaque)
@@ -846,13 +999,15 @@ static int eunion_read_leaf(int parent, const char* leaf,
 	return 0;
 }
 
-static int eunion_open_leaf_directory(int parent, const char* leaf)
+static int eunion_open_leaf_directory(int parent, const char* leaf,
+	const struct eunion_inode_identity* identity,
+	unsigned int required_permissions,
+	struct eunion_readable_directory* directory)
 {
 	if (parent < 0)
 		return -LINUX_ENOENT;
-	return LINUX_SYSCALL(__NR_openat, parent, leaf,
-		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-		LINUX_O_CLOEXEC, 0);
+	return eunion_open_directory_readable_at(parent, leaf, identity,
+		required_permissions, directory);
 }
 
 static int eunion_next_directory_entry(int descriptor, char* buffer,
@@ -956,8 +1111,10 @@ static int eunion_resolve_directory_view(eunion_remove_capability capability)
 		? capability->upper.descriptor[capability->upper.count - 1] : -1;
 	int lower_parent = capability->lower_parent_complete
 		? capability->lower.descriptor[capability->lower.count - 1] : -1;
-	int upper = -1;
-	int lower = -1;
+	struct eunion_readable_directory upper;
+	struct eunion_readable_directory lower;
+	eunion_readable_directory_init(&upper);
+	eunion_readable_directory_init(&lower);
 	int result = 0;
 	int nonempty = 0;
 
@@ -965,21 +1122,13 @@ static int eunion_resolve_directory_view(eunion_remove_capability capability)
 		 capability->upper_leaf.tag == EUNION_IDENTITY_OPAQUE) &&
 		eunion_node_kind(capability->upper_leaf.mode) == EUNION_NODE_DIRECTORY)
 	{
-		upper = eunion_open_leaf_directory(upper_parent, capability->leaf);
-		if (upper < 0)
-		{
-			if (upper != -LINUX_EACCES ||
-				capability->lower_leaf.tag != EUNION_IDENTITY_ABSENT)
-				return upper;
-			// An unreadable upper-only directory can still be removed using
-			// write+execute permission on its parent. Physical rmdir after the
-			// fd-relative rename remains the authoritative emptiness check.
-			upper = -1;
-			capability->directory_view_deferred = 1;
-		}
+		result = eunion_open_leaf_directory(upper_parent, capability->leaf,
+			&capability->upper_leaf, 0500, &upper);
+		if (result < 0)
+			return result;
 		else
 		{
-		result = eunion_upper_directory_nonempty(upper,
+		result = eunion_upper_directory_nonempty(upper.descriptor,
 			capability->runtime->whiteout_marker, &nonempty);
 		if (result < 0 || nonempty)
 			goto done;
@@ -989,25 +1138,26 @@ static int eunion_resolve_directory_view(eunion_remove_capability capability)
 		capability->lower_leaf.tag == EUNION_IDENTITY_PRESENT &&
 		eunion_node_kind(capability->lower_leaf.mode) == EUNION_NODE_DIRECTORY)
 	{
-		lower = eunion_open_leaf_directory(lower_parent, capability->leaf);
-		if (lower < 0)
+		result = eunion_open_leaf_directory(lower_parent, capability->leaf,
+			&capability->lower_leaf, 0, &lower);
+		if (result < 0)
 		{
-			result = lower;
 			goto done;
 		}
-		result = eunion_lower_directory_nonempty(lower, upper,
+		result = eunion_lower_directory_nonempty(lower.descriptor,
+			upper.descriptor,
 			capability->runtime->whiteout_marker, &nonempty);
 	}
 done:
-	if (lower >= 0)
+	if (lower.descriptor >= 0)
 	{
-		int close_result = LINUX_SYSCALL(__NR_close, lower);
+		int close_result = eunion_close_readable_directory(&lower);
 		if (result >= 0 && close_result < 0)
 			result = close_result;
 	}
-	if (upper >= 0)
+	if (upper.descriptor >= 0)
 	{
-		int close_result = LINUX_SYSCALL(__NR_close, upper);
+		int close_result = eunion_close_readable_directory(&upper);
 		if (result >= 0 && close_result < 0)
 			result = close_result;
 	}
@@ -1035,6 +1185,11 @@ static int eunion_resolve_capability(eunion_remove_capability capability)
 		&capability->upper_leaf);
 	if (result < 0)
 		return result;
+	if (capability->upper_ancestor_opacity_unknown &&
+		capability->lower_leaf.tag == EUNION_IDENTITY_PRESENT &&
+		(capability->upper_leaf.tag == EUNION_IDENTITY_PRESENT ||
+		 capability->upper_leaf.tag == EUNION_IDENTITY_ABSENT))
+		return -LINUX_EACCES;
 
 	if (capability->upper_leaf.tag == EUNION_IDENTITY_INVALID ||
 		capability->lower_leaf.tag == EUNION_IDENTITY_INVALID ||
@@ -1652,21 +1807,19 @@ static int eunion_dispose_staged_directory(
 	}
 	if (result != -LINUX_ENOTEMPTY)
 		return result;
-	if (capability->directory_view_deferred)
-		return -LINUX_ENOTEMPTY;
-
-	int source = LINUX_SYSCALL(__NR_openat, capability->work_descriptor,
-		capability->stage_name,
-		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-		LINUX_O_CLOEXEC, 0);
-	if (source < 0)
-		return source;
+	struct eunion_readable_directory source;
+	result = eunion_open_directory_readable_at(
+		capability->work_descriptor, capability->stage_name,
+		&capability->upper_leaf, 0700, &source);
+	if (result < 0)
+		return result;
 	result = eunion_open_tomb_directory(capability);
 	if (result >= 0)
-		result = eunion_move_internal_whiteouts(capability, source);
+		result = eunion_move_internal_whiteouts(capability,
+			source.descriptor);
 	if (result >= 0)
 	{
-		result = eunion_fsync(source);
+		result = eunion_fsync(source.descriptor);
 		if (result >= 0)
 			result = eunion_fsync(capability->tomb_descriptor);
 	}
@@ -1678,12 +1831,13 @@ static int eunion_dispose_staged_directory(
 	if (result < 0 && capability->tomb_contains_originals)
 	{
 		int restore_result =
-			eunion_restore_internal_whiteouts(capability, source);
+			eunion_restore_internal_whiteouts(capability,
+				source.descriptor);
 		if (restore_result < 0)
 			result = restore_result;
 	}
-	int close_result = LINUX_SYSCALL(__NR_close, source);
-	if (result < 0 && close_result < 0)
+	int close_result = eunion_close_readable_directory(&source);
+	if (result >= 0 && close_result < 0)
 		result = close_result;
 	if (result < 0)
 	{

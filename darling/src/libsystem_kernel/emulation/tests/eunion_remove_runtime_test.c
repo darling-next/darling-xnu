@@ -638,11 +638,184 @@ static int unreadable_empty_directory_case(void)
 	result = eunion_remove_path(&fixture.runtime, "/unreadable-nonempty",
 		EUNION_INTENT_REMOVE_DIRECTORY);
 	target_exists = exists(fixture.upper, "/unreadable-nonempty");
+	struct stat status;
+	require(lstat(nonempty, &status) == 0 &&
+		(status.st_mode & 0777) == 0000,
+		"failed unreadable rmdir restores exact mode");
 	require(chmod(nonempty, 0700) == 0,
 		"restore unreadable nonempty directory mode");
 	printf("EUNION_REMOVE_FOLLOWUP dir000-nonempty result=%d target=%d\n",
 		result, target_exists);
 	passed = passed && result == -ENOTEMPTY && target_exists;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static int merged_write_execute_parent_unlink_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char upper_parent[512];
+	char lower_parent[512];
+	join_path(upper_parent, sizeof(upper_parent), fixture.upper,
+		"/merged-write-execute");
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower,
+		"/merged-write-execute");
+	make_directory(upper_parent);
+	make_directory(lower_parent);
+	make_file(fixture.upper, "/merged-write-execute/victim", "upper");
+	require(chmod(upper_parent, 0300) == 0,
+		"chmod merged write-execute upper parent");
+	require(chmod(lower_parent, 0300) == 0,
+		"chmod merged write-execute lower parent");
+
+	int result = eunion_remove_path(&fixture.runtime,
+		"/merged-write-execute/victim", EUNION_INTENT_REMOVE_FILE);
+	int target_exists =
+		exists(fixture.upper, "/merged-write-execute/victim");
+	require(chmod(upper_parent, 0700) == 0,
+		"restore merged write-execute upper parent");
+	require(chmod(lower_parent, 0700) == 0,
+		"restore merged write-execute lower parent");
+	printf("EUNION_REMOVE_CROSS_PRODUCT merged-parent0300 result=%d "
+		"target=%d\n", result, target_exists);
+	int passed = result == 0 && !target_exists;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static void test_unreadable_ancestor_opacity_fails_closed(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char upper_parent[512];
+	char lower_parent[512];
+	join_path(upper_parent, sizeof(upper_parent), fixture.upper,
+		"/unknown-opacity");
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower,
+		"/unknown-opacity");
+	make_directory(upper_parent);
+	make_directory(lower_parent);
+	make_file(fixture.upper, "/unknown-opacity/merged", "upper");
+	make_file(fixture.lower, "/unknown-opacity/merged", "lower");
+	make_file(fixture.lower, "/unknown-opacity/lower-only", "lower");
+	require(chmod(upper_parent, 0300) == 0,
+		"chmod unknown-opacity upper parent");
+	require(chmod(lower_parent, 0300) == 0,
+		"chmod unknown-opacity lower parent");
+
+	require(eunion_remove_path(&fixture.runtime, "/unknown-opacity/merged",
+		EUNION_INTENT_REMOVE_FILE) == -EACCES,
+		"unknown opacity rejects ambiguous merged target");
+	require(eunion_remove_path(&fixture.runtime,
+		"/unknown-opacity/lower-only",
+		EUNION_INTENT_REMOVE_FILE) == -EACCES,
+		"unknown opacity rejects ambiguous lower target");
+	require(exists(fixture.upper, "/unknown-opacity/merged") &&
+		exists(fixture.lower, "/unknown-opacity/merged") &&
+		exists(fixture.lower, "/unknown-opacity/lower-only"),
+		"unknown-opacity rejection preserves every target");
+	require(chmod(upper_parent, 0700) == 0,
+		"restore unknown-opacity upper parent");
+	require(chmod(lower_parent, 0700) == 0,
+		"restore unknown-opacity lower parent");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static int unreadable_merged_empty_directory_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char upper_directory[512];
+	char lower_directory[512];
+	join_path(upper_directory, sizeof(upper_directory), fixture.upper,
+		"/merged-unreadable");
+	join_path(lower_directory, sizeof(lower_directory), fixture.lower,
+		"/merged-unreadable");
+	make_directory(upper_directory);
+	make_directory(lower_directory);
+	require(chmod(upper_directory, 0000) == 0,
+		"chmod unreadable merged upper directory");
+
+	int result = eunion_remove_path(&fixture.runtime, "/merged-unreadable",
+		EUNION_INTENT_REMOVE_DIRECTORY);
+	int parent_whiteout =
+		marker(fixture.upper, "/merged-unreadable", WHITEOUT);
+	int lower_preserved = exists(fixture.lower, "/merged-unreadable");
+	if (exists(fixture.upper, "/merged-unreadable") && !parent_whiteout)
+		require(chmod(upper_directory, 0700) == 0,
+			"restore unreadable merged upper directory");
+	printf("EUNION_REMOVE_CROSS_PRODUCT merged-dir000 result=%d "
+		"whiteout=%d lower=%d\n", result, parent_whiteout,
+		lower_preserved);
+	int passed = result == 0 && parent_whiteout && lower_preserved;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static int unreadable_internal_whiteout_directory_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char upper_directory[512];
+	char lower_directory[512];
+	join_path(upper_directory, sizeof(upper_directory), fixture.upper,
+		"/unreadable-whiteout");
+	join_path(lower_directory, sizeof(lower_directory), fixture.lower,
+		"/unreadable-whiteout");
+	make_directory(upper_directory);
+	make_directory(lower_directory);
+	make_file(fixture.upper, "/unreadable-whiteout/child", "");
+	make_file(fixture.lower, "/unreadable-whiteout/child", "lower");
+	set_marker(fixture.upper, "/unreadable-whiteout/child", WHITEOUT);
+	require(chmod(upper_directory, 0000) == 0,
+		"chmod internal-whiteout directory");
+
+	int result = eunion_remove_path(&fixture.runtime,
+		"/unreadable-whiteout", EUNION_INTENT_REMOVE_DIRECTORY);
+	int parent_whiteout =
+		marker(fixture.upper, "/unreadable-whiteout", WHITEOUT);
+	if (exists(fixture.upper, "/unreadable-whiteout") && !parent_whiteout)
+		require(chmod(upper_directory, 0700) == 0,
+			"restore internal-whiteout directory");
+	printf("EUNION_REMOVE_CROSS_PRODUCT dir000-whiteout result=%d "
+		"whiteout=%d\n", result, parent_whiteout);
+	int passed = result == 0 && parent_whiteout;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static int unreadable_recursive_whiteout_directory_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_directory[512];
+	char upper_directory[512];
+	join_path(lower_directory, sizeof(lower_directory), fixture.lower,
+		"/unreadable-recursive");
+	join_path(upper_directory, sizeof(upper_directory), fixture.upper,
+		"/unreadable-recursive");
+	make_directory(lower_directory);
+	make_file(fixture.lower, "/unreadable-recursive/child", "lower");
+
+	int child_result = eunion_remove_path(&fixture.runtime,
+		"/unreadable-recursive/child", EUNION_INTENT_REMOVE_FILE);
+	require(child_result == 0, "publish unreadable recursive child whiteout");
+	require(chmod(upper_directory, 0000) == 0,
+		"chmod unreadable recursive upper directory");
+	int parent_result = eunion_remove_path(&fixture.runtime,
+		"/unreadable-recursive", EUNION_INTENT_REMOVE_DIRECTORY);
+	int parent_whiteout =
+		marker(fixture.upper, "/unreadable-recursive", WHITEOUT);
+	if (exists(fixture.upper, "/unreadable-recursive") && !parent_whiteout)
+		require(chmod(upper_directory, 0700) == 0,
+			"restore unreadable recursive upper directory");
+	printf("EUNION_REMOVE_CROSS_PRODUCT unreadable-recursive child=%d "
+		"parent=%d whiteout=%d\n", child_result, parent_result,
+		parent_whiteout);
+	int passed =
+		child_result == 0 && parent_result == 0 && parent_whiteout;
 	fixture_destroy(&fixture);
 	return passed;
 }
@@ -653,12 +826,28 @@ static void test_followup_adversarial_remove_cases(void)
 	int hostile_umask = hostile_umask_whiteout_case();
 	int parent_permissions = write_execute_parent_unlink_case();
 	int directory_permissions = unreadable_empty_directory_case();
+	int merged_parent_permissions =
+		merged_write_execute_parent_unlink_case();
+	int merged_directory_permissions =
+		unreadable_merged_empty_directory_case();
+	int unreadable_whiteouts =
+		unreadable_internal_whiteout_directory_case();
+	int unreadable_recursive =
+		unreadable_recursive_whiteout_directory_case();
 	require(recursive, "recursive whiteout-only directory removal");
 	require(hostile_umask, "whiteout creation ignores guest umask");
 	require(parent_permissions,
 		"unlink requires no parent read permission");
 	require(directory_permissions,
 		"rmdir requires no target directory read permission");
+	require(merged_parent_permissions,
+		"merged parent traversal requires no read permission");
+	require(merged_directory_permissions,
+		"merged rmdir requires no target directory read permission");
+	require(unreadable_whiteouts,
+		"unreadable directory internal whiteouts are disposed");
+	require(unreadable_recursive,
+		"recursive unreadable directory removal completes");
 }
 
 static void test_recursive_whiteout_disposal_rollback(void)
@@ -697,6 +886,50 @@ static void test_recursive_whiteout_disposal_rollback(void)
 		"recursive directory removal succeeds after rollback");
 	require(marker(fixture.upper, "/recursive-rollback", WHITEOUT),
 		"recursive retry publishes parent whiteout");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void test_unreadable_whiteout_disposal_rollback(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_parent[512];
+	char upper_parent[512];
+	struct stat status;
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower,
+		"/unreadable-rollback");
+	join_path(upper_parent, sizeof(upper_parent), fixture.upper,
+		"/unreadable-rollback");
+	make_directory(lower_parent);
+	make_file(fixture.lower, "/unreadable-rollback/child", "lower");
+	require(eunion_remove_path(&fixture.runtime,
+		"/unreadable-rollback/child", EUNION_INTENT_REMOVE_FILE) == 0,
+		"publish unreadable rollback child whiteout");
+	require(chmod(upper_parent, 0000) == 0,
+		"chmod unreadable rollback directory");
+
+	eunion_test_remove_fail_tomb_move_ordinal = 1;
+	require(eunion_remove_path(&fixture.runtime, "/unreadable-rollback",
+		EUNION_INTENT_REMOVE_DIRECTORY) == -EIO,
+		"unreadable whiteout quarantine failure is reported");
+	eunion_test_remove_fail_tomb_move_ordinal = 0;
+	require(lstat(upper_parent, &status) == 0 &&
+		(status.st_mode & 0777) == 0000,
+		"unreadable quarantine rollback restores exact mode");
+	require(chmod(upper_parent, 0700) == 0,
+		"inspect unreadable quarantine rollback");
+	require(marker(fixture.upper, "/unreadable-rollback/child", WHITEOUT),
+		"unreadable quarantine rollback restores child whiteout");
+	require_work_empty(&fixture);
+
+	require(chmod(upper_parent, 0000) == 0,
+		"restore unreadable retry mode");
+	require(eunion_remove_path(&fixture.runtime, "/unreadable-rollback",
+		EUNION_INTENT_REMOVE_DIRECTORY) == 0,
+		"unreadable directory removal succeeds after rollback");
+	require(marker(fixture.upper, "/unreadable-rollback", WHITEOUT),
+		"unreadable retry publishes parent whiteout");
 	require_work_empty(&fixture);
 	fixture_destroy(&fixture);
 }
@@ -995,9 +1228,11 @@ int main(void)
 	test_union_directory_emptiness();
 	test_opaque_ancestor_hides_lower_target();
 	test_unreadable_upper_file_can_be_unlinked();
+	test_unreadable_ancestor_opacity_fails_closed();
 	test_materialized_parent_metadata();
 	test_followup_adversarial_remove_cases();
 	test_recursive_whiteout_disposal_rollback();
+	test_unreadable_whiteout_disposal_rollback();
 	test_all_interruption_cases();
 	test_staged_durability_failures();
 	test_nested_parent_rollback();
