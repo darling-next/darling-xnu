@@ -280,6 +280,24 @@ if (BUILD_TESTING)
 	set_tests_properties(eunion_sidecar_vchroot_test PROPERTIES
 		LABELS eunion-sidecar-v1
 	)
+
+	add_executable(eunion_directory_stream_test
+		tests/eunion_directory_stream_test.c
+		src/linux_premigration/eunion_sidecar.c
+		src/linux_premigration/eunion_resolver.c
+	)
+	target_compile_definitions(eunion_directory_stream_test PRIVATE
+		TEST=1 EUNION=1
+	)
+	target_include_directories(eunion_directory_stream_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	target_link_libraries(eunion_directory_stream_test PRIVATE pthread)
+	add_test(NAME eunion_directory_stream_test
+		COMMAND eunion_directory_stream_test)
+	set_tests_properties(eunion_directory_stream_test PROPERTIES
+		LABELS eunion-sidecar-v1
+	)
 endif()
 
 set(xnu_syscall_bsd_sources
