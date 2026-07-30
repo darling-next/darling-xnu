@@ -33,6 +33,7 @@ static int hook_role;
 static int hook_ready_fd = -1;
 static int hook_release_fd = -1;
 static struct fixture* swap_fixture;
+static enum eunion_remove_test_checkpoint swap_checkpoint;
 
 static void require(int condition, const char* message)
 {
@@ -75,6 +76,21 @@ static int exists(const char* root, const char* suffix)
 	struct stat status;
 	join_path(path, sizeof(path), root, suffix);
 	return lstat(path, &status) == 0;
+}
+
+static int file_equals(const char* root, const char* suffix,
+	const char* expected)
+{
+	char path[512];
+	char value[64] = {0};
+	join_path(path, sizeof(path), root, suffix);
+	int descriptor = open(path, O_RDONLY);
+	if (descriptor < 0)
+		return 0;
+	ssize_t length = read(descriptor, value, sizeof(value));
+	int close_result = close(descriptor);
+	return close_result == 0 && length == (ssize_t)strlen(expected) &&
+		memcmp(value, expected, (size_t)length) == 0;
 }
 
 static int marker(const char* root, const char* suffix, const char* name)
@@ -265,7 +281,7 @@ static void test_nested_and_symlink_rejection(void)
 static void swap_hook(enum eunion_remove_test_checkpoint checkpoint,
 	const char* guest_path)
 {
-	if (checkpoint != EUNION_REMOVE_TEST_REVALIDATED ||
+	if (checkpoint != swap_checkpoint ||
 		!swap_fixture || strcmp(guest_path, "/swap") != 0)
 		return;
 	char old_path[512];
@@ -288,6 +304,7 @@ static void test_leaf_swap_revalidation(void)
 	fixture_init(&fixture);
 	make_file(fixture.upper, "/swap", "original");
 	swap_fixture = &fixture;
+	swap_checkpoint = EUNION_REMOVE_TEST_REVALIDATED;
 	eunion_test_remove_checkpoint_hook = swap_hook;
 	require(eunion_remove_path(&fixture.runtime, "/swap",
 		EUNION_INTENT_REMOVE_FILE) == -EAGAIN,
@@ -296,6 +313,188 @@ static void test_leaf_swap_revalidation(void)
 	swap_fixture = NULL;
 	require(exists(fixture.upper, "/swap"), "replacement remains");
 	require(exists(fixture.upper, "/swap.new"), "original remains");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void test_leaf_swap_at_publication_boundary(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	make_file(fixture.upper, "/swap", "original");
+	swap_fixture = &fixture;
+	swap_checkpoint = EUNION_REMOVE_TEST_PREPARED;
+	eunion_test_remove_checkpoint_hook = swap_hook;
+	require(eunion_remove_path(&fixture.runtime, "/swap",
+		EUNION_INTENT_REMOVE_FILE) == -EAGAIN,
+		"leaf replacement detected at publication boundary");
+	eunion_test_remove_checkpoint_hook = NULL;
+	swap_fixture = NULL;
+	require(exists(fixture.upper, "/swap"),
+		"publication-boundary replacement remains");
+	require(exists(fixture.upper, "/swap.new"),
+		"publication-boundary original remains");
+	require(file_equals(fixture.upper, "/swap", "replacement"),
+		"publication-boundary replacement content preserved");
+	require(file_equals(fixture.upper, "/swap.new", "original"),
+		"publication-boundary original content preserved");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void parent_swap_prepared_hook(
+	enum eunion_remove_test_checkpoint checkpoint, const char* guest_path)
+{
+	if (checkpoint != EUNION_REMOVE_TEST_PREPARED || !swap_fixture ||
+		strcmp(guest_path, "/parent/victim") != 0)
+		return;
+	char parent[512];
+	char old_parent[512];
+	join_path(parent, sizeof(parent), swap_fixture->upper, "/parent");
+	join_path(old_parent, sizeof(old_parent), swap_fixture->upper,
+		"/parent.old");
+	if (rename(parent, old_parent) != 0 || mkdir(parent, 0700) != 0)
+		_exit(96);
+}
+
+static void test_parent_swap_at_publication_boundary(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char parent[512];
+	join_path(parent, sizeof(parent), fixture.upper, "/parent");
+	make_directory(parent);
+	make_file(fixture.upper, "/parent/victim", "original");
+	swap_fixture = &fixture;
+	eunion_test_remove_checkpoint_hook = parent_swap_prepared_hook;
+	require(eunion_remove_path(&fixture.runtime, "/parent/victim",
+		EUNION_INTENT_REMOVE_FILE) == -EAGAIN,
+		"parent replacement detected at publication boundary");
+	eunion_test_remove_checkpoint_hook = NULL;
+	swap_fixture = NULL;
+	require(!exists(fixture.upper, "/parent/victim"),
+		"replacement parent remains untouched");
+	require(file_equals(fixture.upper, "/parent.old/victim", "original"),
+		"old parent retains original after rollback");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void test_union_directory_emptiness(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_only[512];
+	char merged_lower[512];
+	char merged_upper[512];
+	join_path(lower_only, sizeof(lower_only), fixture.lower, "/lower-nonempty");
+	join_path(merged_lower, sizeof(merged_lower), fixture.lower,
+		"/merged-nonempty");
+	join_path(merged_upper, sizeof(merged_upper), fixture.upper,
+		"/merged-nonempty");
+	make_directory(lower_only);
+	make_directory(merged_lower);
+	make_directory(merged_upper);
+	make_file(fixture.lower, "/lower-nonempty/child", "lower");
+	make_file(fixture.lower, "/merged-nonempty/lower-child", "lower");
+
+	require(eunion_remove_path(&fixture.runtime, "/lower-nonempty",
+		EUNION_INTENT_REMOVE_DIRECTORY) == -ENOTEMPTY,
+		"rmdir rejects lower-only non-empty union directory");
+	require(!exists(fixture.upper, "/lower-nonempty"),
+		"rejected lower-only rmdir publishes no whiteout");
+	require(eunion_remove_path(&fixture.runtime, "/merged-nonempty",
+		EUNION_INTENT_REMOVE_DIRECTORY) == -ENOTEMPTY,
+		"rmdir rejects merged directory with visible lower child");
+	require(exists(fixture.upper, "/merged-nonempty"),
+		"rejected merged rmdir preserves upper directory");
+	require(!marker(fixture.upper, "/merged-nonempty", WHITEOUT),
+		"rejected merged rmdir publishes no whiteout");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void test_opaque_ancestor_hides_lower_target(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_parent[512];
+	char upper_parent[512];
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower,
+		"/opaque-parent");
+	join_path(upper_parent, sizeof(upper_parent), fixture.upper,
+		"/opaque-parent");
+	make_directory(lower_parent);
+	make_directory(upper_parent);
+	make_file(fixture.lower, "/opaque-parent/hidden", "lower");
+	set_marker(fixture.upper, "/opaque-parent", OPAQUE);
+
+	require(eunion_remove_path(&fixture.runtime, "/opaque-parent/hidden",
+		EUNION_INTENT_REMOVE_FILE) == -ENOENT,
+		"opaque ancestor makes hidden lower target absent");
+	require(!exists(fixture.upper, "/opaque-parent/hidden"),
+		"opaque ancestor rejection publishes no whiteout");
+	require(exists(fixture.lower, "/opaque-parent/hidden"),
+		"opaque ancestor rejection preserves hidden lower target");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void test_unreadable_upper_file_can_be_unlinked(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char path[512];
+	make_file(fixture.upper, "/unreadable", "upper");
+	join_path(path, sizeof(path), fixture.upper, "/unreadable");
+	require(chmod(path, 0000) == 0, "chmod unreadable upper file");
+	require(eunion_remove_path(&fixture.runtime, "/unreadable",
+		EUNION_INTENT_REMOVE_FILE) == 0,
+		"unlink does not require target read permission");
+	require(!exists(fixture.upper, "/unreadable"),
+		"unreadable upper file removed");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static void test_materialized_parent_metadata(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_parent[512];
+	char upper_parent[512];
+	struct stat lower_status;
+	struct stat upper_status;
+	char value[32] = {0};
+	mode_t old_umask;
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower, "/metadata");
+	join_path(upper_parent, sizeof(upper_parent), fixture.upper, "/metadata");
+	make_directory(lower_parent);
+	require(chmod(lower_parent, 0777) == 0, "set lower parent mode");
+	require(lsetxattr(lower_parent, "user.review", "preserved", 9, 0) == 0,
+		"set lower parent xattr");
+	make_file(fixture.lower, "/metadata/victim", "lower");
+
+	old_umask = umask(0077);
+	int remove_result = eunion_remove_path(&fixture.runtime,
+		"/metadata/victim", EUNION_INTENT_REMOVE_FILE);
+	require(remove_result == 0,
+		"nested lower removal materializes metadata parent");
+	umask(old_umask);
+
+	require(lstat(lower_parent, &lower_status) == 0, "stat lower parent");
+	require(lstat(upper_parent, &upper_status) == 0, "stat upper parent");
+	require((upper_status.st_mode & 07777) ==
+		(lower_status.st_mode & 07777),
+		"materialized parent mode ignores caller umask");
+	require(upper_status.st_uid == lower_status.st_uid &&
+		upper_status.st_gid == lower_status.st_gid,
+		"materialized parent ownership preserved");
+	require(lgetxattr(upper_parent, "user.review", value,
+		sizeof(value)) == 9 && memcmp(value, "preserved", 9) == 0,
+		"materialized parent xattr preserved");
+	require(marker(fixture.upper, "/metadata/victim", WHITEOUT),
+		"nested whiteout published after metadata copy");
 	require_work_empty(&fixture);
 	fixture_destroy(&fixture);
 }
@@ -587,7 +786,13 @@ int main(void)
 	test_af_unix_removal();
 	test_nested_and_symlink_rejection();
 	test_leaf_swap_revalidation();
+	test_leaf_swap_at_publication_boundary();
+	test_parent_swap_at_publication_boundary();
 	test_root_swap_revalidation();
+	test_union_directory_emptiness();
+	test_opaque_ancestor_hides_lower_target();
+	test_unreadable_upper_file_can_be_unlinked();
+	test_materialized_parent_metadata();
 	test_all_interruption_cases();
 	test_staged_durability_failures();
 	test_nested_parent_rollback();
