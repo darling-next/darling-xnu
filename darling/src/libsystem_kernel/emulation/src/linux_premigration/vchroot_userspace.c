@@ -112,6 +112,10 @@ static void set_libexec_path(const char* p)
 		libexec_path_len = 0;
 		return;
 	}
+	if (p == libexec_path) {
+		libexec_path_len = (int)strlen(libexec_path);
+		return;
+	}
 	strcpy(libexec_path, p);
 	libexec_path_len = (int)strlen(libexec_path);
 }
@@ -130,9 +134,18 @@ static void set_libexec_path(const char* p)
 #ifndef LINUX_EIO
 #define LINUX_EIO 5
 #endif
+#ifndef LINUX_ENOMEM
+#define LINUX_ENOMEM 12
+#endif
+#ifndef LINUX_EOVERFLOW
+#define LINUX_EOVERFLOW 75
+#endif
 #ifndef LINUX_ENOTDIR
 #define LINUX_ENOTDIR 20
 #endif
+
+extern void* malloc(__SIZE_TYPE__ size);
+extern void free(void* pointer);
 
 static int eunion_lstat(const char* host, stat_t* st); // defined below
 
@@ -171,7 +184,8 @@ static int eunion_init_from_prefix(int prefix_descriptor)
 	result = eunion_sidecar_inspect_prefix(
 		&eunion_anchored_runtime, &inspection);
 	if (result >= 0 &&
-		inspection.verdict == EUNION_PREFIX_FORMAT_UNINITIALIZED) {
+		inspection.verdict != EUNION_PREFIX_FORMAT_VALID &&
+		inspection.verdict != EUNION_PREFIX_RECREATE_REQUIRED) {
 		result = eunion_sidecar_prefix_state_v3_valid(
 			&eunion_anchored_runtime);
 		if (result == -EUNION_PREFIX_RECREATE_REQUIRED_ERROR) {
@@ -230,6 +244,19 @@ static int eunion_init_from_prefix(int prefix_descriptor)
 	set_libexec_path(lower);
 	return 0;
 }
+
+#ifndef TEST
+static void eunion_require_anchored_prefix(void)
+{
+	// E-UNION is anchored only by __darling_vchroot(), which receives the
+	// retained prefix directory descriptor. A string-only lazy lookup cannot
+	// cross that capability boundary and must fail before any sidecar access.
+	__simple_printf(
+		"E-UNION prefix capability unavailable; "
+		"__darling_vchroot must initialize the prefix\n");
+	__simple_abort();
+}
+#endif
 
 // -------- E-UNION copy-on-write ------------------------------------------
 //
@@ -1225,34 +1252,76 @@ int vchroot_rename_path(const char* old_guest, const char* new_guest)
 	return eunion_sidecar_rename_path(&runtime, old_guest, new_guest);
 }
 
-// helper: append `name` to a NUL-separated out buffer if it fits and is not a
-// duplicate of an already-appended name. Returns 1 if appended, 0 if dup, <0 on
-// overflow.
-static int eunion_emit_name(char* out, int cap, int* used, int* count, const char* name)
+struct eunion_name_buffer
 {
-	// dedup against already-emitted names
-	const char* p = out;
-	for (int i = 0; i < *count; i++)
-	{
+	char* data;
+	int capacity;
+	int used;
+	int count;
+	int growable;
+};
+
+static void eunion_name_buffer_release(struct eunion_name_buffer* buffer)
+{
+	if (buffer->growable && buffer->data)
+		free(buffer->data);
+	memset(buffer, 0, sizeof(*buffer));
+}
+
+static int eunion_name_buffer_grow(
+	struct eunion_name_buffer* buffer, int required)
+{
+	if (!buffer->growable)
+		return -LINUX_EOVERFLOW;
+	int capacity = buffer->capacity > 0 ? buffer->capacity : 4096;
+	while (capacity < required) {
+		if (capacity > 0x3fffffff)
+			return -LINUX_EOVERFLOW;
+		capacity *= 2;
+	}
+	char* replacement = malloc((__SIZE_TYPE__)capacity);
+	if (!replacement)
+		return -LINUX_ENOMEM;
+	if (buffer->used > 0)
+		memcpy(replacement, buffer->data, (__SIZE_TYPE__)buffer->used);
+	if (buffer->data)
+		free(buffer->data);
+	buffer->data = replacement;
+	buffer->capacity = capacity;
+	return 0;
+}
+
+// Append `name` to a NUL-separated buffer if it is not already present.
+// Growable buffers have no fixed listing limit; fixed buffers fail closed.
+static int eunion_emit_name(
+	struct eunion_name_buffer* buffer, const char* name)
+{
+	const char* p = buffer->data;
+	for (int i = 0; i < buffer->count; i++) {
 		if (strcmp(p, name) == 0)
 			return 0;
 		p += strlen(p) + 1;
 	}
 	int nlen = (int)strlen(name) + 1;
-	if (*used + nlen > cap)
-		return -LINUX_ENAMETOOLONG;
-	memcpy(out + *used, name, nlen);
-	*used += nlen;
-	(*count)++;
+	if (buffer->used > 0x7fffffff - nlen)
+		return -LINUX_EOVERFLOW;
+	int required = buffer->used + nlen;
+	if (required > buffer->capacity) {
+		int result = eunion_name_buffer_grow(buffer, required);
+		if (result < 0)
+			return result;
+	}
+	memcpy(buffer->data + buffer->used, name, (__SIZE_TYPE__)nlen);
+	buffer->used = required;
+	++buffer->count;
 	return 1;
 }
 
-// is `name` present in a NUL-separated set of `n` names?
-static int name_in_set(const char* buf, int n, const char* name)
+static int name_in_set(
+	const struct eunion_name_buffer* buffer, const char* name)
 {
-	const char* p = buf;
-	for (int i = 0; i < n; i++)
-	{
+	const char* p = buffer->data;
+	for (int i = 0; i < buffer->count; i++) {
 		if (strcmp(p, name) == 0)
 			return 1;
 		p += strlen(p) + 1;
@@ -1275,11 +1344,13 @@ static int eunion_join_guest_path(const char* parent, const char* name,
 	return 0;
 }
 
-// Produce the merged directory listing for guest dir `guest` as a NUL-separated
-// list of names in `out`. Upper layer wins on name clash; whiteouts hide the
-// lower namesake; an opaque upper dir is not merged with the lower. Returns the
-// number of names, or a negative Linux errno.
-int vchroot_readdir_merge(const char* guest, char* out, int cap)
+// Produce the merged directory listing for guest dir `guest`. Upper layer wins
+// on name clash; whiteouts hide the lower namesake; an opaque upper dir is not
+// merged with the lower.
+static int eunion_readdir_merge(
+	const char* guest,
+	struct eunion_name_buffer* visible,
+	struct eunion_name_buffer* hidden)
 {
 	if (prefix_path_len < 0)
 		return -LINUX_ENOENT;
@@ -1288,14 +1359,11 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 	if (scope_result < 0)
 		return scope_result;
 
-	int used = 0, count = 0;
-
 	char up[4096], lo[4096];
 	int have_upper = (eunion_host_path(prefix_path, prefix_path_len, guest, up, sizeof(up)) >= 0);
 
 	// 1. upper layer: emit non-whiteout names; record whiteout names so the
 	//    lower namesake is suppressed (tracked in a separate seen-set).
-	char whbuf[4096]; int whused = 0, whcount = 0;
 	if (have_upper)
 	{
 		int dfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, up, LINUX_O_RDONLY | LINUX_O_DIRECTORY, 0);
@@ -1316,8 +1384,11 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 
 					char child[4096];
 					int hl = (int)strlen(up), nl = (int)strlen(nm);
-					if (hl + 1 + nl + 1 > (int)sizeof(child))
-						continue;
+					if (hl + 1 + nl + 1 > (int)sizeof(child)) {
+						LINUX_SYSCALL(__NR_close, dfd);
+						eunion_resolver_scope_close(&sidecar_scope);
+						return -LINUX_ENAMETOOLONG;
+					}
 					memcpy(child, up, hl); child[hl] = '/'; memcpy(child + hl + 1, nm, nl + 1);
 
 					char child_guest[4096];
@@ -1335,13 +1406,21 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 						eunion_resolver_scope_close(&sidecar_scope);
 						return lookup_result;
 					}
-					int hidden = lookup.kind ==
+					int is_hidden = lookup.kind ==
 						EUNION_SIDECAR_RECORD_WHITEOUT;
-					if (hidden)
-						eunion_emit_name(whbuf, sizeof(whbuf), &whused, &whcount, nm); // hidden
-					else
-						eunion_emit_name(out, cap, &used, &count, nm); // visible upper entry
+					int emit_result = eunion_emit_name(
+						is_hidden ? hidden : visible, nm);
+					if (emit_result < 0) {
+						LINUX_SYSCALL(__NR_close, dfd);
+						eunion_resolver_scope_close(&sidecar_scope);
+						return emit_result;
+					}
 				}
+			}
+			if (len < 0) {
+				LINUX_SYSCALL(__NR_close, dfd);
+				eunion_resolver_scope_close(&sidecar_scope);
+				return len;
 			}
 			LINUX_SYSCALL(__NR_close, dfd);
 		}
@@ -1360,7 +1439,7 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 				eunion_resolver_scope_close(&sidecar_scope);
 			if (close_result < 0)
 				return close_result;
-			return count;
+			return visible->count;
 		}
 	}
 
@@ -1384,7 +1463,7 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 					if (nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0')))
 						continue;
 					// suppressed by a whiteout in the upper?
-					if (name_in_set(whbuf, whcount, nm))
+					if (name_in_set(hidden, nm))
 						continue;
 					if (sidecar_scope.sidecar_open) {
 						char child_guest[4096];
@@ -1406,112 +1485,207 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 							EUNION_SIDECAR_RECORD_WHITEOUT)
 							continue;
 					}
-					eunion_emit_name(out, cap, &used, &count, nm);
+					int emit_result = eunion_emit_name(visible, nm);
+					if (emit_result < 0) {
+						LINUX_SYSCALL(__NR_close, dfd);
+						eunion_resolver_scope_close(&sidecar_scope);
+						return emit_result;
+					}
 				}
+			}
+			if (len < 0) {
+				LINUX_SYSCALL(__NR_close, dfd);
+				eunion_resolver_scope_close(&sidecar_scope);
+				return len;
 			}
 			LINUX_SYSCALL(__NR_close, dfd);
 		}
 	}
 
 	int close_result = eunion_resolver_scope_close(&sidecar_scope);
-	return close_result < 0 ? close_result : count;
+	return close_result < 0 ? close_result : visible->count;
+}
+
+// Bounded compatibility API: callers get an explicit overflow error rather
+// than a successful truncated listing. The paged getdents path below uses a
+// growable buffer and therefore has no 64 KiB aggregate limit.
+int vchroot_readdir_merge(const char* guest, char* out, int cap)
+{
+	if (!out || cap <= 0)
+		return -LINUX_EINVAL;
+	struct eunion_name_buffer visible = {
+		.data = out,
+		.capacity = cap,
+	};
+	struct eunion_name_buffer hidden = {
+		.growable = 1,
+	};
+	int result = eunion_readdir_merge(guest, &visible, &hidden);
+	eunion_name_buffer_release(&hidden);
+	return result;
 }
 
 // -------- E-UNION paged getdents merge (per-fd state) --------------------
 //
-// getdirentries works on an fd and streams the directory in pages; the kernel
-// tracks the offset for the UPPER fd only. To present a MERGED view (upper wins,
-// lower merged in, whiteouts subtracted, opaque honoured) across an arbitrary
-// number of pages WITHOUT the getdents64 rewind hazards, we materialize the full
-// merged name list ONCE per open dir fd (reusing the proven vchroot_readdir_merge
-// enumeration) into a small per-fd buffer, then hand it back page by page. The
-// emulation site calls:
+// getdirentries works on an fd and streams the directory in pages. Duplicated
+// descriptors share one open file description and therefore one merged cursor.
+// Keep a synchronized descriptor-to-description binding table and one growable
+// name stream per description. The emulation site calls:
 //   vchroot_getdents_merge(fd, out, cap)  instead of raw getdents64(fd, ...)
 //   vchroot_dir_closed(fd)                from close()/closedir() teardown
-// rewinddir (lseek(fd,0)) is detected by the emulation, which calls
-// vchroot_dir_closed(fd) so the next getdents re-materializes from the start.
+//   vchroot_dir_dup(oldfd, newfd)          after every fd duplication route
+// rewinddir (lseek(fd,0)) resets the shared description, not just one fd.
 
 #define EUNION_MAXDIRS  256
-#define EUNION_NAMEBUF  65536  // per-dir merged name list (NUL-separated)
 
-struct eunion_dir_state
+struct eunion_dir_description
 {
-	int  fd;                    // upper fd this state tracks (-1 = free slot)
-	int  ready;                 // names[] materialized?
-	int  count;                 // number of names
-	int  cursor;                // byte offset of the next name to emit
-	int  used;                  // bytes used in names[]
-	char guest[4096];           // guest dir path (for per-entry d_type/d_ino lstat)
-	char names[EUNION_NAMEBUF]; // NUL-separated merged listing
+	int references;
+	int ready;
+	int cursor;
+	char guest[4096];
+	struct eunion_name_buffer names;
 };
 
-static struct eunion_dir_state eunion_dirs[EUNION_MAXDIRS];
-static int eunion_dirs_inited = 0;
-
-static void eunion_dirs_init(void)
+struct eunion_dir_binding
 {
-	if (eunion_dirs_inited)
-		return;
-	for (int i = 0; i < EUNION_MAXDIRS; i++)
-		eunion_dirs[i].fd = -1;
-	eunion_dirs_inited = 1;
+	int fd;
+	struct eunion_dir_description* description;
+};
+
+static struct eunion_dir_binding eunion_dirs[EUNION_MAXDIRS];
+static struct eunion_dir_description
+	eunion_dir_descriptions[EUNION_MAXDIRS];
+static int eunion_dirs_inited = 0;
+static int eunion_dirs_lock_word;
+
+static void eunion_dirs_lock(void)
+{
+	while (__atomic_exchange_n(
+			&eunion_dirs_lock_word, 1, __ATOMIC_ACQUIRE) != 0)
+		LINUX_SYSCALL(__NR_sched_yield);
 }
 
-static struct eunion_dir_state* eunion_dir_find(int fd)
+static void eunion_dirs_unlock(void)
 {
-	eunion_dirs_init();
+	__atomic_store_n(&eunion_dirs_lock_word, 0, __ATOMIC_RELEASE);
+}
+
+static void eunion_dirs_init_locked(void)
+{
+	if (!eunion_dirs_inited) {
+		for (int i = 0; i < EUNION_MAXDIRS; ++i)
+			eunion_dirs[i].fd = -1;
+		eunion_dirs_inited = 1;
+	}
+}
+
+static struct eunion_dir_binding* eunion_dir_find_locked(int fd)
+{
+	eunion_dirs_init_locked();
 	for (int i = 0; i < EUNION_MAXDIRS; i++)
 		if (eunion_dirs[i].fd == fd)
 			return &eunion_dirs[i];
 	return 0;
 }
 
-// Free per-fd merge state (call from close()/closedir() and on rewinddir).
-// Idempotent.
+static void eunion_dir_description_release_locked(
+	struct eunion_dir_description* description)
+{
+	if (!description || description->references <= 0)
+		return;
+	if (--description->references == 0) {
+		eunion_name_buffer_release(&description->names);
+		memset(description, 0, sizeof(*description));
+	}
+}
+
+static void eunion_dir_binding_close_locked(
+	struct eunion_dir_binding* binding)
+{
+	if (!binding)
+		return;
+	eunion_dir_description_release_locked(binding->description);
+	binding->fd = -1;
+	binding->description = 0;
+}
+
+static struct eunion_dir_binding* eunion_dir_binding_alloc_locked(int fd)
+{
+	for (int i = 0; i < EUNION_MAXDIRS; ++i) {
+		if (eunion_dirs[i].fd == -1) {
+			eunion_dirs[i].fd = fd;
+			eunion_dirs[i].description = 0;
+			return &eunion_dirs[i];
+		}
+	}
+	return 0;
+}
+
+static struct eunion_dir_description*
+eunion_dir_description_alloc_locked(void)
+{
+	for (int i = 0; i < EUNION_MAXDIRS; ++i) {
+		if (eunion_dir_descriptions[i].references == 0) {
+			memset(&eunion_dir_descriptions[i], 0,
+				sizeof(eunion_dir_descriptions[i]));
+			eunion_dir_descriptions[i].references = 1;
+			eunion_dir_descriptions[i].names.growable = 1;
+			return &eunion_dir_descriptions[i];
+		}
+	}
+	return 0;
+}
+
+// Free one descriptor binding. The shared cursor lives until the last
+// descriptor referencing the open file description is closed.
 void vchroot_dir_closed(int fd)
 {
-	struct eunion_dir_state* s = eunion_dir_find(fd);
-	if (!s)
-		return;
-	s->fd = -1;
-	s->ready = 0;
+	eunion_dirs_lock();
+	eunion_dir_binding_close_locked(eunion_dir_find_locked(fd));
+	eunion_dirs_unlock();
 }
 
 void vchroot_dir_rewind(int fd)
 {
-	vchroot_dir_closed(fd);
-}
-
-static struct eunion_dir_state* eunion_dir_alloc(int fd)
-{
-	struct eunion_dir_state* s = eunion_dir_find(fd);
-	if (!s)
-	{
-		for (int i = 0; i < EUNION_MAXDIRS; i++)
-			if (eunion_dirs[i].fd == -1) { s = &eunion_dirs[i]; break; }
+	eunion_dirs_lock();
+	struct eunion_dir_binding* binding = eunion_dir_find_locked(fd);
+	if (binding && binding->description) {
+		struct eunion_dir_description* description =
+			binding->description;
+		eunion_name_buffer_release(&description->names);
+		description->names.growable = 1;
+		description->ready = 0;
+		description->cursor = 0;
+		description->guest[0] = '\0';
 	}
-	if (!s)
-		return 0; // caller reports explicit capacity exhaustion
-	s->fd = fd;
-	s->ready = 0;
-	s->count = s->cursor = s->used = 0;
-	return s;
+	eunion_dirs_unlock();
 }
 
 int vchroot_dir_dup(int oldfd, int newfd)
 {
-	struct eunion_dir_state* source = eunion_dir_find(oldfd);
-	struct eunion_dir_state* target;
-
-	if (!source)
+	if (oldfd == newfd)
 		return 0;
-	target = eunion_dir_find(newfd);
-	if (!target)
-		target = eunion_dir_alloc(newfd);
-	if (!target)
+	eunion_dirs_lock();
+	struct eunion_dir_binding* source =
+		eunion_dir_find_locked(oldfd);
+	struct eunion_dir_description* description =
+		source ? source->description : 0;
+	struct eunion_dir_binding* target =
+		eunion_dir_find_locked(newfd);
+	eunion_dir_binding_close_locked(target);
+	if (!description) {
+		eunion_dirs_unlock();
+		return 0;
+	}
+	target = eunion_dir_binding_alloc_locked(newfd);
+	if (!target) {
+		eunion_dirs_unlock();
 		return -LINUX_EMFILE;
-	memcpy(target, source, sizeof(*target));
-	target->fd = newfd;
+	}
+	++description->references;
+	target->description = description;
+	eunion_dirs_unlock();
 	return 0;
 }
 
@@ -1618,60 +1792,85 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 	if (libexec_path_len <= 0)
 		return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
 
-	struct eunion_dir_state* s = eunion_dir_find(fd);
-	if (!s)
-	{
-		s = eunion_dir_alloc(fd);
-		if (!s)
+	eunion_dirs_lock();
+	struct eunion_dir_binding* binding = eunion_dir_find_locked(fd);
+	int created_binding = 0;
+	if (!binding) {
+		binding = eunion_dir_binding_alloc_locked(fd);
+		if (!binding) {
+			eunion_dirs_unlock();
 			return -LINUX_EMFILE;
+		}
+		binding->description = eunion_dir_description_alloc_locked();
+		if (!binding->description) {
+			eunion_dir_binding_close_locked(binding);
+			eunion_dirs_unlock();
+			return -LINUX_EMFILE;
+		}
+		created_binding = 1;
 	}
+	struct eunion_dir_description* description = binding->description;
 
-	if (!s->ready)
+	if (!description->ready)
 	{
 		// recover the guest dir path from the upper fd, then materialize the
 		// merged listing once.
 		char guest[4096];
 		struct vchroot_fdpath_args fp;
 		fp.fd = fd; fp.path = guest; fp.maxlen = sizeof(guest);
-		if (vchroot_fdpath(&fp) < 0) // not under the prefix: no merge to do
+		if (vchroot_fdpath(&fp) < 0) {
+			if (created_binding)
+				eunion_dir_binding_close_locked(binding);
+			eunion_dirs_unlock();
 			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		}
 
-		int n = vchroot_readdir_merge(guest, s->names, sizeof(s->names));
-		if (n < 0)
+		struct eunion_name_buffer hidden = {
+			.growable = 1,
+		};
+		int n = eunion_readdir_merge(
+			guest, &description->names, &hidden);
+		eunion_name_buffer_release(&hidden);
+		if (n < 0) {
+			eunion_name_buffer_release(&description->names);
+			description->names.growable = 1;
+			eunion_dirs_unlock();
 			return n;
+		}
 
 		// remember the guest dir path so the emitter can lstat each entry for a
 		// real d_type/d_ino (overlay presents valid types, not DT_UNKNOWN).
 		{
 			int gl = (int)strlen(guest);
-			if (gl + 1 > (int)sizeof(s->guest))
-				gl = (int)sizeof(s->guest) - 1;
-			memcpy(s->guest, guest, gl);
-			s->guest[gl] = '\0';
+			if (gl + 1 > (int)sizeof(description->guest))
+				gl = (int)sizeof(description->guest) - 1;
+			memcpy(description->guest, guest, gl);
+			description->guest[gl] = '\0';
 		}
 
-		s->count = n;
-		s->cursor = 0;
-		s->used = 0;
-		// compute total bytes for cursor walking
-		const char* p = s->names;
-		for (int i = 0; i < n; i++)
-			p += strlen(p) + 1;
-		s->used = (int)(p - s->names);
-		s->ready = 1;
+		description->cursor = 0;
+		description->ready = 1;
 	}
 
 	// page out from cursor
 	int written = 0;
-	while (s->cursor < s->used)
+	while (description->cursor < description->names.used)
 	{
-		const char* name = s->names + s->cursor;
-		int w = eunion_emit_dirent(out, cap, written, s->guest, name);
+		const char* name =
+			description->names.data + description->cursor;
+		int w = eunion_emit_dirent(
+			out, cap, written, description->guest, name);
 		if (!w)
 			break; // page full; resume here next call
 		written += w;
-		s->cursor += (int)strlen(name) + 1;
+		description->cursor += (int)strlen(name) + 1;
 	}
+	if (written == 0 &&
+		description->cursor < description->names.used) {
+		eunion_dirs_unlock();
+		return -LINUX_EINVAL;
+	}
+	eunion_dirs_unlock();
 	return written; // 0 when cursor reaches used -> end of merged stream
 }
 #endif
@@ -1807,17 +2006,6 @@ static void init_vchroot_path(void)
 
 	prefix_path_len = (int)tmp_len;
 
-#ifdef EUNION
-	code = eunion_init_from_prefix();
-	if (code < 0) {
-		if (code == -EUNION_PREFIX_RECREATE_REQUIRED_ERROR)
-			__simple_printf("PREFIX_RECREATE_REQUIRED\n");
-		else
-			__simple_printf("Invalid E-UNION prefix format: %d\n", code);
-		__simple_abort();
-	}
-#endif
-
 #ifndef TEST
 	__simple_printf("init_vchroot_path: %s\n", prefix_path);
 #endif
@@ -1829,8 +2017,13 @@ int vchroot_expand(struct vchroot_expand_args* args)
 	struct context ctxt;
 
 #ifndef TEST
-	if (prefix_path_len == -1)
+	if (prefix_path_len == -1) {
+#ifdef EUNION
+		eunion_require_anchored_prefix();
+#else
 		init_vchroot_path();
+#endif
+	}
 	__simple_printf("vchroot_expand(): input %s\n", args->path);
 #endif
 
@@ -2217,8 +2410,13 @@ static bool next_component(const char* from, const char** end)
 int vchroot_fdpath(struct vchroot_fdpath_args* args)
 {
 #ifndef TEST
-	if (prefix_path_len == -1)
+	if (prefix_path_len == -1) {
+#ifdef EUNION
+		eunion_require_anchored_prefix();
+#else
 		init_vchroot_path();
+#endif
+	}
 #endif
 
 	char buf[50];

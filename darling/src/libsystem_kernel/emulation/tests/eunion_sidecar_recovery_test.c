@@ -53,8 +53,10 @@ static void write_file(const char* path)
 static void kill_at_boundary(
 	enum eunion_sidecar_test_checkpoint checkpoint, const char* guest_path)
 {
-	if (checkpoint == kill_checkpoint && strcmp(guest_path, kill_path) == 0)
+	if (checkpoint == kill_checkpoint && strcmp(guest_path, kill_path) == 0) {
+		signal(termination_signal, SIG_DFL);
 		kill(getpid(), termination_signal);
+	}
 }
 
 static void fail_at_boundary(

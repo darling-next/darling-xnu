@@ -38,6 +38,9 @@ typedef struct linux_stat sidecar_stat_t;
 #ifndef __NR_fchmodat2
 #define __NR_fchmodat2 452
 #endif
+#if !defined(__NR_newfstatat) && defined(__NR_fstatat64)
+#define __NR_newfstatat __NR_fstatat64
+#endif
 #ifndef LINUX_O_RDONLY
 #define LINUX_O_RDONLY 0
 #endif
@@ -106,6 +109,9 @@ typedef struct linux_stat sidecar_stat_t;
 #endif
 #ifndef LINUX_EACCES
 #define LINUX_EACCES 13
+#endif
+#ifndef LINUX_ENOMEM
+#define LINUX_ENOMEM 12
 #endif
 #ifndef LINUX_EINVAL
 #define LINUX_EINVAL 22
@@ -960,12 +966,12 @@ static int eunion_sidecar_cleanup_failed_initialize(int upper, int sidecar)
 		eunion_sidecar_close_fd(&tree, 0);
 	}
 	const char* sidecar_names[] = {
-		"staging-v1", "tree-v1", "format-v1", "lock-v1",
+		"staging-v1", "tree-v1", "format-v1",
 		"journal-v1.tmp", "journal-v1",
 		EUNION_SIDECAR_ACTIVATION_NAME ".tmp",
 		EUNION_SIDECAR_ACTIVATION_NAME,
 	};
-	const int sidecar_flags[] = { 0x200, 0x200, 0, 0, 0, 0, 0, 0 };
+	const int sidecar_flags[] = { 0x200, 0x200, 0, 0, 0, 0, 0 };
 	for (size_t index = 0;
 		index < sizeof(sidecar_names) / sizeof(sidecar_names[0]);
 		++index) {
@@ -980,6 +986,92 @@ static int eunion_sidecar_cleanup_failed_initialize(int upper, int sidecar)
 	sync_result = SIDECAR_SYSCALL(__NR_fsync, upper);
 	if (result >= 0 && sync_result < 0)
 		result = sync_result;
+	return result;
+}
+
+static int eunion_sidecar_initialization_layout(
+	int sidecar, int* recovery_required)
+{
+	if (!recovery_required)
+		return -LINUX_EINVAL;
+	*recovery_required = 0;
+	int cursor = SIDECAR_SYSCALL(__NR_openat, sidecar, ".",
+		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+		LINUX_O_CLOEXEC, 0);
+	if (cursor < 0)
+		return cursor;
+	char buffer[1024];
+	int found_lock = 0;
+	int result = 0;
+	for (;;) {
+		int length = SIDECAR_SYSCALL(
+			__NR_getdents64, cursor, buffer, sizeof(buffer));
+		if (length < 0) {
+			result = length;
+			break;
+		}
+		if (length == 0)
+			break;
+		int offset = 0;
+		while (offset < length) {
+			struct eunion_sidecar_dirent64* entry =
+				(struct eunion_sidecar_dirent64*)(buffer + offset);
+			if (entry->record_length == 0 ||
+				offset + entry->record_length > length) {
+				result = -LINUX_EIO;
+				break;
+			}
+			offset += entry->record_length;
+			if (strcmp(entry->name, ".") == 0 ||
+				strcmp(entry->name, "..") == 0)
+				continue;
+			if (strcmp(entry->name, "lock-v1") == 0) {
+				if (found_lock) {
+					result = -LINUX_EIO;
+					break;
+				}
+				found_lock = 1;
+				continue;
+			}
+			if (strcmp(entry->name, "format-v1") == 0 ||
+				strcmp(entry->name, "tree-v1") == 0 ||
+				strcmp(entry->name, "staging-v1") == 0 ||
+				strcmp(entry->name,
+					EUNION_SIDECAR_ACTIVATION_NAME ".tmp") == 0) {
+				*recovery_required = 1;
+				continue;
+			}
+			{
+				result = -LINUX_ENOTEMPTY;
+				break;
+			}
+		}
+		if (result < 0)
+			break;
+	}
+	result = eunion_sidecar_close_fd(&cursor, result);
+	return result < 0 ? result : (found_lock ? 0 : -LINUX_EIO);
+}
+
+static int eunion_sidecar_validate_named_lock(int sidecar, int lock)
+{
+	sidecar_stat_t opened_status;
+	sidecar_stat_t named_status;
+	int result = SIDECAR_SYSCALL(__NR_fstat, lock, &opened_status);
+	if (result >= 0 &&
+		((unsigned int)opened_status.st_mode & LINUX_S_IFMT) !=
+			LINUX_S_IFREG)
+		result = -LINUX_EIO;
+	if (result >= 0)
+		result = SIDECAR_SYSCALL(__NR_newfstatat,
+			sidecar, "lock-v1", &named_status,
+			LINUX_AT_SYMLINK_NOFOLLOW);
+	if (result >= 0 &&
+		(((unsigned int)named_status.st_mode & LINUX_S_IFMT) !=
+			LINUX_S_IFREG ||
+		 opened_status.st_dev != named_status.st_dev ||
+		 opened_status.st_ino != named_status.st_ino))
+		result = -LINUX_EBUSY;
 	return result;
 }
 
@@ -1020,11 +1112,7 @@ int eunion_sidecar_initialize(const struct eunion_sidecar_runtime* runtime)
 		eunion_sidecar_close_fd(&upper, 0);
 		return state_result;
 	}
-	int sidecar_empty = 0;
-	int result = eunion_sidecar_directory_empty(sidecar, &sidecar_empty);
-	if (result >= 0 && !sidecar_empty)
-		result = -LINUX_ENOTEMPTY;
-	int mutation_started = 0;
+	int result = 0;
 	struct eunion_sidecar_identity upper_identity;
 	struct eunion_sidecar_identity lower_identity;
 	if (result >= 0)
@@ -1032,50 +1120,132 @@ int eunion_sidecar_initialize(const struct eunion_sidecar_runtime* runtime)
 	if (result >= 0)
 		result = eunion_sidecar_fstat_identity(lower, &lower_identity);
 	if (result >= 0) {
-		mutation_started = 1;
-		int lock = SIDECAR_SYSCALL(__NR_openat, sidecar, "lock-v1",
-			LINUX_O_RDWR | LINUX_O_CREAT | LINUX_O_EXCL |
+#ifdef TEST
+		if (eunion_test_sidecar_checkpoint_hook)
+			eunion_test_sidecar_checkpoint_hook(
+				EUNION_SIDECAR_TEST_INITIALIZE_READY, "/");
+#endif
+	}
+	int lock = -1;
+	if (result >= 0) {
+		lock = SIDECAR_SYSCALL(__NR_openat, sidecar, "lock-v1",
+			LINUX_O_RDWR | LINUX_O_CREAT |
 			LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC, 0600);
 		if (lock < 0)
 			result = lock;
 		else {
-			result = SIDECAR_SYSCALL(__NR_fchmod, lock, 0600);
+			result = SIDECAR_SYSCALL(
+				__NR_flock, lock, LINUX_LOCK_EX);
+			if (result >= 0)
+				result = eunion_sidecar_validate_named_lock(
+					sidecar, lock);
+			if (result >= 0)
+				result = SIDECAR_SYSCALL(__NR_fchmod, lock, 0600);
 			if (result >= 0)
 				result = SIDECAR_SYSCALL(__NR_fsync, lock);
-			result = eunion_sidecar_close_fd(&lock, result);
+#ifdef TEST
+			if (result >= 0 && eunion_test_sidecar_checkpoint_hook)
+				eunion_test_sidecar_checkpoint_hook(
+					EUNION_SIDECAR_TEST_INITIALIZE_LOCKED, "/");
+#endif
 		}
 	}
+	int recovery_required = 0;
+	if (result >= 0) {
+		struct eunion_sidecar_activation_disk activation;
+		int activation_result =
+			eunion_sidecar_read_activation(sidecar, &activation);
+		if (activation_result >= 0) {
+			struct eunion_prefix_format_inspection inspection;
+			int inspect_result =
+				eunion_sidecar_inspect_prefix(&anchored, &inspection);
+			result = inspect_result < 0
+				? inspect_result
+				: inspection.verdict == EUNION_PREFIX_FORMAT_VALID
+					? 1 : -LINUX_EIO;
+		} else if (activation_result != -LINUX_ENOENT)
+			result = activation_result;
+		else
+			result = eunion_sidecar_initialization_layout(
+				sidecar, &recovery_required);
+	}
+	if (result >= 0 && result != 1 && recovery_required) {
+		result = eunion_sidecar_cleanup_failed_initialize(upper, sidecar);
+		if (result >= 0) {
+			int unexpected_recovery = 0;
+			result = eunion_sidecar_initialization_layout(
+				sidecar, &unexpected_recovery);
+			if (result >= 0 && unexpected_recovery)
+				result = -LINUX_EIO;
+		}
+	}
+	int already_initialized = result == 1;
+	int initialization_owned =
+		result == 0 && !already_initialized;
+	if (already_initialized)
+		result = 0;
 	struct eunion_sidecar_format_disk format;
-	if (result >= 0)
+	if (result >= 0 && !already_initialized)
 		result = eunion_sidecar_write_format(sidecar,
 			&upper_identity, &lower_identity, &format);
-	if (result >= 0)
+#ifdef TEST
+	if (result >= 0 && !already_initialized &&
+		eunion_test_sidecar_checkpoint_hook)
+		eunion_test_sidecar_checkpoint_hook(
+			EUNION_SIDECAR_TEST_INITIALIZE_FORMAT, "/");
+#endif
+	if (result >= 0 && !already_initialized)
 		result = eunion_sidecar_mkdir_private(sidecar, "tree-v1");
 	int tree = -1;
-	if (result >= 0) {
+	if (result >= 0 && !already_initialized) {
 		tree = SIDECAR_SYSCALL(__NR_openat, sidecar, "tree-v1",
 			LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
 			LINUX_O_CLOEXEC, 0);
 		result = tree < 0 ? tree : 0;
 	}
-	if (result >= 0)
+	if (result >= 0 && !already_initialized)
 		result = SIDECAR_SYSCALL(__NR_fchmod, tree, 0700);
-	if (result >= 0)
+	if (result >= 0 && !already_initialized)
 		result = eunion_sidecar_write_root_node(tree,
 			&upper_identity, &lower_identity);
-	if (result >= 0)
+#ifdef TEST
+	if (result >= 0 && !already_initialized &&
+		eunion_test_sidecar_checkpoint_hook)
+		eunion_test_sidecar_checkpoint_hook(
+			EUNION_SIDECAR_TEST_INITIALIZE_TREE, "/");
+#endif
+	if (result >= 0 && !already_initialized)
 		result = eunion_sidecar_mkdir_private(sidecar, "staging-v1");
-	if (result >= 0)
+#ifdef TEST
+	if (result >= 0 && !already_initialized &&
+		eunion_test_sidecar_checkpoint_hook)
+		eunion_test_sidecar_checkpoint_hook(
+			EUNION_SIDECAR_TEST_INITIALIZE_STAGING, "/");
+#endif
+	if (result >= 0 && !already_initialized)
 		result = SIDECAR_SYSCALL(__NR_fsync, sidecar);
-	if (result >= 0)
+	if (result >= 0 && !already_initialized)
 		result = eunion_sidecar_write_activation(sidecar, &format);
+#ifdef TEST
+	if (result >= 0 && !already_initialized &&
+		eunion_test_sidecar_checkpoint_hook)
+		eunion_test_sidecar_checkpoint_hook(
+			EUNION_SIDECAR_TEST_INITIALIZE_ACTIVATED, "/");
+#endif
 	result = eunion_sidecar_close_fd(&tree, result);
-	if (result < 0 && mutation_started) {
+	if (result < 0 && initialization_owned) {
 		int cleanup = eunion_sidecar_cleanup_failed_initialize(
 			upper, sidecar);
 		if (cleanup < 0)
 			result = cleanup;
 	}
+	if (lock >= 0) {
+		int unlock = SIDECAR_SYSCALL(
+			__NR_flock, lock, LINUX_LOCK_UN);
+		if (result >= 0 && unlock < 0)
+			result = unlock;
+	}
+	result = eunion_sidecar_close_fd(&lock, result);
 	result = eunion_sidecar_close_fd(&sidecar, result);
 	result = eunion_sidecar_close_fd(&lower, result);
 	return eunion_sidecar_close_fd(&upper, result);
@@ -1722,10 +1892,35 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 	const char* guest_path, int create_missing,
 	enum eunion_sidecar_record_kind leaf_kind,
 	int* node_result, struct eunion_sidecar_node_disk* record_result);
-static int eunion_sidecar_parse_path(const char* guest_path,
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1],
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX], int* count);
+
+struct eunion_sidecar_path_component {
+	size_t length;
+	char name[EUNION_SIDECAR_NAME_MAX + 1];
+};
+
+struct eunion_sidecar_path {
+	struct eunion_sidecar_path_component* component;
+	int count;
+};
+
+extern void* malloc(size_t size);
+extern void free(void* pointer);
+
+static int eunion_sidecar_parse_path(
+	const char* guest_path, struct eunion_sidecar_path* path);
+
+static void eunion_sidecar_path_release(struct eunion_sidecar_path* path)
+{
+	if (!path)
+		return;
+	free(path->component);
+	path->component = NULL;
+	path->count = 0;
+}
+
+#define EUNION_SIDECAR_AUTO_PATH(name) \
+	struct eunion_sidecar_path name \
+		__attribute__((cleanup(eunion_sidecar_path_release))) = {0}
 
 int eunion_sidecar_lookup_path(eunion_sidecar_view view,
 	const char* guest_path, struct eunion_sidecar_lookup* result)
@@ -1879,24 +2074,13 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 {
 	if (!guest_path || guest_path[0] != '/' || !node_result || !record_result)
 		return -LINUX_EINVAL;
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
+	char component[EUNION_SIDECAR_NAME_MAX + 1];
+	size_t length = 0;
 	const char* cursor = guest_path;
-	for (;;) {
-		if (count >= EUNION_SIDECAR_COMPONENT_MAX)
-			return -LINUX_EINVAL;
-		int next = eunion_sidecar_next_component(&cursor,
-			component[count], &length[count]);
-		if (next < 0)
-			return next;
-		if (next == 0)
-			break;
-		++count;
-	}
-	if (count == 0)
-		return -LINUX_EINVAL;
+	int next = eunion_sidecar_next_component(
+		&cursor, component, &length);
+	if (next <= 0)
+		return next < 0 ? next : -LINUX_EINVAL;
 
 	int sidecar_node = view->root_descriptor;
 	int upper_parent = view->upper_descriptor;
@@ -1906,19 +2090,23 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 	int own_upper_parent = 0;
 	int own_lower_parent = 0;
 	int result = 0;
-	for (int index = 0; index < count; ++index) {
+	for (;;) {
+		const char* remaining = cursor;
+		while (*remaining == '/')
+			++remaining;
+		const int is_leaf = *remaining == '\0';
 		struct eunion_sidecar_identity upper;
 		struct eunion_sidecar_identity lower;
 		if (upper_parent >= 0)
 			result = eunion_sidecar_fstatat_identity_or_absent(
-				upper_parent, component[index], &upper);
+				upper_parent, component, &upper);
 		else {
 			memset(&upper, 0, sizeof(upper));
 			result = 0;
 		}
 		if (result >= 0 && lower_parent >= 0)
 			result = eunion_sidecar_fstatat_identity_or_absent(
-				lower_parent, component[index], &lower);
+				lower_parent, component, &lower);
 		else if (result >= 0)
 			memset(&lower, 0, sizeof(lower));
 		if (result < 0)
@@ -1927,10 +2115,10 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 		int child = -1;
 		struct eunion_sidecar_node_disk record;
 		result = eunion_sidecar_open_child(view, sidecar_node,
-			parent_generation, component[index], length[index],
+			parent_generation, component, length,
 			&child, &record);
 		enum eunion_sidecar_record_kind expected_kind =
-			index == count - 1 && leaf_kind != EUNION_SIDECAR_RECORD_NONE
+			is_leaf && leaf_kind != EUNION_SIDECAR_RECORD_NONE
 				? leaf_kind : EUNION_SIDECAR_RECORD_INDEX;
 		if (result == -LINUX_ENOENT && create_missing) {
 			if (expected_kind == EUNION_SIDECAR_RECORD_WHITEOUT &&
@@ -1943,7 +2131,7 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 				result = -LINUX_EINVAL;
 			else
 				result = eunion_sidecar_create_child(view, sidecar_node,
-					parent_generation, component[index], length[index],
+					parent_generation, component, length,
 					expected_kind, &upper, &lower, &child, &record);
 		}
 		if (result < 0)
@@ -1954,7 +2142,7 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 			eunion_sidecar_close_fd(&child, 0);
 			break;
 		}
-		if (index == count - 1 && create_missing &&
+		if (is_leaf && create_missing &&
 			record.kind != (uint32_t)expected_kind) {
 			record.kind = (uint32_t)expected_kind;
 			record.generation++;
@@ -1967,12 +2155,12 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 			}
 		}
 
-		int next_upper = index + 1 < count
+		int next_upper = !is_leaf
 			? eunion_sidecar_open_path_child(
-				upper_parent, component[index], &upper) : -1;
-		int next_lower = index + 1 < count
+				upper_parent, component, &upper) : -1;
+		int next_lower = !is_leaf
 			? eunion_sidecar_open_path_child(
-				lower_parent, component[index], &lower) : -1;
+				lower_parent, component, &lower) : -1;
 		if (own_sidecar_node)
 			eunion_sidecar_close_fd(&sidecar_node, 0);
 		if (own_upper_parent)
@@ -1982,13 +2170,21 @@ static int eunion_sidecar_walk(eunion_sidecar_view view,
 		sidecar_node = child;
 		own_sidecar_node = 1;
 		parent_generation = record.generation;
-		if (index + 1 < count) {
+		if (!is_leaf) {
 			upper_parent = next_upper >= 0 ? next_upper : -1;
 			lower_parent = next_lower >= 0 ? next_lower : -1;
 			own_upper_parent = upper_parent >= 0;
 			own_lower_parent = lower_parent >= 0;
 		}
 		*record_result = record;
+		if (is_leaf)
+			break;
+		next = eunion_sidecar_next_component(
+			&cursor, component, &length);
+		if (next <= 0) {
+			result = next < 0 ? next : -LINUX_EINVAL;
+			break;
+		}
 	}
 	if (own_upper_parent)
 		eunion_sidecar_close_fd(&upper_parent, 0);
@@ -2136,22 +2332,19 @@ static int eunion_sidecar_replace_with_empty_index(
 	eunion_sidecar_view view, const char* guest_path,
 	const struct eunion_sidecar_node_disk* old_record)
 {
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
-	int result = eunion_sidecar_parse_path(
-		guest_path, component, length, &count);
+	struct eunion_sidecar_path path;
+	int result = eunion_sidecar_parse_path(guest_path, &path);
 	if (result < 0)
 		return result;
 	int parent_node = view->root_descriptor;
 	int own_parent = 0;
 	uint64_t parent_generation = view->root_generation;
-	for (int index = 0; index < count - 1; ++index) {
+	for (int index = 0; index < path.count - 1; ++index) {
 		int child = -1;
 		struct eunion_sidecar_node_disk record;
 		result = eunion_sidecar_open_child(view, parent_node,
-			parent_generation, component[index], length[index],
+			parent_generation, path.component[index].name,
+			path.component[index].length,
 			&child, &record);
 		if (result < 0)
 			goto done;
@@ -2169,7 +2362,8 @@ static int eunion_sidecar_replace_with_empty_index(
 	char hash[17];
 	char temporary[22] = ".new-";
 	eunion_sidecar_hash_name(eunion_sidecar_component_hash(
-		view->key, component[count - 1], length[count - 1]), hash);
+		view->key, path.component[path.count - 1].name,
+		path.component[path.count - 1].length), hash);
 	memcpy(temporary + 5, hash, sizeof(hash));
 	result = eunion_sidecar_mkdir_private(children, temporary);
 	if (result < 0) {
@@ -2206,6 +2400,7 @@ static int eunion_sidecar_replace_with_empty_index(
 done:
 	if (own_parent)
 		eunion_sidecar_close_fd(&parent_node, 0);
+	eunion_sidecar_path_release(&path);
 	return result;
 }
 
@@ -2243,42 +2438,59 @@ int eunion_sidecar_publish_opaque(eunion_sidecar_view view,
 	return eunion_sidecar_close_fd(&node, result);
 }
 
-static int eunion_sidecar_parse_path(const char* guest_path,
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1],
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX], int* count)
+static int eunion_sidecar_parse_path(
+	const char* guest_path, struct eunion_sidecar_path* path)
 {
-	if (!guest_path || guest_path[0] != '/' || !count)
+	if (!guest_path || guest_path[0] != '/' || !path)
 		return -LINUX_EINVAL;
-	*count = 0;
+	memset(path, 0, sizeof(*path));
+	char component[EUNION_SIDECAR_NAME_MAX + 1];
+	size_t length;
 	const char* cursor = guest_path;
 	for (;;) {
-		if (*count >= EUNION_SIDECAR_COMPONENT_MAX)
-			return -LINUX_EINVAL;
 		int result = eunion_sidecar_next_component(&cursor,
-			component[*count], &length[*count]);
+			component, &length);
 		if (result < 0)
 			return result;
 		if (result == 0)
 			break;
-		++*count;
+		if (path->count == 0x7fffffff)
+			return -LINUX_ENAMETOOLONG;
+		++path->count;
 	}
-	return *count > 0 ? 0 : -LINUX_EINVAL;
+	if (path->count == 0)
+		return -LINUX_EINVAL;
+	if ((size_t)path->count >
+		(size_t)-1 / sizeof(*path->component))
+		return -LINUX_ENAMETOOLONG;
+	path->component = malloc(
+		(size_t)path->count * sizeof(*path->component));
+	if (!path->component)
+		return -LINUX_ENOMEM;
+	cursor = guest_path;
+	for (int index = 0; index < path->count; ++index) {
+		int result = eunion_sidecar_next_component(&cursor,
+			path->component[index].name,
+			&path->component[index].length);
+		if (result != 1) {
+			eunion_sidecar_path_release(path);
+			return result < 0 ? result : -LINUX_EIO;
+		}
+	}
+	return 0;
 }
 
-static int eunion_sidecar_open_parent(int root,
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1],
-	int count, int readable)
+static int eunion_sidecar_open_parent(
+	int root, const struct eunion_sidecar_path* path, int readable)
 {
 	int descriptor = SIDECAR_SYSCALL(__NR_dup, root);
 	if (descriptor < 0)
 		return descriptor;
-	for (int index = 0; index < count - 1; ++index) {
+	for (int index = 0; index < path->count - 1; ++index) {
 		int flags = (readable ? LINUX_O_RDONLY : LINUX_O_PATH) |
 			LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC;
 		int next = SIDECAR_SYSCALL(__NR_openat, descriptor,
-			component[index], flags, 0);
+			path->component[index].name, flags, 0);
 		if (next < 0) {
 			eunion_sidecar_close_fd(&descriptor, 0);
 			return next;
@@ -2378,22 +2590,19 @@ static int eunion_sidecar_open_record_path(
 	eunion_sidecar_view view, const char* guest_path, int* node_result,
 	struct eunion_sidecar_node_disk* record_result)
 {
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
-	int result = eunion_sidecar_parse_path(
-		guest_path, component, length, &count);
+	struct eunion_sidecar_path path;
+	int result = eunion_sidecar_parse_path(guest_path, &path);
 	if (result < 0)
 		return result;
 	int node = view->root_descriptor;
 	int own_node = 0;
 	uint64_t parent_generation = view->root_generation;
-	for (int index = 0; index < count; ++index) {
+	for (int index = 0; index < path.count; ++index) {
 		int child = -1;
 		struct eunion_sidecar_node_disk record;
 		result = eunion_sidecar_open_child(view, node,
-			parent_generation, component[index], length[index],
+			parent_generation, path.component[index].name,
+			path.component[index].length,
 			&child, &record);
 		if (result < 0)
 			break;
@@ -2407,9 +2616,11 @@ static int eunion_sidecar_open_record_path(
 	if (result < 0) {
 		if (own_node)
 			eunion_sidecar_close_fd(&node, 0);
+		eunion_sidecar_path_release(&path);
 		return result;
 	}
 	*node_result = node;
+	eunion_sidecar_path_release(&path);
 	return 0;
 }
 
@@ -2635,22 +2846,19 @@ static int eunion_sidecar_open_tree_parent(
 	eunion_sidecar_view view, const char* guest_path, int* children_result,
 	uint64_t* parent_generation_result, char hash_result[17])
 {
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
-	int result = eunion_sidecar_parse_path(
-		guest_path, component, length, &count);
+	struct eunion_sidecar_path path;
+	int result = eunion_sidecar_parse_path(guest_path, &path);
 	if (result < 0)
 		return result;
 	int parent = view->root_descriptor;
 	int own_parent = 0;
 	uint64_t parent_generation = view->root_generation;
-	for (int index = 0; index < count - 1; ++index) {
+	for (int index = 0; index < path.count - 1; ++index) {
 		int child = -1;
 		struct eunion_sidecar_node_disk record;
 		result = eunion_sidecar_open_child(view, parent,
-			parent_generation, component[index], length[index],
+			parent_generation, path.component[index].name,
+			path.component[index].length,
 			&child, &record);
 		if (result < 0)
 			break;
@@ -2668,11 +2876,12 @@ static int eunion_sidecar_open_tree_parent(
 	if (result >= 0) {
 		*parent_generation_result = parent_generation;
 		eunion_sidecar_hash_name(eunion_sidecar_component_hash(
-			view->key, component[count - 1],
-			length[count - 1]), hash_result);
+			view->key, path.component[path.count - 1].name,
+			path.component[path.count - 1].length), hash_result);
 	}
 	if (own_parent)
 		eunion_sidecar_close_fd(&parent, 0);
+	eunion_sidecar_path_release(&path);
 	return result;
 }
 
@@ -2850,42 +3059,34 @@ static int eunion_sidecar_recover_locked(eunion_sidecar_view view)
 		view->sidecar_descriptor, &journal);
 	if (result < 0)
 		return result;
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
-	result = eunion_sidecar_parse_path(
-		journal.path, component, length, &count);
+	EUNION_SIDECAR_AUTO_PATH(path);
+	result = eunion_sidecar_parse_path(journal.path, &path);
 	if (result < 0)
 		return result;
 	int upper_parent = eunion_sidecar_open_parent(
-		view->upper_descriptor, component, count, 0);
+		view->upper_descriptor, &path, 0);
 	if (upper_parent < 0)
 		return upper_parent;
 	struct eunion_sidecar_identity current;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &current);
+		upper_parent, path.component[path.count - 1].name, &current);
 	eunion_sidecar_close_fd(&upper_parent, 0);
 	if (result < 0 || current.present == 2)
 		return result < 0 ? result : -LINUX_EIO;
 	if (journal.operation == EUNION_SIDECAR_OPERATION_RENAME) {
-		char secondary_component[EUNION_SIDECAR_COMPONENT_MAX]
-			[EUNION_SIDECAR_NAME_MAX + 1];
-		size_t secondary_length[EUNION_SIDECAR_COMPONENT_MAX];
-		int secondary_count = 0;
-		result = eunion_sidecar_parse_path(journal.secondary_path,
-			secondary_component, secondary_length, &secondary_count);
+		EUNION_SIDECAR_AUTO_PATH(secondary);
+		result = eunion_sidecar_parse_path(
+			journal.secondary_path, &secondary);
 		if (result < 0)
 			return result;
 		int destination_parent = eunion_sidecar_open_parent(
-			view->upper_descriptor, secondary_component,
-			secondary_count, 0);
+			view->upper_descriptor, &secondary, 0);
 		if (destination_parent < 0)
 			return destination_parent;
 		struct eunion_sidecar_identity destination;
 		result = eunion_sidecar_fstatat_identity_or_absent(
 			destination_parent,
-			secondary_component[secondary_count - 1],
+			secondary.component[secondary.count - 1].name,
 			&destination);
 		eunion_sidecar_close_fd(&destination_parent, 0);
 		if (result < 0 || current.present == 2 ||
@@ -2930,9 +3131,9 @@ static int eunion_sidecar_recover_locked(eunion_sidecar_view view)
 			(journal.lower.mode & LINUX_S_IFMT) != LINUX_S_IFDIR)
 			return -LINUX_EIO;
 		int current_upper_parent = eunion_sidecar_open_parent(
-			view->upper_descriptor, component, count, 0);
+			view->upper_descriptor, &path, 0);
 		int current_lower_parent = eunion_sidecar_open_parent(
-			view->lower_descriptor, component, count, 0);
+			view->lower_descriptor, &path, 0);
 		if (current_upper_parent < 0 || current_lower_parent < 0) {
 			result = current_upper_parent < 0
 				? current_upper_parent : current_lower_parent;
@@ -2942,7 +3143,8 @@ static int eunion_sidecar_recover_locked(eunion_sidecar_view view)
 		}
 		struct eunion_sidecar_identity current_lower;
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			current_lower_parent, component[count - 1],
+			current_lower_parent,
+			path.component[path.count - 1].name,
 			&current_lower);
 		if (result >= 0 &&
 			!eunion_sidecar_same_object(
@@ -2952,7 +3154,8 @@ static int eunion_sidecar_recover_locked(eunion_sidecar_view view)
 		int lower_directory = -1;
 		if (result >= 0) {
 			upper_directory = SIDECAR_SYSCALL(__NR_openat,
-				current_upper_parent, component[count - 1],
+				current_upper_parent,
+				path.component[path.count - 1].name,
 				LINUX_O_RDONLY | LINUX_O_DIRECTORY |
 					LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC,
 				0);
@@ -2961,7 +3164,8 @@ static int eunion_sidecar_recover_locked(eunion_sidecar_view view)
 		}
 		if (result >= 0) {
 			lower_directory = SIDECAR_SYSCALL(__NR_openat,
-				current_lower_parent, component[count - 1],
+				current_lower_parent,
+				path.component[path.count - 1].name,
 				LINUX_O_RDONLY | LINUX_O_DIRECTORY |
 					LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC,
 				0);
@@ -3080,10 +3284,7 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	if (result < 0)
 		return result;
 	struct eunion_sidecar_view_storage* view = &transaction->view;
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
+	EUNION_SIDECAR_AUTO_PATH(path);
 	int upper_parent = -1;
 	int lower_parent = -1;
 	int sidecar_node = -1;
@@ -3094,15 +3295,14 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	int journal_active = 0;
 	struct eunion_sidecar_journal_disk journal;
 	memset(&journal, 0, sizeof(journal));
-	result = eunion_sidecar_parse_path(
-		guest_path, component, length, &count);
+	result = eunion_sidecar_parse_path(guest_path, &path);
 	if (result < 0)
 		return eunion_sidecar_transaction_release(transaction, result);
 
 	upper_parent = eunion_sidecar_open_parent(
-		view->upper_descriptor, component, count, 0);
+		view->upper_descriptor, &path, 0);
 	lower_parent = eunion_sidecar_open_parent(
-		view->lower_descriptor, component, count, 0);
+		view->lower_descriptor, &path, 0);
 	if (upper_parent < 0) {
 		result = upper_parent;
 		goto done;
@@ -3114,12 +3314,12 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	struct eunion_sidecar_identity upper;
 	struct eunion_sidecar_identity lower;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &upper);
+		upper_parent, path.component[path.count - 1].name, &upper);
 	if (result < 0 || upper.present == 2)
 		goto done;
 	if (lower_parent >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			lower_parent, component[count - 1], &lower);
+			lower_parent, path.component[path.count - 1].name, &lower);
 	else {
 		memset(&lower, 0, sizeof(lower));
 		result = 0;
@@ -3131,9 +3331,10 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	int lower_hidden = 0;
 	char ancestor[EUNION_SIDECAR_PATH_MAX] = "/";
 	size_t ancestor_length = 1;
-	for (int index = 0; index < count - 1; ++index) {
+	for (int index = 0; index < path.count - 1; ++index) {
 		size_t needed = ancestor_length +
-			(ancestor_length > 1 ? 1 : 0) + length[index] + 1;
+			(ancestor_length > 1 ? 1 : 0) +
+			path.component[index].length + 1;
 		if (needed > sizeof(ancestor)) {
 			result = -LINUX_EINVAL;
 			goto done;
@@ -3141,8 +3342,9 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 		if (ancestor_length > 1)
 			ancestor[ancestor_length++] = '/';
 		memcpy(ancestor + ancestor_length,
-			component[index], length[index]);
-		ancestor_length += length[index];
+			path.component[index].name,
+			path.component[index].length);
+		ancestor_length += path.component[index].length;
 		ancestor[ancestor_length] = '\0';
 		result = eunion_sidecar_lookup_path(view, ancestor, &lookup);
 		if (result < 0)
@@ -3185,7 +3387,7 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 		int nonempty = 0;
 		if (visible_upper) {
 			int directory = SIDECAR_SYSCALL(__NR_openat, upper_parent,
-				component[count - 1],
+			path.component[path.count - 1].name,
 				LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
 				LINUX_O_CLOEXEC, 0);
 			if (directory >= 0) {
@@ -3207,7 +3409,7 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 		if (visible_lower &&
 			(lower.mode & LINUX_S_IFMT) == LINUX_S_IFDIR) {
 			int directory = SIDECAR_SYSCALL(__NR_openat, lower_parent,
-				component[count - 1],
+			path.component[path.count - 1].name,
 				LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
 				LINUX_O_CLOEXEC, 0);
 			if (directory < 0) {
@@ -3315,10 +3517,12 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	struct eunion_sidecar_identity current_upper;
 	struct eunion_sidecar_identity current_lower;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &current_upper);
+		upper_parent, path.component[path.count - 1].name,
+		&current_upper);
 	if (result >= 0 && lower_parent >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			lower_parent, component[count - 1], &current_lower);
+			lower_parent, path.component[path.count - 1].name,
+			&current_lower);
 	else if (result >= 0)
 		memset(&current_lower, 0, sizeof(current_lower));
 	if (result < 0 ||
@@ -3330,7 +3534,8 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	}
 	if (visible_upper) {
 		result = SIDECAR_SYSCALL(__NR_unlinkat, upper_parent,
-			component[count - 1], remove_directory ? 0x200 : 0);
+			path.component[path.count - 1].name,
+			remove_directory ? 0x200 : 0);
 		if (result < 0)
 			goto rollback;
 	}
@@ -3473,10 +3678,7 @@ static int eunion_sidecar_create_common(
 	if (result < 0)
 		return result;
 	struct eunion_sidecar_view_storage* view = &transaction->view;
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
+	EUNION_SIDECAR_AUTO_PATH(path);
 	int upper_parent = -1;
 	int lower_parent = -1;
 	int source_parent = -1;
@@ -3484,18 +3686,17 @@ static int eunion_sidecar_create_common(
 	int directory = kind == EUNION_SIDECAR_CREATE_DIRECTORY;
 	struct eunion_sidecar_journal_disk journal;
 	memset(&journal, 0, sizeof(journal));
-	result = eunion_sidecar_parse_path(
-		guest_path, component, length, &count);
+	result = eunion_sidecar_parse_path(guest_path, &path);
 	if (result < 0)
 		goto done_create;
 	upper_parent = eunion_sidecar_open_parent(
-		view->upper_descriptor, component, count, 0);
+		view->upper_descriptor, &path, 0);
 	if (upper_parent < 0) {
 		result = upper_parent;
 		goto done_create;
 	}
 	lower_parent = eunion_sidecar_open_parent(
-		view->lower_descriptor, component, count, 0);
+		view->lower_descriptor, &path, 0);
 	if (lower_parent < 0 && lower_parent != -LINUX_ENOENT) {
 		result = lower_parent;
 		goto done_create;
@@ -3503,12 +3704,12 @@ static int eunion_sidecar_create_common(
 	struct eunion_sidecar_identity upper;
 	struct eunion_sidecar_identity lower;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &upper);
+		upper_parent, path.component[path.count - 1].name, &upper);
 	if (result < 0 || upper.present == 2)
 		goto done_create;
 	if (lower_parent >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			lower_parent, component[count - 1], &lower);
+			lower_parent, path.component[path.count - 1].name, &lower);
 	else {
 		memset(&lower, 0, sizeof(lower));
 		result = 0;
@@ -3525,7 +3726,8 @@ static int eunion_sidecar_create_common(
 			goto done_create;
 		}
 		created_descriptor = SIDECAR_SYSCALL(__NR_openat,
-			upper_parent, component[count - 1], flags, mode);
+			upper_parent, path.component[path.count - 1].name,
+			flags, mode);
 		result = created_descriptor;
 		goto done_create;
 	}
@@ -3583,10 +3785,12 @@ static int eunion_sidecar_create_common(
 	struct eunion_sidecar_identity current_upper;
 	struct eunion_sidecar_identity current_lower;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &current_upper);
+		upper_parent, path.component[path.count - 1].name,
+		&current_upper);
 	if (result >= 0 && lower_parent >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			lower_parent, component[count - 1], &current_lower);
+			lower_parent, path.component[path.count - 1].name,
+			&current_lower);
 	else if (result >= 0)
 		memset(&current_lower, 0, sizeof(current_lower));
 	if (result < 0 ||
@@ -3600,11 +3804,12 @@ static int eunion_sidecar_create_common(
 	switch (kind) {
 		case EUNION_SIDECAR_CREATE_DIRECTORY:
 			result = SIDECAR_SYSCALL(__NR_mkdirat,
-				upper_parent, component[count - 1], mode);
+				upper_parent, path.component[path.count - 1].name,
+				mode);
 			break;
 		case EUNION_SIDECAR_CREATE_OPEN:
 			created_descriptor = SIDECAR_SYSCALL(__NR_openat,
-				upper_parent, component[count - 1],
+				upper_parent, path.component[path.count - 1].name,
 				flags | LINUX_O_CREAT | LINUX_O_EXCL |
 					LINUX_O_NOFOLLOW,
 				mode);
@@ -3616,41 +3821,38 @@ static int eunion_sidecar_create_common(
 				break;
 			}
 			result = SIDECAR_SYSCALL(__NR_symlinkat, auxiliary,
-				upper_parent, component[count - 1]);
+				upper_parent, path.component[path.count - 1].name);
 			break;
 		case EUNION_SIDECAR_CREATE_MKNOD:
 			result = SIDECAR_SYSCALL(__NR_mknodat, upper_parent,
-				component[count - 1], mode, device);
+				path.component[path.count - 1].name, mode, device);
 			break;
 		case EUNION_SIDECAR_CREATE_HARDLINK:
 		{
-			char source_component[EUNION_SIDECAR_COMPONENT_MAX]
-				[EUNION_SIDECAR_NAME_MAX + 1];
-			size_t source_length[EUNION_SIDECAR_COMPONENT_MAX];
-			int source_count = 0;
+			EUNION_SIDECAR_AUTO_PATH(source_path);
 			result = auxiliary
 				? eunion_sidecar_parse_path(auxiliary,
-					source_component, source_length,
-					&source_count)
+					&source_path)
 				: -LINUX_EINVAL;
 			if (result < 0)
 				break;
 			source_parent = eunion_sidecar_open_parent(
-				view->upper_descriptor, source_component,
-				source_count, 0);
+				view->upper_descriptor, &source_path, 0);
 			if (source_parent < 0) {
 				result = source_parent;
 				break;
 			}
 			result = SIDECAR_SYSCALL(__NR_linkat,
 				source_parent,
-				source_component[source_count - 1],
-				upper_parent, component[count - 1], flags);
+				source_path.component[source_path.count - 1].name,
+				upper_parent, path.component[path.count - 1].name,
+				flags);
 			break;
 		}
 		case EUNION_SIDECAR_CREATE_SOCKET:
 			result = eunion_sidecar_bind_at(
-				(int)device, upper_parent, component[count - 1]);
+				(int)device, upper_parent,
+				path.component[path.count - 1].name);
 			break;
 		default:
 			result = -LINUX_EINVAL;
@@ -3668,7 +3870,8 @@ static int eunion_sidecar_create_common(
 			EUNION_SIDECAR_TEST_POST_BACKING_PRE_JOURNAL, guest_path);
 #endif
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &journal.backing_new);
+		upper_parent, path.component[path.count - 1].name,
+		&journal.backing_new);
 	if (result < 0 || journal.backing_new.present != 1) {
 		if (result >= 0)
 			result = -LINUX_EIO;
@@ -4292,23 +4495,19 @@ static int eunion_sidecar_copy_up_common(
 	if (result < 0)
 		return result;
 	struct eunion_sidecar_view_storage* view = &transaction->view;
-	char component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t length[EUNION_SIDECAR_COMPONENT_MAX];
-	int count = 0;
+	EUNION_SIDECAR_AUTO_PATH(path);
 	int upper_parent = -1;
 	int lower_parent = -1;
 	int staging = -1;
 	struct eunion_sidecar_journal_disk journal;
 	memset(&journal, 0, sizeof(journal));
-	result = eunion_sidecar_parse_path(
-		guest_path, component, length, &count);
+	result = eunion_sidecar_parse_path(guest_path, &path);
 	if (result < 0)
 		goto copyup_done;
 	upper_parent = eunion_sidecar_open_parent(
-		view->upper_descriptor, component, count, 0);
+		view->upper_descriptor, &path, 0);
 	lower_parent = eunion_sidecar_open_parent(
-		view->lower_descriptor, component, count, 0);
+		view->lower_descriptor, &path, 0);
 	if (upper_parent < 0 || lower_parent < 0) {
 		result = upper_parent < 0 ? upper_parent : lower_parent;
 		goto copyup_done;
@@ -4316,10 +4515,10 @@ static int eunion_sidecar_copy_up_common(
 	struct eunion_sidecar_identity upper;
 	struct eunion_sidecar_identity lower;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &upper);
+		upper_parent, path.component[path.count - 1].name, &upper);
 	if (result >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			lower_parent, component[count - 1], &lower);
+			lower_parent, path.component[path.count - 1].name, &lower);
 	if (result < 0 || upper.present == 2 || lower.present == 2)
 		goto copyup_done;
 	struct eunion_sidecar_lookup lookup;
@@ -4376,7 +4575,7 @@ static int eunion_sidecar_copy_up_common(
 					guest_path);
 #endif
 			int upper_directory = SIDECAR_SYSCALL(__NR_openat,
-				upper_parent, component[count - 1],
+				upper_parent, path.component[path.count - 1].name,
 				LINUX_O_RDONLY | LINUX_O_DIRECTORY |
 					LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC,
 				0);
@@ -4385,7 +4584,7 @@ static int eunion_sidecar_copy_up_common(
 				goto copyup_done;
 			}
 			int lower_directory = SIDECAR_SYSCALL(__NR_openat,
-				lower_parent, component[count - 1],
+				lower_parent, path.component[path.count - 1].name,
 				LINUX_O_RDONLY | LINUX_O_DIRECTORY |
 					LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC,
 				0);
@@ -4493,7 +4692,8 @@ static int eunion_sidecar_copy_up_common(
 		goto copyup_done;
 	}
 	result = eunion_sidecar_stage_copyup(view, lower_parent,
-		component[count - 1], &lower, recursive, &staging);
+		path.component[path.count - 1].name,
+		&lower, recursive, &staging);
 	if (result < 0)
 		goto copyup_done;
 	result = eunion_sidecar_fstatat_identity_or_absent(
@@ -4530,10 +4730,12 @@ static int eunion_sidecar_copy_up_common(
 	struct eunion_sidecar_identity current_upper;
 	struct eunion_sidecar_identity current_lower;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		upper_parent, component[count - 1], &current_upper);
+		upper_parent, path.component[path.count - 1].name,
+		&current_upper);
 	if (result >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			lower_parent, component[count - 1], &current_lower);
+			lower_parent, path.component[path.count - 1].name,
+			&current_lower);
 	if (result < 0 ||
 		!eunion_sidecar_same_object(&upper, &current_upper) ||
 		!eunion_sidecar_same_object(&lower, &current_lower)) {
@@ -4542,7 +4744,8 @@ static int eunion_sidecar_copy_up_common(
 		goto copyup_precommit_failure;
 	}
 	result = SIDECAR_SYSCALL(__NR_renameat2, staging, "copyup-v1",
-		upper_parent, component[count - 1], LINUX_RENAME_NOREPLACE);
+		upper_parent, path.component[path.count - 1].name,
+		LINUX_RENAME_NOREPLACE);
 	if (result < 0)
 		goto copyup_precommit_failure;
 #ifdef TEST
@@ -4640,38 +4843,33 @@ int eunion_sidecar_rename_path(const struct eunion_sidecar_runtime* runtime,
 	if (result < 0)
 		return result;
 	struct eunion_sidecar_view_storage* view = &transaction->view;
-	char old_component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	char new_component[EUNION_SIDECAR_COMPONENT_MAX]
-		[EUNION_SIDECAR_NAME_MAX + 1];
-	size_t old_length[EUNION_SIDECAR_COMPONENT_MAX];
-	size_t new_length[EUNION_SIDECAR_COMPONENT_MAX];
-	int old_count = 0;
-	int new_count = 0;
+	EUNION_SIDECAR_AUTO_PATH(old_path);
+	EUNION_SIDECAR_AUTO_PATH(new_path);
 	int old_parent = -1;
 	int new_parent = -1;
 	struct eunion_sidecar_journal_disk journal;
 	memset(&journal, 0, sizeof(journal));
 	result = eunion_sidecar_parse_path(
-		old_guest_path, old_component, old_length, &old_count);
+		old_guest_path, &old_path);
 	if (result >= 0)
 		result = eunion_sidecar_parse_path(
-			new_guest_path, new_component, new_length, &new_count);
+			new_guest_path, &new_path);
 	if (result < 0)
 		goto rename_done;
 	old_parent = eunion_sidecar_open_parent(
-		view->upper_descriptor, old_component, old_count, 0);
+		view->upper_descriptor, &old_path, 0);
 	new_parent = eunion_sidecar_open_parent(
-		view->upper_descriptor, new_component, new_count, 0);
+		view->upper_descriptor, &new_path, 0);
 	if (old_parent < 0 || new_parent < 0) {
 		result = old_parent < 0 ? old_parent : new_parent;
 		goto rename_done;
 	}
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		old_parent, old_component[old_count - 1], &journal.upper);
+		old_parent, old_path.component[old_path.count - 1].name,
+		&journal.upper);
 	if (result >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			new_parent, new_component[new_count - 1],
+			new_parent, new_path.component[new_path.count - 1].name,
 			&journal.secondary_upper);
 	if (result < 0 || journal.upper.present != 1 ||
 		journal.secondary_upper.present == 2) {
@@ -4680,12 +4878,13 @@ int eunion_sidecar_rename_path(const struct eunion_sidecar_runtime* runtime,
 		goto rename_done;
 	}
 	int old_lower_parent = eunion_sidecar_open_parent(
-		view->lower_descriptor, old_component, old_count, 0);
+		view->lower_descriptor, &old_path, 0);
 	int new_lower_parent = eunion_sidecar_open_parent(
-		view->lower_descriptor, new_component, new_count, 0);
+		view->lower_descriptor, &new_path, 0);
 	if (old_lower_parent >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			old_lower_parent, old_component[old_count - 1],
+			old_lower_parent,
+			old_path.component[old_path.count - 1].name,
 			&journal.lower);
 	else if (old_lower_parent == -LINUX_ENOENT)
 		memset(&journal.lower, 0, sizeof(journal.lower));
@@ -4693,7 +4892,8 @@ int eunion_sidecar_rename_path(const struct eunion_sidecar_runtime* runtime,
 		result = old_lower_parent;
 	if (result >= 0 && new_lower_parent >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			new_lower_parent, new_component[new_count - 1],
+			new_lower_parent,
+			new_path.component[new_path.count - 1].name,
 			&journal.secondary_lower);
 	else if (result >= 0 && new_lower_parent == -LINUX_ENOENT)
 		memset(&journal.secondary_lower, 0,
@@ -4773,10 +4973,11 @@ int eunion_sidecar_rename_path(const struct eunion_sidecar_runtime* runtime,
 	struct eunion_sidecar_identity current_source;
 	struct eunion_sidecar_identity current_destination;
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		old_parent, old_component[old_count - 1], &current_source);
+		old_parent, old_path.component[old_path.count - 1].name,
+		&current_source);
 	if (result >= 0)
 		result = eunion_sidecar_fstatat_identity_or_absent(
-			new_parent, new_component[new_count - 1],
+			new_parent, new_path.component[new_path.count - 1].name,
 			&current_destination);
 	if (result < 0 ||
 		!eunion_sidecar_same_object(
@@ -4789,8 +4990,8 @@ int eunion_sidecar_rename_path(const struct eunion_sidecar_runtime* runtime,
 		goto rename_done;
 	}
 	result = SIDECAR_SYSCALL(__NR_renameat,
-		old_parent, old_component[old_count - 1],
-		new_parent, new_component[new_count - 1]);
+		old_parent, old_path.component[old_path.count - 1].name,
+		new_parent, new_path.component[new_path.count - 1].name);
 	if (result < 0) {
 		int original = result;
 		(void)eunion_sidecar_remove_journal(view);
@@ -4804,7 +5005,7 @@ int eunion_sidecar_rename_path(const struct eunion_sidecar_runtime* runtime,
 			old_guest_path);
 #endif
 	result = eunion_sidecar_fstatat_identity_or_absent(
-		new_parent, new_component[new_count - 1],
+		new_parent, new_path.component[new_path.count - 1].name,
 		&journal.backing_new);
 	if (result < 0 || !journal.backing_new.present ||
 		!eunion_sidecar_same_object(

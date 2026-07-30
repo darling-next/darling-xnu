@@ -166,8 +166,8 @@ int main(void)
 	require(lstat(activation, &status) == 0 && S_ISREG(status.st_mode) &&
 		!S_ISLNK(status.st_mode) && (status.st_mode & 0777) == 0600,
 		"activation is exact regular mode 0600");
-	require(eunion_sidecar_initialize(&runtime) == -ENOTEMPTY,
-		"activation prevents partial reinitialization");
+	require(eunion_sidecar_initialize(&runtime) == 0,
+		"initializer idempotently joins the published sidecar");
 
 	int descriptor = open(activation, O_RDWR | O_CLOEXEC);
 	require(descriptor >= 0, "open activation corruption fixture");

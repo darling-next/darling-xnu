@@ -128,6 +128,83 @@ static void wait_success(pid_t child, const char* message)
 		message);
 }
 
+static void run_simultaneous_initialize(void)
+{
+	char root[] = "/tmp/eunion-sidecar-init-concurrency.XXXXXX";
+	require(mkdtemp(root) != NULL, "create initialize fixture");
+	char upper[512], lower[512], sidecar[512];
+	join_path(upper, sizeof(upper), root, "/upper");
+	join_path(lower, sizeof(lower), root, "/lower");
+	join_path(sidecar, sizeof(sidecar), root, "/sidecar");
+	require(mkdir(upper, 0700) == 0 &&
+			mkdir(lower, 0700) == 0 &&
+			mkdir(sidecar, 0700) == 0,
+		"create initialize roots");
+	struct eunion_sidecar_runtime runtime = {
+		.upper_root = upper,
+		.lower_root = lower,
+		.sidecar_root = sidecar,
+	};
+	require(eunion_sidecar_test_write_prefix_state(&runtime) == 0,
+		"publish initialize prefix state");
+
+	enum { INITIALIZERS = 3 };
+	int ready[2], release[2], results[2];
+	require(pipe(ready) == 0 && pipe(release) == 0 &&
+			pipe(results) == 0, "create initialize barriers");
+	pid_t children[INITIALIZERS];
+	for (int index = 0; index < INITIALIZERS; ++index) {
+		children[index] = fork();
+		require(children[index] >= 0, "fork initializer");
+		if (children[index] == 0) {
+			close(ready[0]);
+			close(release[1]);
+			close(results[0]);
+			pause_checkpoint = EUNION_SIDECAR_TEST_INITIALIZE_READY;
+			checkpoint_ready = ready[1];
+			checkpoint_release = release[0];
+			eunion_test_sidecar_checkpoint_hook = pause_at_checkpoint;
+			int result = eunion_sidecar_initialize(&runtime);
+			(void)write(results[1], &result, sizeof(result));
+			_exit(result == 0 ? 0 : 1);
+		}
+	}
+	close(ready[1]);
+	close(release[0]);
+	close(results[1]);
+	for (int index = 0; index < INITIALIZERS; ++index)
+		receive_byte(ready[0]);
+	for (int index = 0; index < INITIALIZERS; ++index)
+		send_byte(release[1]);
+	int success = 0;
+	for (int index = 0; index < INITIALIZERS; ++index) {
+		if (receive_result(results[0]) == 0)
+			++success;
+	}
+	for (int index = 0; index < INITIALIZERS; ++index)
+		wait_success(children[index],
+			"simultaneous initializer succeeds");
+	require(success == INITIALIZERS,
+		"all simultaneous initializers converge on one format");
+	struct eunion_prefix_format_inspection inspection;
+	require(eunion_sidecar_inspect_prefix(&runtime, &inspection) == 0 &&
+			inspection.verdict == EUNION_PREFIX_FORMAT_VALID,
+		"simultaneous initialize publishes one valid sidecar");
+	eunion_sidecar_view reader = {{0}};
+	require(eunion_sidecar_view_open(reader, &runtime,
+			EUNION_SIDECAR_ACCESS_SHARED) == 0 &&
+			eunion_sidecar_view_close(reader) == 0,
+		"simultaneous initialize leaves persistent lock usable");
+
+	close(ready[0]);
+	close(release[1]);
+	close(results[0]);
+	char command[640];
+	require(snprintf(command, sizeof(command), "rm -rf -- '%s'", root) > 0,
+		"construct initialize cleanup");
+	require(system(command) == 0, "remove initialize fixture");
+}
+
 static int run_competing(
 	enum competing_operation operation,
 	const struct eunion_sidecar_runtime* runtime)
@@ -304,6 +381,7 @@ static void run_case(enum primary_operation operation,
 
 int main(void)
 {
+	run_simultaneous_initialize();
 	static const enum eunion_sidecar_test_checkpoint remove_phases[] = {
 		EUNION_SIDECAR_TEST_RESOLVED,
 		EUNION_SIDECAR_TEST_JOURNAL_PREPARED,
