@@ -380,6 +380,49 @@ static void test_parent_swap_at_publication_boundary(void)
 	fixture_destroy(&fixture);
 }
 
+static void unreadable_directory_swap_hook(
+	enum eunion_remove_test_checkpoint checkpoint, const char* guest_path)
+{
+	if (checkpoint != EUNION_REMOVE_TEST_PREPARED || !swap_fixture ||
+		strcmp(guest_path, "/swap-dir") != 0)
+		return;
+	char current[512];
+	char original[512];
+	join_path(current, sizeof(current), swap_fixture->upper, "/swap-dir");
+	join_path(original, sizeof(original), swap_fixture->upper,
+		"/swap-dir.old");
+	if (rename(current, original) != 0 || mkdir(current, 0000) != 0)
+		_exit(97);
+}
+
+static void test_unreadable_directory_swap_at_publication_boundary(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char current[512];
+	char original[512];
+	join_path(current, sizeof(current), fixture.upper, "/swap-dir");
+	join_path(original, sizeof(original), fixture.upper, "/swap-dir.old");
+	make_directory(current);
+	require(chmod(current, 0000) == 0, "chmod original swap directory");
+	swap_fixture = &fixture;
+	eunion_test_remove_checkpoint_hook = unreadable_directory_swap_hook;
+	require(eunion_remove_path(&fixture.runtime, "/swap-dir",
+		EUNION_INTENT_REMOVE_DIRECTORY) == -EAGAIN,
+		"unreadable directory replacement detected before mutation");
+	eunion_test_remove_checkpoint_hook = NULL;
+	swap_fixture = NULL;
+	require(exists(fixture.upper, "/swap-dir"),
+		"unreadable replacement directory remains");
+	require(exists(fixture.upper, "/swap-dir.old"),
+		"unreadable original directory remains");
+	require(chmod(current, 0700) == 0 &&
+		chmod(original, 0700) == 0,
+		"restore swapped directory modes");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
 static void test_union_directory_emptiness(void)
 {
 	struct fixture fixture;
@@ -495,6 +538,165 @@ static void test_materialized_parent_metadata(void)
 		"materialized parent xattr preserved");
 	require(marker(fixture.upper, "/metadata/victim", WHITEOUT),
 		"nested whiteout published after metadata copy");
+	require_work_empty(&fixture);
+	fixture_destroy(&fixture);
+}
+
+static int recursive_whiteout_directory_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_parent[512];
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower, "/recursive");
+	make_directory(lower_parent);
+	make_file(fixture.lower, "/recursive/child", "lower");
+
+	int child_result = eunion_remove_path(&fixture.runtime,
+		"/recursive/child", EUNION_INTENT_REMOVE_FILE);
+	int parent_result = eunion_remove_path(&fixture.runtime, "/recursive",
+		EUNION_INTENT_REMOVE_DIRECTORY);
+	int parent_whiteout = marker(fixture.upper, "/recursive", WHITEOUT);
+	int lower_preserved = exists(fixture.lower, "/recursive");
+	printf("EUNION_REMOVE_FOLLOWUP recursive child=%d parent=%d "
+		"whiteout=%d lower=%d\n", child_result, parent_result,
+		parent_whiteout, lower_preserved);
+	int passed = child_result == 0 && parent_result == 0 &&
+		parent_whiteout && lower_preserved;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static int hostile_umask_whiteout_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	make_file(fixture.lower, "/umask-victim", "lower");
+	mode_t old_umask = umask(0777);
+	int result = eunion_remove_path(&fixture.runtime, "/umask-victim",
+		EUNION_INTENT_REMOVE_FILE);
+	umask(old_umask);
+	int whiteout = marker(fixture.upper, "/umask-victim", WHITEOUT);
+	char path[512];
+	struct stat status;
+	join_path(path, sizeof(path), fixture.upper, "/umask-victim");
+	int stat_result = lstat(path, &status);
+	unsigned int mode = stat_result == 0
+		? (unsigned int)status.st_mode & 0777 : 0;
+	printf("EUNION_REMOVE_FOLLOWUP umask result=%d whiteout=%d mode=%04o\n",
+		result, whiteout, mode);
+	int passed = result == 0 && whiteout &&
+		stat_result == 0 && mode == 0600;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static int write_execute_parent_unlink_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char parent[512];
+	join_path(parent, sizeof(parent), fixture.upper, "/write-execute");
+	make_directory(parent);
+	make_file(fixture.upper, "/write-execute/victim", "upper");
+	require(chmod(parent, 0300) == 0, "chmod write-execute parent");
+	int result = eunion_remove_path(&fixture.runtime,
+		"/write-execute/victim", EUNION_INTENT_REMOVE_FILE);
+	int target_exists = exists(fixture.upper, "/write-execute/victim");
+	require(chmod(parent, 0700) == 0, "restore write-execute parent mode");
+	printf("EUNION_REMOVE_FOLLOWUP parent0300 result=%d target=%d\n",
+		result, target_exists);
+	int passed = result == 0 && !target_exists;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static int unreadable_empty_directory_case(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char directory[512];
+	join_path(directory, sizeof(directory), fixture.upper, "/unreadable-dir");
+	make_directory(directory);
+	require(chmod(directory, 0000) == 0, "chmod unreadable directory");
+	int result = eunion_remove_path(&fixture.runtime, "/unreadable-dir",
+		EUNION_INTENT_REMOVE_DIRECTORY);
+	int target_exists = exists(fixture.upper, "/unreadable-dir");
+	if (target_exists)
+		require(chmod(directory, 0700) == 0,
+			"restore unreadable directory mode");
+	printf("EUNION_REMOVE_FOLLOWUP dir000 result=%d target=%d\n",
+		result, target_exists);
+	int passed = result == 0 && !target_exists;
+
+	char nonempty[512];
+	join_path(nonempty, sizeof(nonempty), fixture.upper,
+		"/unreadable-nonempty");
+	make_directory(nonempty);
+	make_file(fixture.upper, "/unreadable-nonempty/child", "upper");
+	require(chmod(nonempty, 0000) == 0,
+		"chmod unreadable nonempty directory");
+	result = eunion_remove_path(&fixture.runtime, "/unreadable-nonempty",
+		EUNION_INTENT_REMOVE_DIRECTORY);
+	target_exists = exists(fixture.upper, "/unreadable-nonempty");
+	require(chmod(nonempty, 0700) == 0,
+		"restore unreadable nonempty directory mode");
+	printf("EUNION_REMOVE_FOLLOWUP dir000-nonempty result=%d target=%d\n",
+		result, target_exists);
+	passed = passed && result == -ENOTEMPTY && target_exists;
+	fixture_destroy(&fixture);
+	return passed;
+}
+
+static void test_followup_adversarial_remove_cases(void)
+{
+	int recursive = recursive_whiteout_directory_case();
+	int hostile_umask = hostile_umask_whiteout_case();
+	int parent_permissions = write_execute_parent_unlink_case();
+	int directory_permissions = unreadable_empty_directory_case();
+	require(recursive, "recursive whiteout-only directory removal");
+	require(hostile_umask, "whiteout creation ignores guest umask");
+	require(parent_permissions,
+		"unlink requires no parent read permission");
+	require(directory_permissions,
+		"rmdir requires no target directory read permission");
+}
+
+static void test_recursive_whiteout_disposal_rollback(void)
+{
+	struct fixture fixture;
+	fixture_init(&fixture);
+	char lower_parent[512];
+	join_path(lower_parent, sizeof(lower_parent), fixture.lower,
+		"/recursive-rollback");
+	make_directory(lower_parent);
+	make_file(fixture.lower, "/recursive-rollback/one", "lower");
+	make_file(fixture.lower, "/recursive-rollback/two", "lower");
+	require(eunion_remove_path(&fixture.runtime,
+		"/recursive-rollback/one", EUNION_INTENT_REMOVE_FILE) == 0,
+		"publish first recursive whiteout");
+	require(eunion_remove_path(&fixture.runtime,
+		"/recursive-rollback/two", EUNION_INTENT_REMOVE_FILE) == 0,
+		"publish second recursive whiteout");
+
+	eunion_test_remove_fail_tomb_move_ordinal = 2;
+	require(eunion_remove_path(&fixture.runtime, "/recursive-rollback",
+		EUNION_INTENT_REMOVE_DIRECTORY) == -EIO,
+		"whiteout quarantine failure is reported");
+	eunion_test_remove_fail_tomb_move_ordinal = 0;
+	require(exists(fixture.upper, "/recursive-rollback"),
+		"failed quarantine restores upper directory");
+	require(marker(fixture.upper, "/recursive-rollback/one", WHITEOUT) &&
+		marker(fixture.upper, "/recursive-rollback/two", WHITEOUT),
+		"failed quarantine restores every internal whiteout");
+	require(!marker(fixture.upper, "/recursive-rollback", WHITEOUT),
+		"failed quarantine does not publish parent whiteout");
+	require_work_empty(&fixture);
+
+	require(eunion_remove_path(&fixture.runtime, "/recursive-rollback",
+		EUNION_INTENT_REMOVE_DIRECTORY) == 0,
+		"recursive directory removal succeeds after rollback");
+	require(marker(fixture.upper, "/recursive-rollback", WHITEOUT),
+		"recursive retry publishes parent whiteout");
 	require_work_empty(&fixture);
 	fixture_destroy(&fixture);
 }
@@ -788,11 +990,14 @@ int main(void)
 	test_leaf_swap_revalidation();
 	test_leaf_swap_at_publication_boundary();
 	test_parent_swap_at_publication_boundary();
+	test_unreadable_directory_swap_at_publication_boundary();
 	test_root_swap_revalidation();
 	test_union_directory_emptiness();
 	test_opaque_ancestor_hides_lower_target();
 	test_unreadable_upper_file_can_be_unlinked();
 	test_materialized_parent_metadata();
+	test_followup_adversarial_remove_cases();
+	test_recursive_whiteout_disposal_rollback();
 	test_all_interruption_cases();
 	test_staged_durability_failures();
 	test_nested_parent_rollback();
