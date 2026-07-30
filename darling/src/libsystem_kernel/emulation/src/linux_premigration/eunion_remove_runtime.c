@@ -40,6 +40,9 @@ typedef struct linux_stat stat_t;
 #ifndef LINUX_AT_SYMLINK_NOFOLLOW
 #define LINUX_AT_SYMLINK_NOFOLLOW 0x100
 #endif
+#ifndef LINUX_AT_EMPTY_PATH
+#define LINUX_AT_EMPTY_PATH 0x1000
+#endif
 #ifndef LINUX_O_RDONLY
 #define LINUX_O_RDONLY 0
 #endif
@@ -60,6 +63,9 @@ typedef struct linux_stat stat_t;
 #endif
 #ifndef LINUX_O_CLOEXEC
 #define LINUX_O_CLOEXEC 02000000
+#endif
+#ifndef LINUX_O_PATH
+#define LINUX_O_PATH 010000000
 #endif
 #ifndef LINUX_RENAME_NOREPLACE
 #define LINUX_RENAME_NOREPLACE 1
@@ -90,6 +96,9 @@ typedef struct linux_stat stat_t;
 #endif
 #ifndef LINUX_EIO
 #define LINUX_EIO 5
+#endif
+#ifndef LINUX_EBADF
+#define LINUX_EBADF 9
 #endif
 #ifndef LINUX_EACCES
 #define LINUX_EACCES 13
@@ -126,6 +135,9 @@ typedef struct linux_stat stat_t;
 #endif
 #ifndef LINUX_S_IFLNK
 #define LINUX_S_IFLNK 0120000
+#endif
+#ifndef __NR_fchmodat2
+#define __NR_fchmodat2 452
 #endif
 
 #define EUNION_REMOVE_PATH_MAX 4096
@@ -176,6 +188,7 @@ struct eunion_remove_capability_storage {
 	int upper_parent_complete;
 	int lower_parent_complete;
 	int lower_hidden_by_opaque_ancestor;
+	int directory_view_deferred;
 	unsigned char created_upper_parent[EUNION_REMOVE_COMPONENT_MAX];
 	struct eunion_inode_identity upper_leaf;
 	struct eunion_inode_identity lower_leaf;
@@ -184,7 +197,10 @@ struct eunion_remove_capability_storage {
 	char parent_path[EUNION_REMOVE_PATH_MAX];
 	char leaf[EUNION_REMOVE_NAME_MAX + 1];
 	char stage_name[EUNION_REMOVE_NAME_MAX + 1];
+	char tomb_name[EUNION_REMOVE_NAME_MAX + 1];
 	int work_descriptor;
+	int tomb_descriptor;
+	int tomb_contains_originals;
 	int lock_held;
 	int applied_kind;
 };
@@ -208,6 +224,8 @@ int eunion_test_remove_fail_checkpoint;
 int eunion_test_remove_interrupt_checkpoint;
 int eunion_test_remove_fail_fsync_ordinal;
 int eunion_test_remove_fsync_count;
+int eunion_test_remove_fail_tomb_move_ordinal;
+int eunion_test_remove_tomb_move_count;
 void (*eunion_test_remove_checkpoint_hook)(
 	enum eunion_remove_test_checkpoint checkpoint,
 	const char* guest_path
@@ -223,6 +241,19 @@ static int eunion_fsync(int descriptor)
 		return -LINUX_EIO;
 #endif
 	return LINUX_SYSCALL(__NR_fsync, descriptor);
+}
+
+static int eunion_fsync_directory(eunion_remove_capability capability,
+	int descriptor)
+{
+	int result = eunion_fsync(descriptor);
+#if defined(__NR_syncfs)
+	if (result == -LINUX_EBADF &&
+		descriptor != capability->upper.descriptor[0])
+		result = LINUX_SYSCALL(__NR_syncfs,
+			capability->upper.descriptor[0]);
+#endif
+	return result;
 }
 
 static struct eunion_inode_identity eunion_absent_identity(void)
@@ -498,6 +529,10 @@ static int eunion_chain_append(struct eunion_directory_chain* chain,
 	next = LINUX_SYSCALL(__NR_openat, current, component,
 		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
 		LINUX_O_CLOEXEC, 0);
+	if (next == -LINUX_EACCES)
+		next = LINUX_SYSCALL(__NR_openat, current, component,
+			LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+			LINUX_O_CLOEXEC, 0);
 	if (next < 0)
 		return next;
 	strcpy(chain->name[chain->count - 1], component);
@@ -561,7 +596,14 @@ static int eunion_open_parent_chains(eunion_remove_capability capability,
 					component, lower->mode & 07777);
 				if (result < 0 && result != -LINUX_EEXIST)
 					return result;
-				if (eunion_fsync(upper_parent) < 0)
+				if (result == 0)
+				{
+					result = LINUX_SYSCALL(__NR_fchmodat, upper_parent,
+						component, lower->mode & 0777);
+					if (result < 0)
+						return result;
+				}
+				if (eunion_fsync_directory(capability, upper_parent) < 0)
 					return -LINUX_EIO;
 				result = eunion_chain_append(&capability->upper, component);
 			}
@@ -569,7 +611,7 @@ static int eunion_open_parent_chains(eunion_remove_capability capability,
 				upper_available = 0;
 			else if (result < 0)
 				return result;
-			else
+			else if (lower_available)
 			{
 				int opaque = eunion_marker_descriptor(
 					capability->upper.descriptor[
@@ -700,6 +742,13 @@ static int eunion_materialize_upper_parent_chain(
 				return result;
 			if (created)
 			{
+				result = LINUX_SYSCALL(__NR_fchmodat, upper_parent,
+					component, lower->mode & 0777);
+				if (result < 0)
+					return result;
+			}
+			if (created)
+			{
 				capability->created_upper_parent[index] = 1;
 				strcpy(capability->upper.name[index], component);
 			}
@@ -719,7 +768,7 @@ static int eunion_materialize_upper_parent_chain(
 				if (result < 0)
 					return result;
 			}
-			result = eunion_fsync(upper_parent);
+			result = eunion_fsync_directory(capability, upper_parent);
 		}
 		if (result < 0)
 			return result;
@@ -756,7 +805,8 @@ static int eunion_revalidate_chain(const struct eunion_directory_chain* chain)
 }
 
 static int eunion_read_leaf(int parent, const char* leaf,
-	const char* whiteout_marker, struct eunion_inode_identity* identity)
+	const char* whiteout_marker, int allow_unreadable_directory,
+	struct eunion_inode_identity* identity)
 {
 	int result;
 	int whiteout;
@@ -774,9 +824,15 @@ static int eunion_read_leaf(int parent, const char* leaf,
 	if (kind != EUNION_NODE_REGULAR && kind != EUNION_NODE_DIRECTORY)
 		return 0;
 	whiteout = eunion_marker_at(parent, leaf, whiteout_marker, identity);
+	if (whiteout == -LINUX_EACCES && allow_unreadable_directory &&
+		kind == EUNION_NODE_DIRECTORY)
+		whiteout = 0;
 	if (whiteout < 0)
 		return whiteout;
 	opaque = eunion_marker_at(parent, leaf, "user.union.opaque", identity);
+	if (opaque == -LINUX_EACCES && allow_unreadable_directory &&
+		kind == EUNION_NODE_DIRECTORY)
+		opaque = 0;
 	if (opaque < 0)
 		return opaque;
 	if (whiteout && opaque)
@@ -911,11 +967,23 @@ static int eunion_resolve_directory_view(eunion_remove_capability capability)
 	{
 		upper = eunion_open_leaf_directory(upper_parent, capability->leaf);
 		if (upper < 0)
-			return upper;
+		{
+			if (upper != -LINUX_EACCES ||
+				capability->lower_leaf.tag != EUNION_IDENTITY_ABSENT)
+				return upper;
+			// An unreadable upper-only directory can still be removed using
+			// write+execute permission on its parent. Physical rmdir after the
+			// fd-relative rename remains the authoritative emptiness check.
+			upper = -1;
+			capability->directory_view_deferred = 1;
+		}
+		else
+		{
 		result = eunion_upper_directory_nonempty(upper,
 			capability->runtime->whiteout_marker, &nonempty);
 		if (result < 0 || nonempty)
 			goto done;
+		}
 	}
 	if (capability->upper_leaf.tag != EUNION_IDENTITY_OPAQUE &&
 		capability->lower_leaf.tag == EUNION_IDENTITY_PRESENT &&
@@ -956,12 +1024,15 @@ static int eunion_resolve_capability(eunion_remove_capability capability)
 		? capability->upper.descriptor[capability->upper.count - 1] : -1;
 	int lower_parent = capability->lower_parent_complete
 		? capability->lower.descriptor[capability->lower.count - 1] : -1;
-	int result = eunion_read_leaf(upper_parent, capability->leaf,
-		capability->runtime->whiteout_marker, &capability->upper_leaf);
+	int result = eunion_read_leaf(lower_parent, capability->leaf,
+		capability->runtime->whiteout_marker, 0,
+		&capability->lower_leaf);
 	if (result < 0)
 		return result;
-	result = eunion_read_leaf(lower_parent, capability->leaf,
-		capability->runtime->whiteout_marker, &capability->lower_leaf);
+	result = eunion_read_leaf(upper_parent, capability->leaf,
+		capability->runtime->whiteout_marker,
+		capability->lower_leaf.tag == EUNION_IDENTITY_ABSENT,
+		&capability->upper_leaf);
 	if (result < 0)
 		return result;
 
@@ -1068,6 +1139,7 @@ static int eunion_anchor(eunion_remove_capability capability,
 		return -LINUX_EBUSY;
 	memset(capability, 0, sizeof(*capability));
 	capability->work_descriptor = -1;
+	capability->tomb_descriptor = -1;
 	capability->runtime = runtime;
 	capability->intent = intent;
 	for (int index = 0; index <= EUNION_REMOVE_COMPONENT_MAX; ++index)
@@ -1203,7 +1275,9 @@ static int eunion_prepare(eunion_remove_capability capability)
 			LINUX_O_CLOEXEC, 0600);
 		if (descriptor < 0)
 			return descriptor;
-		result = LINUX_SYSCALL(__NR_fsetxattr, descriptor,
+		result = LINUX_SYSCALL(__NR_fchmod, descriptor, 0600);
+		if (result >= 0)
+			result = LINUX_SYSCALL(__NR_fsetxattr, descriptor,
 			capability->runtime->whiteout_marker, "y", 1, 0);
 		if (result >= 0)
 			result = eunion_fsync(descriptor);
@@ -1296,14 +1370,10 @@ static int eunion_validate_applied_publication(
 	return 0;
 }
 
-static int eunion_apply(eunion_remove_capability capability)
+static int eunion_apply_namespace(eunion_remove_capability capability,
+	int upper_parent)
 {
-	if (capability->phase != EUNION_REMOVE_PHASE_PREPARED)
-		return -LINUX_EIO;
-	int upper_parent =
-		capability->upper.descriptor[capability->upper.count - 1];
 	int result;
-	capability->applied_kind = capability->resolved.visible_kind;
 	switch (capability->plan.action)
 	{
 		case EUNION_REMOVE_PUBLISH_WHITEOUT:
@@ -1338,29 +1408,321 @@ static int eunion_apply(eunion_remove_capability capability)
 		default:
 			return -LINUX_EIO;
 	}
+	return result;
+}
+
+static int eunion_apply(eunion_remove_capability capability)
+{
+	if (capability->phase != EUNION_REMOVE_PHASE_PREPARED)
+		return -LINUX_EIO;
+	int upper_parent =
+		capability->upper.descriptor[capability->upper.count - 1];
+	int directory_descriptor = -1;
+	int relaxed_mode = 0;
+	int result;
+	capability->applied_kind = capability->resolved.visible_kind;
+
+	if (capability->applied_kind == EUNION_NODE_DIRECTORY &&
+		capability->plan.action != EUNION_REMOVE_PUBLISH_WHITEOUT)
+	{
+		directory_descriptor = LINUX_SYSCALL(__NR_openat, upper_parent,
+			capability->leaf,
+			LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+			LINUX_O_CLOEXEC, 0);
+		if (directory_descriptor < 0)
+			return directory_descriptor;
+		struct eunion_inode_identity identity;
+		result = eunion_fstat_identity(directory_descriptor, &identity);
+		if (result < 0 ||
+			!eunion_same_object(&identity, &capability->upper_leaf))
+		{
+			LINUX_SYSCALL(__NR_close, directory_descriptor);
+			return result < 0 ? result : -LINUX_EAGAIN;
+		}
+	}
+
+	result = eunion_apply_namespace(capability, upper_parent);
+	if (result == -LINUX_EACCES && directory_descriptor >= 0)
+	{
+		result = LINUX_SYSCALL(__NR_fchmodat2, directory_descriptor, "",
+			(capability->upper_leaf.mode & 07777) | 0300,
+			LINUX_AT_EMPTY_PATH);
+		if (result >= 0)
+		{
+			relaxed_mode = 1;
+			result = eunion_apply_namespace(capability, upper_parent);
+		}
+	}
+	if (result >= 0)
+		capability->phase = EUNION_REMOVE_PHASE_APPLIED;
+	if (relaxed_mode)
+	{
+		int restore_result = LINUX_SYSCALL(__NR_fchmodat2,
+			directory_descriptor, "",
+			capability->upper_leaf.mode & 07777, LINUX_AT_EMPTY_PATH);
+		if (result >= 0 && restore_result < 0)
+			result = restore_result;
+	}
+	if (directory_descriptor >= 0)
+	{
+		int close_result =
+			LINUX_SYSCALL(__NR_close, directory_descriptor);
+		if (result >= 0 && close_result < 0)
+			result = close_result;
+	}
 	if (result < 0)
 		return result;
-	capability->phase = EUNION_REMOVE_PHASE_APPLIED;
 	result = eunion_validate_applied_publication(capability);
 	if (result < 0)
 		return result;
-	return eunion_fsync(upper_parent);
+	return eunion_fsync_directory(capability, upper_parent);
+}
+
+static int eunion_first_directory_entry(int descriptor,
+	char name[EUNION_REMOVE_NAME_MAX + 1])
+{
+	char buffer[4096];
+	int length = 0;
+	int offset = 0;
+	const char* observed;
+	int result = LINUX_SYSCALL(__NR_lseek, descriptor, 0, 0);
+	if (result < 0)
+		return result;
+	result = eunion_next_directory_entry(descriptor, buffer,
+		sizeof(buffer), &length, &offset, &observed);
+	if (result <= 0)
+		return result;
+	int name_length = (int)strlen(observed);
+	if (name_length <= 0 || name_length > EUNION_REMOVE_NAME_MAX)
+		return -LINUX_EIO;
+	memcpy(name, observed, (size_t)name_length + 1);
+	return 1;
+}
+
+static int eunion_open_tomb_directory(eunion_remove_capability capability)
+{
+	const char suffix[] = ".tombs";
+	int stage_length = (int)strlen(capability->stage_name);
+	if (stage_length <= 0 ||
+		stage_length + (int)sizeof(suffix) >
+			(int)sizeof(capability->tomb_name))
+		return -LINUX_ENAMETOOLONG;
+	memcpy(capability->tomb_name, capability->stage_name,
+		(size_t)stage_length);
+	memcpy(capability->tomb_name + stage_length, suffix, sizeof(suffix));
+	int result = LINUX_SYSCALL(__NR_mkdirat, capability->work_descriptor,
+		capability->tomb_name, 0700);
+	if (result < 0)
+		return result;
+	result = LINUX_SYSCALL(__NR_fchmodat, capability->work_descriptor,
+		capability->tomb_name, 0700);
+	if (result < 0)
+		return result;
+	capability->tomb_descriptor = LINUX_SYSCALL(__NR_openat,
+		capability->work_descriptor, capability->tomb_name,
+		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+		LINUX_O_CLOEXEC, 0);
+	if (capability->tomb_descriptor < 0)
+		return capability->tomb_descriptor;
+	result = eunion_fsync(capability->tomb_descriptor);
+	if (result < 0)
+		return result;
+	return eunion_fsync(capability->work_descriptor);
+}
+
+static int eunion_move_internal_whiteouts(
+	eunion_remove_capability capability, int source)
+{
+	char name[EUNION_REMOVE_NAME_MAX + 1];
+	for (;;)
+	{
+		int result = eunion_first_directory_entry(source, name);
+		if (result <= 0)
+			return result;
+		struct eunion_inode_identity identity;
+		result = eunion_fstatat_identity(source, name, &identity);
+		if (result < 0)
+			return result;
+		int whiteout = eunion_marker_at(source, name,
+			capability->runtime->whiteout_marker, &identity);
+		if (whiteout < 0)
+			return whiteout;
+		int opaque = eunion_marker_at(source, name, "user.union.opaque",
+			&identity);
+		if (opaque < 0)
+			return opaque;
+		if (!whiteout || opaque ||
+			eunion_node_kind(identity.mode) != EUNION_NODE_REGULAR)
+			return -LINUX_ENOTEMPTY;
+#ifdef TEST
+		++eunion_test_remove_tomb_move_count;
+		if (eunion_test_remove_fail_tomb_move_ordinal ==
+			eunion_test_remove_tomb_move_count)
+			return -LINUX_EIO;
+#endif
+		result = LINUX_SYSCALL(__NR_renameat2, source, name,
+			capability->tomb_descriptor, name, LINUX_RENAME_NOREPLACE);
+		if (result < 0)
+			return result;
+		capability->tomb_contains_originals = 1;
+	}
+}
+
+static int eunion_restore_internal_whiteouts(
+	eunion_remove_capability capability, int destination)
+{
+	char name[EUNION_REMOVE_NAME_MAX + 1];
+	for (;;)
+	{
+		int result = eunion_first_directory_entry(
+			capability->tomb_descriptor, name);
+		if (result < 0)
+			return result;
+		if (result == 0)
+		{
+			capability->tomb_contains_originals = 0;
+			result = eunion_fsync(destination);
+			if (result < 0)
+				return result;
+			return eunion_fsync(capability->tomb_descriptor);
+		}
+		result = LINUX_SYSCALL(__NR_renameat2,
+			capability->tomb_descriptor, name, destination, name,
+			LINUX_RENAME_NOREPLACE);
+		if (result < 0)
+			return result;
+	}
+}
+
+static int eunion_purge_internal_whiteouts(
+	eunion_remove_capability capability)
+{
+	char name[EUNION_REMOVE_NAME_MAX + 1];
+	for (;;)
+	{
+		int result = eunion_first_directory_entry(
+			capability->tomb_descriptor, name);
+		if (result < 0)
+			return result;
+		if (result == 0)
+		{
+			capability->tomb_contains_originals = 0;
+			return eunion_fsync(capability->tomb_descriptor);
+		}
+		result = LINUX_SYSCALL(__NR_unlinkat,
+			capability->tomb_descriptor, name, 0);
+		if (result < 0)
+			return result;
+	}
+}
+
+static int eunion_remove_tomb_directory(
+	eunion_remove_capability capability)
+{
+	int result = 0;
+	if (capability->tomb_descriptor >= 0)
+	{
+		result = LINUX_SYSCALL(__NR_close, capability->tomb_descriptor);
+		capability->tomb_descriptor = -1;
+	}
+	if (result >= 0 && capability->tomb_name[0] != '\0')
+	{
+		result = LINUX_SYSCALL(__NR_unlinkat, capability->work_descriptor,
+			capability->tomb_name, LINUX_AT_REMOVEDIR);
+		if (result == -LINUX_ENOENT)
+			result = 0;
+	}
+	if (result >= 0)
+	{
+		capability->tomb_name[0] = '\0';
+		result = eunion_fsync(capability->work_descriptor);
+	}
+	return result;
+}
+
+static int eunion_dispose_staged_directory(
+	eunion_remove_capability capability)
+{
+	int result = LINUX_SYSCALL(__NR_unlinkat, capability->work_descriptor,
+		capability->stage_name, LINUX_AT_REMOVEDIR);
+	if (result == 0)
+	{
+		capability->phase = EUNION_REMOVE_PHASE_COMMITTED;
+		return 0;
+	}
+	if (result != -LINUX_ENOTEMPTY)
+		return result;
+	if (capability->directory_view_deferred)
+		return -LINUX_ENOTEMPTY;
+
+	int source = LINUX_SYSCALL(__NR_openat, capability->work_descriptor,
+		capability->stage_name,
+		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+		LINUX_O_CLOEXEC, 0);
+	if (source < 0)
+		return source;
+	result = eunion_open_tomb_directory(capability);
+	if (result >= 0)
+		result = eunion_move_internal_whiteouts(capability, source);
+	if (result >= 0)
+	{
+		result = eunion_fsync(source);
+		if (result >= 0)
+			result = eunion_fsync(capability->tomb_descriptor);
+	}
+	if (result >= 0)
+		result = LINUX_SYSCALL(__NR_unlinkat, capability->work_descriptor,
+			capability->stage_name, LINUX_AT_REMOVEDIR);
+	if (result >= 0)
+		capability->phase = EUNION_REMOVE_PHASE_COMMITTED;
+	if (result < 0 && capability->tomb_contains_originals)
+	{
+		int restore_result =
+			eunion_restore_internal_whiteouts(capability, source);
+		if (restore_result < 0)
+			result = restore_result;
+	}
+	int close_result = LINUX_SYSCALL(__NR_close, source);
+	if (result < 0 && close_result < 0)
+		result = close_result;
+	if (result < 0)
+	{
+		int tomb_result = eunion_remove_tomb_directory(capability);
+		if (tomb_result < 0)
+			return tomb_result;
+		return result;
+	}
+
+	// The old upper directory inode is gone. The published namespace is now
+	// irreversible; quarantined internal whiteouts are transaction garbage,
+	// not state that rollback may resurrect.
+	result = eunion_purge_internal_whiteouts(capability);
+	if (result >= 0)
+		result = eunion_remove_tomb_directory(capability);
+	return result;
 }
 
 static int eunion_remove_staged_original(eunion_remove_capability capability)
 {
 	if (capability->plan.action == EUNION_REMOVE_PUBLISH_WHITEOUT)
+	{
+		capability->phase = EUNION_REMOVE_PHASE_COMMITTED;
 		return 0;
+	}
 	int flags = capability->applied_kind == EUNION_NODE_DIRECTORY
 		? LINUX_AT_REMOVEDIR : 0;
-	return LINUX_SYSCALL(__NR_unlinkat, capability->work_descriptor,
-		capability->stage_name, flags);
+	if (flags == LINUX_AT_REMOVEDIR)
+		return eunion_dispose_staged_directory(capability);
+	int result = LINUX_SYSCALL(__NR_unlinkat, capability->work_descriptor,
+		capability->stage_name, 0);
+	if (result >= 0)
+		capability->phase = EUNION_REMOVE_PHASE_COMMITTED;
+	return result;
 }
 
-static int eunion_rollback_applied(eunion_remove_capability capability)
+static int eunion_rollback_namespace(eunion_remove_capability capability,
+	int upper_parent)
 {
-	int upper_parent =
-		capability->upper.descriptor[capability->upper.count - 1];
 	int result = 0;
 	switch (capability->plan.action)
 	{
@@ -1396,9 +1758,66 @@ static int eunion_rollback_applied(eunion_remove_capability capability)
 			result = -LINUX_EIO;
 			break;
 	}
+	return result;
+}
+
+static int eunion_rollback_applied(eunion_remove_capability capability)
+{
+	int upper_parent =
+		capability->upper.descriptor[capability->upper.count - 1];
+	int directory_descriptor = -1;
+	int relaxed_mode = 0;
+	int result = eunion_rollback_namespace(capability, upper_parent);
+	if (result == -LINUX_EACCES &&
+		capability->applied_kind == EUNION_NODE_DIRECTORY &&
+		capability->plan.action != EUNION_REMOVE_PUBLISH_WHITEOUT)
+	{
+		directory_descriptor = LINUX_SYSCALL(__NR_openat,
+			capability->work_descriptor, capability->stage_name,
+			LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+			LINUX_O_CLOEXEC, 0);
+		if (directory_descriptor >= 0)
+		{
+			struct eunion_inode_identity identity;
+			result = eunion_fstat_identity(directory_descriptor, &identity);
+			if (result >= 0 &&
+				eunion_same_object(&identity, &capability->upper_leaf))
+			{
+				result = LINUX_SYSCALL(__NR_fchmodat2,
+					directory_descriptor, "",
+					(capability->upper_leaf.mode & 07777) | 0300,
+					LINUX_AT_EMPTY_PATH);
+				if (result >= 0)
+				{
+					relaxed_mode = 1;
+					result = eunion_rollback_namespace(capability,
+						upper_parent);
+				}
+			}
+			else if (result >= 0)
+				result = -LINUX_EAGAIN;
+		}
+		else
+			result = directory_descriptor;
+	}
+	if (relaxed_mode)
+	{
+		int restore_result = LINUX_SYSCALL(__NR_fchmodat2,
+			directory_descriptor, "",
+			capability->upper_leaf.mode & 07777, LINUX_AT_EMPTY_PATH);
+		if (result >= 0 && restore_result < 0)
+			result = restore_result;
+	}
+	if (directory_descriptor >= 0)
+	{
+		int close_result =
+			LINUX_SYSCALL(__NR_close, directory_descriptor);
+		if (result >= 0 && close_result < 0)
+			result = close_result;
+	}
 	if (result >= 0)
 	{
-		eunion_fsync(upper_parent);
+		eunion_fsync_directory(capability, upper_parent);
 		eunion_fsync(capability->work_descriptor);
 	}
 	return result;
@@ -1408,6 +1827,21 @@ static int eunion_cleanup(eunion_remove_capability capability,
 	int operation_error)
 {
 	int cleanup_error = 0;
+	if (capability->phase == EUNION_REMOVE_PHASE_COMMITTED &&
+		capability->tomb_descriptor >= 0 &&
+		capability->tomb_contains_originals)
+	{
+		int result = eunion_purge_internal_whiteouts(capability);
+		if (result < 0)
+			cleanup_error = result;
+	}
+	if (capability->tomb_descriptor >= 0 &&
+		!capability->tomb_contains_originals)
+	{
+		int result = eunion_remove_tomb_directory(capability);
+		if (result < 0 && cleanup_error == 0)
+			cleanup_error = result;
+	}
 	if (capability->phase == EUNION_REMOVE_PHASE_APPLIED &&
 		operation_error < 0)
 	{
@@ -1418,10 +1852,16 @@ static int eunion_cleanup(eunion_remove_capability capability,
 	if (capability->work_descriptor >= 0 &&
 		capability->stage_name[0] != '\0')
 	{
-		int flags = capability->applied_kind == EUNION_NODE_DIRECTORY
-			? LINUX_AT_REMOVEDIR : 0;
-		int result = LINUX_SYSCALL(__NR_unlinkat,
-			capability->work_descriptor, capability->stage_name, flags);
+		struct eunion_inode_identity staged;
+		int result = eunion_fstatat_identity(capability->work_descriptor,
+			capability->stage_name, &staged);
+		int flags = staged.tag != EUNION_IDENTITY_ABSENT &&
+			eunion_node_kind(staged.mode) == EUNION_NODE_DIRECTORY
+				? LINUX_AT_REMOVEDIR : 0;
+		if (result >= 0 && staged.tag != EUNION_IDENTITY_ABSENT)
+			result = LINUX_SYSCALL(__NR_unlinkat,
+				capability->work_descriptor, capability->stage_name,
+				flags);
 		if (result < 0 && result != -LINUX_ENOENT && cleanup_error == 0)
 			cleanup_error = result;
 		eunion_fsync(capability->work_descriptor);
@@ -1441,7 +1881,7 @@ static int eunion_cleanup(eunion_remove_capability capability,
 				cleanup_error == 0)
 				cleanup_error = result;
 			if (result >= 0)
-				eunion_fsync(parent);
+				eunion_fsync_directory(capability, parent);
 		}
 	}
 	if (capability->lock_held)
@@ -1476,6 +1916,7 @@ int eunion_remove_path(const struct eunion_remove_runtime* runtime,
 		return -LINUX_EINVAL;
 #ifdef TEST
 	eunion_test_remove_fsync_count = 0;
+	eunion_test_remove_tomb_move_count = 0;
 #endif
 	result = eunion_anchor(capability, runtime, guest_path, intent);
 	if (result < 0)
@@ -1510,9 +1951,8 @@ int eunion_remove_path(const struct eunion_remove_runtime* runtime,
 	result = eunion_remove_staged_original(capability);
 	if (result < 0)
 		return eunion_cleanup(capability, result);
-	// Removing the tomb is the irreversible publication boundary. From this
-	// point cleanup must never attempt to resurrect the old namespace entry.
-	capability->phase = EUNION_REMOVE_PHASE_COMMITTED;
+	if (capability->phase != EUNION_REMOVE_PHASE_COMMITTED)
+		return eunion_cleanup(capability, -LINUX_EIO);
 	if (eunion_fsync(capability->work_descriptor) < 0)
 		return eunion_cleanup(capability, -LINUX_EIO);
 	return eunion_cleanup(capability, 0);

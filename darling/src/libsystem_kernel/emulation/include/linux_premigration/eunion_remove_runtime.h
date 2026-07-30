@@ -27,6 +27,8 @@ extern int eunion_test_remove_fail_checkpoint;
 extern int eunion_test_remove_interrupt_checkpoint;
 extern int eunion_test_remove_fail_fsync_ordinal;
 extern int eunion_test_remove_fsync_count;
+extern int eunion_test_remove_fail_tomb_move_ordinal;
+extern int eunion_test_remove_tomb_move_count;
 extern void (*eunion_test_remove_checkpoint_hook)(
 	enum eunion_remove_test_checkpoint checkpoint,
 	const char* guest_path
