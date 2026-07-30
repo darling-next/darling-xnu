@@ -130,7 +130,13 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 	// that for other syscalls, we either have to check for this and use an
 	// `l` variant (e.g. `llistxattr` instead of `listxatrr`) or we're screwed
 
-	ret = LINUX_SYSCALL(__NR_openat, vc.dfd, vc.path, linux_flags, mode);
+	#ifdef EUNION
+	if (union_path == 0 && (flags & BSD_O_CREAT))
+		ret = vchroot_open_create(guest_path, linux_flags, mode);
+	else
+	#endif
+		ret = LINUX_SYSCALL(__NR_openat,
+			vc.dfd, vc.path, linux_flags, mode);
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 

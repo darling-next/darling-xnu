@@ -30,17 +30,34 @@ long sys_linkat(int fd, const char* path, int fdlink, const char* link, int flag
 	strcpy(vc2.path, link);
 
 #ifdef EUNION
-	// hardlink: the source must live in the writable upper layer (you cannot link
-	// a file out of the read-only template into it), and the new name must clear
-	// any whiteout. Note: copy-up breaks link identity (st_nlink resets) -- same
-	// behaviour as gVisor; documented in DESIGN.md.
-	if (path[0] == '/') {
-		int wr = vchroot_prepare_write(path);
+	char source_guest[4096];
+	char destination_guest[4096];
+	int source_union = vchroot_canonical_guest_path(
+		vc.dfd, path, source_guest, sizeof(source_guest));
+	int destination_union = vchroot_canonical_guest_create_path(
+		vc2.dfd, link, destination_guest, sizeof(destination_guest));
+	if (source_union < 0)
+		return errno_linux_to_bsd(source_union);
+	if (destination_union < 0)
+		return errno_linux_to_bsd(destination_union);
+	if ((source_union == 0) != (destination_union == 0))
+		return EXDEV;
+	if (source_union == 0) {
+		int wr = vchroot_prepare_write(source_guest);
 		if (wr < 0)
 			return errno_linux_to_bsd(wr);
+		wr = vchroot_prepare_create(destination_guest);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+		linux_flags = atflags_bsd_to_linux(flag);
+		if (linux_flags == LINUX_AT_INVALID)
+			return -EINVAL;
+		ret = vchroot_link_create(
+			source_guest, destination_guest, linux_flags);
+		if (ret < 0)
+			return errno_linux_to_bsd(ret);
+		return 0;
 	}
-	if (link[0] == '/')
-		vchroot_pre_mkdir(link);
 #endif
 
 	ret = vchroot_expand(&vc);

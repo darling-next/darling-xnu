@@ -34,18 +34,25 @@ long sys_bind(int fd, const void* name, int socklen)
 			const char* p = ((const struct sockaddr_un*) name)->sun_path;
 			if (p[0] == '/')
 			{
-				// A socket path is a create operation. Use the common create policy
-				// rather than copying its literal parent: the parent can itself be a
-				// lower-only symlink (for example /var/run), whose real target must
-				// also be materialized in the writable upper layer.
-				ret = vchroot_prepare_create(p);
+				char guest_path[4096];
+				int union_path = vchroot_canonical_guest_create_path(
+					get_perthread_wd(), p,
+					guest_path, sizeof(guest_path));
+				if (union_path < 0)
+					return errno_linux_to_bsd(union_path);
+				if (union_path != 0)
+					goto ordinary_bind;
+				ret = vchroot_prepare_create(guest_path);
 				if (ret < 0)
 					return errno_linux_to_bsd(ret);
+				ret = vchroot_socket_bind_create(fd, guest_path);
+				return ret < 0 ? errno_linux_to_bsd(ret) : 0;
 			}
 		}
 	}
 #endif
 
+ordinary_bind:
 	fixed = __builtin_alloca(sockaddr_fixup_size_from_bsd(name, socklen));
 	ret = socklen = sockaddr_fixup_from_bsd(fixed, name, socklen);
 	if (ret < 0)

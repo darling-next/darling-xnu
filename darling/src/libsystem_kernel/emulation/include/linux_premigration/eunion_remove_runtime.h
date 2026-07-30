@@ -33,6 +33,7 @@ extern void (*eunion_test_remove_checkpoint_hook)(
 	enum eunion_remove_test_checkpoint checkpoint,
 	const char* guest_path
 );
+extern void (*eunion_test_remove_permission_lift_hook)(void);
 int eunion_test_remove_capability_reopen(
 	const struct eunion_remove_runtime* runtime, const char* guest_path,
 	enum eunion_operation_intent intent);

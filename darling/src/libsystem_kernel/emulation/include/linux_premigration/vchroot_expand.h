@@ -56,8 +56,6 @@ void vchroot_dir_rewind(int fd);
 int vchroot_dir_dup(int oldfd, int newfd);
 // Thin policy helpers the syscall-emulation sites call (see vchroot_userspace.c):
 //   vchroot_prepare_write(guest) BEFORE a write/mutate (expand then hits upper);
-//   vchroot_post_unlink(guest)   AFTER a successful unlink/rmdir;
-//   vchroot_pre_mkdir(guest)     BEFORE re-creating a possibly-deleted name.
 int vchroot_prepare_write(const char* guest);
 // Convert an absolute or dirfd-relative syscall path into a canonical absolute
 // guest path. Returns 0 for a path inside the union, 1 for an unmanaged path,
@@ -90,10 +88,14 @@ int vchroot_fd_for_content_write(int fd);
 // retain the ordinary syscall path.
 int vchroot_remove_at(int dfd, const char* path, int remove_directory,
 	int* handled);
-// BEFORE a rename destination is committed: copy up the dest's parent dir and
-// whiteout a lower-only dest namesake, so the host rename lands in the upper
-// layer and never moves into / overwrites the shared template.
+// BEFORE a rename transaction begins: copy up only the destination parent.
+// Destination masking and source retirement are published atomically by
+// vchroot_rename_path().
 int vchroot_prepare_rename_dest(const char* guest);
+// Rename one managed guest path to another through the durable sidecar
+// transaction. Both paths must already have their writable parents/source
+// materialized.
+int vchroot_rename_path(const char* old_guest, const char* new_guest);
 // Return the concrete writable host path for a managed guest path. This is used
 // after a mutation transaction has prepared an upper destination (for example,
 // a rename over a lower-only name that now carries a whiteout). Returns zero for
@@ -106,8 +108,20 @@ int vchroot_prepare_create(const char* guest);
 // where the create syscall must run. This avoids resolving a lower namesake back
 // to the template after the parent has been prepared.
 int vchroot_prepare_create_path(const char* guest, char* out, int cap);
-int vchroot_post_unlink(const char* guest);
-int vchroot_pre_mkdir(const char* guest);
+// Execute a create while holding the sidecar transaction capability. These
+// entrypoints journal before the backing syscall and publish marker state only
+// after the exact new inode is known.
+int vchroot_open_create(
+	const char* guest, int linux_flags, unsigned int mode);
+int vchroot_mkdir_create(const char* guest, unsigned int mode);
+int vchroot_symlink_create(
+	const char* target, const char* guest, unsigned int mode);
+int vchroot_mknod_create(
+	const char* guest, unsigned int mode, unsigned int device);
+int vchroot_link_create(const char* source_guest,
+	const char* destination_guest, int flags);
+int vchroot_socket_bind_create(
+	int socket_descriptor, const char* guest);
 #endif // EUNION
 
 #endif // _VCHROOT_EXPAND_H

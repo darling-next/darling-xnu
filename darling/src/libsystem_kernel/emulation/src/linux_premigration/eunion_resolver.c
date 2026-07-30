@@ -122,6 +122,27 @@ int eunion_resolve_path(const struct eunion_resolver* resolver,
 		strcpy(result->host_path, upper);
 		return 0;
 	}
+	/*
+	 * An external sidecar whiteout intentionally has no upper placeholder.
+	 * Marker backends must therefore be consulted after an absent upper lookup
+	 * as well. The legacy xattr backend still returns false for an absent path.
+	 */
+	status = resolver->ops.marker_status(resolver->context, upper,
+		resolver->whiteout_marker);
+	if (status < 0)
+	{
+		result->layer = EUNION_RESOLVER_ERROR;
+		result->error = status;
+		strcpy(result->host_path, upper);
+		return 0;
+	}
+	if (status > 0)
+	{
+		result->layer = EUNION_RESOLVER_WHITEOUT;
+		strcpy(result->host_path, upper);
+		result->error = resolver->missing_status;
+		return 0;
+	}
 
 	status = eunion_parent(guest_path, parent, sizeof(parent));
 	if (status < 0)

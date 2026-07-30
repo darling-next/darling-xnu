@@ -52,22 +52,20 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 	}
 #endif
 
-	ret = LINUX_SYSCALL(__NR_mkdirat, vc.dfd, vc.path, mode);
+	#ifdef EUNION
+	if (union_path == 0)
+		ret = vchroot_mkdir_create(guest_path, mode);
+	else
+	#endif
+		ret = LINUX_SYSCALL(__NR_mkdirat, vc.dfd, vc.path, mode);
 
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
 #ifdef EUNION
-	// If the new dir shadows a LOWER directory (delete-recreate of a populated
-	// dir), mark it opaque so the stale lower children are not re-merged. Only
-	// meaningful for an absolute guest path; best-effort (a failed opaque-set does
-	// not undo the successful mkdir, but the dir would then leak lower content --
-	// so surface the error to the caller).
-	if (union_path == 0) {
-		int op = vchroot_post_mkdir(guest_path);
-		if (op < 0)
-			return errno_linux_to_bsd(op);
-	}
+	// The managed create transaction publishes the exact opaque/index record
+	// after mkdir succeeds; no post-syscall marker mutation is permitted here.
+	(void)guest_path;
 #endif
 
 	return 0;
