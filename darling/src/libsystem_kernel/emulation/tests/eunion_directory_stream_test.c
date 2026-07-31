@@ -21,6 +21,8 @@
 enum {
 	LARGE_ENTRY_COUNT = 2600,
 	WHITEOUT_COUNT = 96,
+	DESCRIPTOR_PRESSURE_COUNT = 320,
+	PAGE_CAPTURE_CAPACITY = 512,
 };
 
 static int checks;
@@ -254,6 +256,96 @@ static int collect_page_names(
 	return found;
 }
 
+struct page_capture {
+	int result;
+	int length;
+	char page[PAGE_CAPTURE_CAPACITY];
+};
+
+static int write_full(int descriptor, const void* data, size_t size)
+{
+	const unsigned char* cursor = data;
+	while (size > 0) {
+		ssize_t written = write(descriptor, cursor, size);
+		if (written <= 0)
+			return -1;
+		cursor += written;
+		size -= (size_t)written;
+	}
+	return 0;
+}
+
+static int read_full(int descriptor, void* data, size_t size)
+{
+	unsigned char* cursor = data;
+	while (size > 0) {
+		ssize_t received = read(descriptor, cursor, size);
+		if (received <= 0)
+			return -1;
+		cursor += received;
+		size -= (size_t)received;
+	}
+	return 0;
+}
+
+static struct page_capture capture_page(int descriptor)
+{
+	struct page_capture capture = {
+		.result = 0,
+		.length = 0,
+	};
+	capture.length = vchroot_getdents_merge(
+		descriptor, capture.page, sizeof(capture.page));
+	if (capture.length < 0)
+		capture.result = capture.length;
+	return capture;
+}
+
+static void collect_two_nonoverlapping_pages(
+	const struct page_capture* first,
+	const struct page_capture* second,
+	const char* message)
+{
+	require(first->result == 0 && first->length > 0 &&
+			second->result == 0 && second->length > 0,
+		message);
+	unsigned char seen[LARGE_ENTRY_COUNT] = {0};
+	int total = collect_page_names(first->page, first->length, seen);
+	total += collect_page_names(second->page, second->length, seen);
+	require(total > 1, "shared open-file-description cursor advances");
+}
+
+static int run_exec_reader(int argc, char** argv)
+{
+	if (argc != 6)
+		return 120;
+	int directory_descriptor = atoi(argv[2]);
+	int result_descriptor = atoi(argv[3]);
+	const char* upper = argv[4];
+	const char* lower = argv[5];
+	memcpy(prefix_path, upper, strlen(upper) + 1);
+	prefix_path_len = (int)strlen(prefix_path);
+	set_libexec_path(lower);
+	int upper_descriptor = open(upper,
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	if (upper_descriptor < 0)
+		return 121;
+	int result = eunion_init_from_prefix(upper_descriptor);
+	struct page_capture capture = {
+		.result = result,
+		.length = 0,
+	};
+	if (result == 0)
+		capture = capture_page(directory_descriptor);
+	int write_result = write_full(
+		result_descriptor, &capture, sizeof(capture));
+	int release_result = eunion_sidecar_runtime_release(
+		&eunion_anchored_runtime);
+	close(upper_descriptor);
+	close(result_descriptor);
+	return write_result == 0 && release_result == 0 ? 0 : 122;
+}
+
 struct parallel_reader {
 	int descriptor;
 	unsigned char* seen;
@@ -281,6 +373,169 @@ static void* drain_merged_directory(void* context)
 			page, length, reader->seen);
 		pthread_mutex_unlock(reader->lock);
 	}
+}
+
+struct concurrent_closer {
+	int descriptor;
+	int result;
+};
+
+static void* close_merged_duplicate(void* context)
+{
+	struct concurrent_closer* closer = context;
+	closer->result = close(closer->descriptor);
+	return NULL;
+}
+
+static void run_duplication_routes(int directory_descriptor)
+{
+	require(lseek(directory_descriptor, 0, SEEK_SET) == 0,
+		"rewind merged cursor through kernel OFD");
+	int duplicate = dup(directory_descriptor);
+	require(duplicate >= 0, "dup merged directory descriptor");
+	struct page_capture first = capture_page(directory_descriptor);
+	struct page_capture second = capture_page(duplicate);
+	collect_two_nonoverlapping_pages(
+		&first, &second, "dup shares kernel OFD cursor");
+	require(close(duplicate) == 0, "close dup descriptor");
+
+	require(lseek(directory_descriptor, 0, SEEK_SET) == 0,
+		"rewind before dup2 route");
+	int dup2_target = open("/dev/null", O_RDONLY | O_CLOEXEC);
+	require(dup2_target >= 0 &&
+			dup2(directory_descriptor, dup2_target) == dup2_target,
+		"dup2 merged directory descriptor");
+	first = capture_page(directory_descriptor);
+	second = capture_page(dup2_target);
+	collect_two_nonoverlapping_pages(
+		&first, &second, "dup2 shares kernel OFD cursor");
+	require(close(dup2_target) == 0, "close dup2 descriptor");
+
+	require(lseek(directory_descriptor, 0, SEEK_SET) == 0,
+		"rewind before F_DUPFD route");
+	int fcntl_duplicate = fcntl(directory_descriptor, F_DUPFD, 0);
+	require(fcntl_duplicate >= 0, "F_DUPFD merged directory descriptor");
+	first = capture_page(directory_descriptor);
+	second = capture_page(fcntl_duplicate);
+	collect_two_nonoverlapping_pages(
+		&first, &second, "F_DUPFD shares kernel OFD cursor");
+	require(close(fcntl_duplicate) == 0, "close F_DUPFD descriptor");
+
+#ifdef F_DUPFD_CLOEXEC
+	require(lseek(directory_descriptor, 0, SEEK_SET) == 0,
+		"rewind before F_DUPFD_CLOEXEC route");
+	int cloexec_duplicate =
+		fcntl(directory_descriptor, F_DUPFD_CLOEXEC, 0);
+	require(cloexec_duplicate >= 0,
+		"F_DUPFD_CLOEXEC merged directory descriptor");
+	first = capture_page(directory_descriptor);
+	second = capture_page(cloexec_duplicate);
+	collect_two_nonoverlapping_pages(
+		&first, &second, "F_DUPFD_CLOEXEC shares kernel OFD cursor");
+	require(close(cloexec_duplicate) == 0,
+		"close F_DUPFD_CLOEXEC descriptor");
+#endif
+}
+
+static void run_fork_cursor(
+	const char* upper_large)
+{
+	int descriptor = open(upper_large,
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	require(descriptor >= 0, "open fork cursor directory");
+	int results[2];
+	require(pipe(results) == 0, "create fork cursor result pipe");
+	pid_t child = fork();
+	require(child >= 0, "fork merged cursor reader");
+	if (child == 0) {
+		close(results[0]);
+		struct page_capture capture = capture_page(descriptor);
+		int write_result = write_full(
+			results[1], &capture, sizeof(capture));
+		close(results[1]);
+		_exit(write_result == 0 ? 0 : 123);
+	}
+	close(results[1]);
+	struct page_capture child_page;
+	require(read_full(results[0], &child_page,
+			sizeof(child_page)) == 0,
+		"receive fork child page");
+	close(results[0]);
+	int status;
+	require(waitpid(child, &status, 0) == child &&
+			WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		"fork child exits cleanly");
+	struct page_capture parent_page = capture_page(descriptor);
+	collect_two_nonoverlapping_pages(
+		&child_page, &parent_page,
+		"fork shares cursor through kernel OFD");
+	require(close(descriptor) == 0, "close fork cursor directory");
+}
+
+static void run_exec_cursor(
+	const char* upper_large, const char* upper, const char* lower)
+{
+	int descriptor = open(upper_large, O_RDONLY | O_DIRECTORY);
+	require(descriptor >= 0, "open exec cursor directory");
+	struct page_capture parent_page = capture_page(descriptor);
+	int results[2];
+	require(pipe(results) == 0, "create exec cursor result pipe");
+	pid_t child = fork();
+	require(child >= 0, "fork exec cursor reader");
+	if (child == 0) {
+		close(results[0]);
+		char descriptor_argument[32];
+		char result_argument[32];
+		require(snprintf(descriptor_argument,
+				sizeof(descriptor_argument), "%d", descriptor) > 0,
+			"format exec directory descriptor");
+		require(snprintf(result_argument,
+				sizeof(result_argument), "%d", results[1]) > 0,
+			"format exec result descriptor");
+		char* arguments[] = {
+			"/proc/self/exe",
+			"--exec-reader",
+			descriptor_argument,
+			result_argument,
+			(char*)upper,
+			(char*)lower,
+			NULL,
+		};
+		execv(arguments[0], arguments);
+		_exit(124);
+	}
+	close(results[1]);
+	struct page_capture child_page;
+	require(read_full(results[0], &child_page,
+			sizeof(child_page)) == 0,
+		"receive exec child page");
+	close(results[0]);
+	int status;
+	require(waitpid(child, &status, 0) == child &&
+			WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		"exec child exits cleanly");
+	collect_two_nonoverlapping_pages(
+		&parent_page, &child_page,
+		"exec preserves cursor through kernel OFD");
+	require(close(descriptor) == 0, "close exec cursor directory");
+}
+
+static void run_descriptor_pressure(const char* upper_large)
+{
+	int descriptors[DESCRIPTOR_PRESSURE_COUNT];
+	memset(descriptors, -1, sizeof(descriptors));
+	for (int index = 0; index < DESCRIPTOR_PRESSURE_COUNT; ++index) {
+		descriptors[index] = open(upper_large,
+			O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		require(descriptors[index] >= 0,
+			"system accepts descriptor pressure fixture");
+		struct page_capture page = capture_page(descriptors[index]);
+		require(page.result == 0 && page.length > 0,
+			"merged cursor has no private descriptor cap");
+	}
+	for (int index = 0; index < DESCRIPTOR_PRESSURE_COUNT; ++index)
+		require(close(descriptors[index]) == 0,
+			"close descriptor pressure fixture");
 }
 
 static void run_large_listing(
@@ -324,33 +579,14 @@ static void run_large_listing(
 	require(total == LARGE_ENTRY_COUNT,
 		"paged merged listing emits every >64KiB entry");
 
-	vchroot_dir_rewind(descriptor);
-	++checks;
-	int duplicate = dup(descriptor);
-	require(duplicate >= 0 && vchroot_dir_dup(descriptor, duplicate) == 0,
-		"duplicate merged directory description");
-	char first_page[512], second_page[512];
-	int first_length = vchroot_getdents_merge(
-		descriptor, first_page, sizeof(first_page));
-	int second_length = vchroot_getdents_merge(
-		duplicate, second_page, sizeof(second_page));
-	require(first_length > 0 && second_length > 0,
-		"duplicated descriptors stream pages");
-	unsigned char shared_seen[LARGE_ENTRY_COUNT] = {0};
-	int shared_total = collect_page_names(
-		first_page, first_length, shared_seen);
-	shared_total += collect_page_names(
-		second_page, second_length, shared_seen);
-	require(shared_total > 0,
-		"duplicated descriptors share a non-overlapping cursor");
-
-	vchroot_dir_rewind(descriptor);
+	run_duplication_routes(descriptor);
+	require(lseek(descriptor, 0, SEEK_SET) == 0,
+		"rewind before parallel readers");
 	int third = dup(descriptor);
 	int fourth = dup(descriptor);
-	require(third >= 0 && fourth >= 0 &&
-			vchroot_dir_dup(descriptor, third) == 0 &&
-			vchroot_dir_dup(descriptor, fourth) == 0,
-		"bind all parallel descriptor duplicates");
+	int concurrently_closed = dup(descriptor);
+	require(third >= 0 && fourth >= 0 && concurrently_closed >= 0,
+		"duplicate all parallel directory descriptors");
 	unsigned char parallel_seen[LARGE_ENTRY_COUNT] = {0};
 	pthread_mutex_t parallel_lock = PTHREAD_MUTEX_INITIALIZER;
 	int parallel_total = 0;
@@ -360,26 +596,36 @@ static void run_large_listing(
 		{fourth, parallel_seen, &parallel_lock, &parallel_total, 0},
 	};
 	pthread_t threads[3];
+	struct concurrent_closer closer = {
+		.descriptor = concurrently_closed,
+		.result = -1,
+	};
+	pthread_t close_thread;
 	for (int index = 0; index < 3; ++index)
 		require(pthread_create(&threads[index], NULL,
 				drain_merged_directory, &readers[index]) == 0,
 			"start parallel directory reader");
+	require(pthread_create(&close_thread, NULL,
+			close_merged_duplicate, &closer) == 0,
+		"start concurrent sibling close");
 	for (int index = 0; index < 3; ++index)
 		require(pthread_join(threads[index], NULL) == 0 &&
 				readers[index].result == 0,
 			"join parallel directory reader");
+	require(pthread_join(close_thread, NULL) == 0 &&
+			closer.result == 0,
+		"concurrent sibling close preserves shared OFD");
 	require(parallel_total == LARGE_ENTRY_COUNT,
 		"parallel duplicated readers share one complete cursor");
 	require(pthread_mutex_destroy(&parallel_lock) == 0,
 		"destroy parallel reader lock");
-	vchroot_dir_closed(third);
-	vchroot_dir_closed(fourth);
 	require(close(third) == 0 && close(fourth) == 0,
 		"close parallel duplicates");
-	vchroot_dir_closed(duplicate);
-	require(close(duplicate) == 0, "close duplicate");
-	vchroot_dir_closed(descriptor);
 	require(close(descriptor) == 0, "close merged directory");
+
+	run_fork_cursor(upper_large);
+	run_exec_cursor(upper_large, upper, lower);
+	run_descriptor_pressure(upper_large);
 }
 
 static void run_whiteout_pressure(
@@ -439,7 +685,6 @@ static void run_whiteout_pressure(
 	require(vchroot_getdents_merge(
 			descriptor, full_page, sizeof(full_page)) > 0,
 		"failed small page does not consume NAME_MAX entry");
-	vchroot_dir_closed(descriptor);
 	require(close(descriptor) == 0,
 		"close NAME_MAX merged directory");
 }
@@ -484,8 +729,11 @@ static void run_deep_path(
 		"deep sidecar record remains addressable");
 }
 
-int main(void)
+int main(int argc, char** argv)
 {
+	if (argc > 1 && strcmp(argv[1], "--exec-reader") == 0)
+		return run_exec_reader(argc, argv);
+
 	run_first_boot_crash_recovery();
 	run_full_first_boot_race();
 
@@ -530,7 +778,10 @@ int main(void)
 	require(snprintf(command, sizeof(command), "rm -rf -- '%s'", root) > 0,
 		"construct stream cleanup");
 	require(system(command) == 0, "remove stream fixture");
-	printf("EUNION_DIRECTORY_STREAM_OK checks=%d entries=%d\n",
-		checks, LARGE_ENTRY_COUNT);
+	printf(
+		"EUNION_DIRECTORY_STREAM_OK checks=%d visible_entries=%d "
+		"descriptor_pressure=%d dup2=PASS f_dupfd=PASS "
+		"fork=PASS exec=PASS concurrent_close=PASS\n",
+		checks, LARGE_ENTRY_COUNT, DESCRIPTOR_PRESSURE_COUNT);
 	return 0;
 }

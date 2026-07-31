@@ -87,8 +87,34 @@ def eunion_5() -> None:
 
 
 def eunion_6() -> None:
-    require(VCHROOT_H, "int vchroot_getdents_merge(int fd, char* out, int cap);", "void vchroot_dir_closed(int fd);")
-    require(VCHROOT_C, "int vchroot_getdents_merge(int fd, char* out, int cap)", "void vchroot_dir_closed(int fd)")
+    require(
+        VCHROOT_H,
+        "int vchroot_getdents_merge(int fd, char* out, int cap);",
+        "kernel open-file-description offset",
+    )
+    require(
+        VCHROOT_C,
+        "int vchroot_getdents_merge(int fd, char* out, int cap)",
+        "__NR_lseek, fd, 0, LINUX_SEEK_CUR",
+        "EUNION_SIDECAR_ACCESS_EXCLUSIVE",
+    )
+    require_not(
+        VCHROOT_C,
+        "EUNION_MAXDIRS",
+        "eunion_dir_descriptions",
+        "eunion_dirs_lock_word",
+        "void vchroot_dir_closed(int fd)",
+        "void vchroot_dir_rewind(int fd)",
+        "int vchroot_dir_dup(int oldfd, int newfd)",
+    )
+    for wrapper in (
+        FD_DUP_C,
+        FD_DUP2_C,
+        FD_FCNTL_C,
+        "darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/unistd/close.c",
+        "darling/src/libsystem_kernel/emulation/src/xnu_syscall/bsd/impl/unistd/lseek.c",
+    ):
+        require_not(wrapper, "vchroot_dir_dup", "vchroot_dir_closed", "vchroot_dir_rewind")
 
 
 def eunion_7() -> None:

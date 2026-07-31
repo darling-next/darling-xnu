@@ -41,6 +41,16 @@ guest namespace:
 ```
 
 `active-v1` is published only after the complete sidecar tree is durable.
+Lifecycle publication intentionally precedes that runtime activation. The
+launcher atomically publishes the upper root, its bound
+`.darling-prefix-state-v3` record and an empty sidecar directory. That exact
+versioned tuple is the typed `UNINITIALIZED` state. On first guest boot, the
+runtime takes the persistent sidecar lock and performs the crash-recoverable
+`UNINITIALIZED -> VALID` transition by creating `format-v1`, `tree-v1`,
+`staging-v1` and finally `active-v1`. Concurrent first boots join the same
+transaction; cleanup removes only objects owned by the initializing
+transaction.
+
 The launcher anchors the upper root, its parent, workdir, sidecar and
 persistent lifecycle lock component-by-component with `O_NOFOLLOW`. It passes
 only retained descriptors to Darlingserver. The server validates every
@@ -53,11 +63,16 @@ sidecar pathname is returned to guest code.
 
 ## Version gate and Policy 1 recreation
 
-New prefixes are constructed directly in sidecar-v1 format. A legacy,
-unversioned, partially initialized, or incompatible prefix returns the typed
+New prefixes are constructed directly in the versioned sidecar-v1 protocol.
+The only accepted pre-activation state is an empty sidecar whose exact inode
+is bound by a valid `.darling-prefix-state-v3`; inspection reports it as
+`UNINITIALIZED` without mutation. An empty sidecar without that binding, a
+legacy prefix, or an incompatible layout returns the typed
 `PREFIX_RECREATE_REQUIRED` verdict before guest boot and before mutation.
-There is no automatic migration, partial sidecar activation, physical-marker
-fallback, or privileged migrator.
+A nonempty sidecar without a valid activation is either an initializer-owned
+recoverable layout under `lock-v1` or corruption; it is never silently treated
+as fresh. There is no automatic migration, partial sidecar activation,
+physical-marker fallback, or privileged migrator.
 
 Recreation is a separate explicit launcher command with exact confirmation.
 It takes the persistent lifecycle lock, checks the retained prefix name,

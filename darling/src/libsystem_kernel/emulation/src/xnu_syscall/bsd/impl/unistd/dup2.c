@@ -7,10 +7,6 @@
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/common/guarded/table.h>
-#ifdef EUNION
-#include <darling/emulation/linux_premigration/vchroot_expand.h>
-#endif
-
 extern void kqueue_dup(int oldfd, int newfd);
 
 long sys_dup2(int fd_from, int fd_to)
@@ -35,13 +31,6 @@ long sys_dup2(int fd_from, int fd_to)
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 	else {
-	#ifdef EUNION
-		int state_ret = vchroot_dir_dup(fd_from, fd_to);
-		if (state_ret < 0) {
-			LINUX_SYSCALL1(__NR_close, fd_to);
-			return errno_linux_to_bsd(state_ret);
-		}
-	#endif
 		kqueue_dup(fd_from, fd_to);
 	}
 

@@ -119,8 +119,8 @@ int main(void)
 	};
 	struct eunion_prefix_format_inspection inspection;
 	require(eunion_sidecar_inspect_prefix(&runtime, &inspection) == 0 &&
-		inspection.verdict == EUNION_PREFIX_FORMAT_UNINITIALIZED,
-		"empty sidecar is uninitialized before lifecycle validation");
+		inspection.verdict == EUNION_PREFIX_RECREATE_REQUIRED,
+		"unversioned empty sidecar requires explicit lifecycle recreation");
 	require(access(activation, F_OK) == -1 && errno == ENOENT,
 		"inspection does not mutate unversioned prefix");
 
@@ -132,8 +132,8 @@ int main(void)
 		lstat(legacy_work, &work_before) == 0,
 		"snapshot legacy prefix");
 	require(eunion_sidecar_inspect_prefix(&runtime, &inspection) == 0 &&
-		inspection.verdict == EUNION_PREFIX_FORMAT_UNINITIALIZED,
-		"inspection does not infer format from guest-visible contents");
+		inspection.verdict == EUNION_PREFIX_RECREATE_REQUIRED,
+		"guest-visible contents do not create a versioned uninitialized state");
 	struct stat legacy_after;
 	struct stat work_after;
 	require(lstat(legacy_payload, &legacy_after) == 0 &&
@@ -156,6 +156,11 @@ int main(void)
 	require(unlink(legacy_payload) == 0 && rmdir(legacy_work) == 0,
 		"clear legacy fixture explicitly");
 	write_prefix_state(upper, sidecar);
+	require(eunion_sidecar_inspect_prefix(&runtime, &inspection) == 0 &&
+		inspection.verdict == EUNION_PREFIX_FORMAT_UNINITIALIZED,
+		"prefix-state-v3 plus empty sidecar is typed UNINITIALIZED");
+	require(access(activation, F_OK) == -1 && errno == ENOENT,
+		"typed UNINITIALIZED inspection remains non-mutating");
 	require(eunion_sidecar_initialize(&runtime) == 0,
 		"fresh prefix initializes directly as sidecar v1");
 	require(eunion_sidecar_inspect_prefix(&runtime, &inspection) == 0 &&

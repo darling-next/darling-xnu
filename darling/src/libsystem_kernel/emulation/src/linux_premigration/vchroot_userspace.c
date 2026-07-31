@@ -143,6 +143,12 @@ static void set_libexec_path(const char* p)
 #ifndef LINUX_ENOTDIR
 #define LINUX_ENOTDIR 20
 #endif
+#ifndef LINUX_SEEK_SET
+#define LINUX_SEEK_SET 0
+#endif
+#ifndef LINUX_SEEK_CUR
+#define LINUX_SEEK_CUR 1
+#endif
 
 extern void* malloc(__SIZE_TYPE__ size);
 extern void free(void* pointer);
@@ -151,9 +157,11 @@ static int eunion_lstat(const char* host, stat_t* st); // defined below
 
 // A sidecar-v1 prefix is the only supported E-UNION runtime format. The
 // external activation record is validated before the union becomes visible.
-// Missing activation is a typed legacy verdict: boot must stop and an explicit
-// lifecycle-owned recreate must be requested. There is no physical-whiteout
-// fallback and inspection never mutates the prefix.
+// A missing activation is accepted only for the versioned UNINITIALIZED tuple:
+// a valid prefix-state-v3 binding plus an empty sidecar. The runtime completes
+// that state under the persistent lock. Every unversioned or incompatible
+// layout requires explicit lifecycle-owned recreation. There is no
+// physical-whiteout fallback and inspection never mutates the prefix.
 static int eunion_init_from_prefix(int prefix_descriptor)
 {
 	if (eunion_anchored_runtime.anchored)
@@ -1525,169 +1533,17 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 	return result;
 }
 
-// -------- E-UNION paged getdents merge (per-fd state) --------------------
+// -------- E-UNION paged getdents merge (kernel OFD state) ----------------
 //
 // getdirentries works on an fd and streams the directory in pages. Duplicated
-// descriptors share one open file description and therefore one merged cursor.
-// Keep a synchronized descriptor-to-description binding table and one growable
-// name stream per description. The emulation site calls:
-//   vchroot_getdents_merge(fd, out, cap)  instead of raw getdents64(fd, ...)
-//   vchroot_dir_closed(fd)                from close()/closedir() teardown
-//   vchroot_dir_dup(oldfd, newfd)          after every fd duplication route
-// rewinddir (lseek(fd,0)) resets the shared description, not just one fd.
-
-#define EUNION_MAXDIRS  256
-
-struct eunion_dir_description
-{
-	int references;
-	int ready;
-	int cursor;
-	char guest[4096];
-	struct eunion_name_buffer names;
-};
-
-struct eunion_dir_binding
-{
-	int fd;
-	struct eunion_dir_description* description;
-};
-
-static struct eunion_dir_binding eunion_dirs[EUNION_MAXDIRS];
-static struct eunion_dir_description
-	eunion_dir_descriptions[EUNION_MAXDIRS];
-static int eunion_dirs_inited = 0;
-static int eunion_dirs_lock_word;
-
-static void eunion_dirs_lock(void)
-{
-	while (__atomic_exchange_n(
-			&eunion_dirs_lock_word, 1, __ATOMIC_ACQUIRE) != 0)
-		LINUX_SYSCALL(__NR_sched_yield);
-}
-
-static void eunion_dirs_unlock(void)
-{
-	__atomic_store_n(&eunion_dirs_lock_word, 0, __ATOMIC_RELEASE);
-}
-
-static void eunion_dirs_init_locked(void)
-{
-	if (!eunion_dirs_inited) {
-		for (int i = 0; i < EUNION_MAXDIRS; ++i)
-			eunion_dirs[i].fd = -1;
-		eunion_dirs_inited = 1;
-	}
-}
-
-static struct eunion_dir_binding* eunion_dir_find_locked(int fd)
-{
-	eunion_dirs_init_locked();
-	for (int i = 0; i < EUNION_MAXDIRS; i++)
-		if (eunion_dirs[i].fd == fd)
-			return &eunion_dirs[i];
-	return 0;
-}
-
-static void eunion_dir_description_release_locked(
-	struct eunion_dir_description* description)
-{
-	if (!description || description->references <= 0)
-		return;
-	if (--description->references == 0) {
-		eunion_name_buffer_release(&description->names);
-		memset(description, 0, sizeof(*description));
-	}
-}
-
-static void eunion_dir_binding_close_locked(
-	struct eunion_dir_binding* binding)
-{
-	if (!binding)
-		return;
-	eunion_dir_description_release_locked(binding->description);
-	binding->fd = -1;
-	binding->description = 0;
-}
-
-static struct eunion_dir_binding* eunion_dir_binding_alloc_locked(int fd)
-{
-	for (int i = 0; i < EUNION_MAXDIRS; ++i) {
-		if (eunion_dirs[i].fd == -1) {
-			eunion_dirs[i].fd = fd;
-			eunion_dirs[i].description = 0;
-			return &eunion_dirs[i];
-		}
-	}
-	return 0;
-}
-
-static struct eunion_dir_description*
-eunion_dir_description_alloc_locked(void)
-{
-	for (int i = 0; i < EUNION_MAXDIRS; ++i) {
-		if (eunion_dir_descriptions[i].references == 0) {
-			memset(&eunion_dir_descriptions[i], 0,
-				sizeof(eunion_dir_descriptions[i]));
-			eunion_dir_descriptions[i].references = 1;
-			eunion_dir_descriptions[i].names.growable = 1;
-			return &eunion_dir_descriptions[i];
-		}
-	}
-	return 0;
-}
-
-// Free one descriptor binding. The shared cursor lives until the last
-// descriptor referencing the open file description is closed.
-void vchroot_dir_closed(int fd)
-{
-	eunion_dirs_lock();
-	eunion_dir_binding_close_locked(eunion_dir_find_locked(fd));
-	eunion_dirs_unlock();
-}
-
-void vchroot_dir_rewind(int fd)
-{
-	eunion_dirs_lock();
-	struct eunion_dir_binding* binding = eunion_dir_find_locked(fd);
-	if (binding && binding->description) {
-		struct eunion_dir_description* description =
-			binding->description;
-		eunion_name_buffer_release(&description->names);
-		description->names.growable = 1;
-		description->ready = 0;
-		description->cursor = 0;
-		description->guest[0] = '\0';
-	}
-	eunion_dirs_unlock();
-}
-
-int vchroot_dir_dup(int oldfd, int newfd)
-{
-	if (oldfd == newfd)
-		return 0;
-	eunion_dirs_lock();
-	struct eunion_dir_binding* source =
-		eunion_dir_find_locked(oldfd);
-	struct eunion_dir_description* description =
-		source ? source->description : 0;
-	struct eunion_dir_binding* target =
-		eunion_dir_find_locked(newfd);
-	eunion_dir_binding_close_locked(target);
-	if (!description) {
-		eunion_dirs_unlock();
-		return 0;
-	}
-	target = eunion_dir_binding_alloc_locked(newfd);
-	if (!target) {
-		eunion_dirs_unlock();
-		return -LINUX_EMFILE;
-	}
-	++description->references;
-	target->description = description;
-	eunion_dirs_unlock();
-	return 0;
-}
+// descriptors, forked processes and descriptors surviving exec share one
+// kernel open file description. Store the merged byte cursor in that OFD's
+// directory offset instead of a process-local fd table. This preserves native
+// dup/fork/exec/lseek/close lifetime semantics and imposes no private fd cap.
+//
+// A fresh growable snapshot is reconstructed for each page. Cursor read/update
+// is serialized with the persistent sidecar lock after snapshot construction,
+// so no process-local mutex or fork-sensitive spinlock is involved.
 
 // append one linux_dirent64 record for `name` into out; returns bytes used or
 // 0 if it would not fit (caller stops this page). The ON-WIRE header is the
@@ -1782,6 +1638,8 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 {
 	if (prefix_path_len < 0)
 		return -LINUX_ENOENT;
+	if (!out || cap <= 0)
+		return -LINUX_EINVAL;
 
 	// Union inactive (no template configured for this prefix): pass straight
 	// through to the real getdents64 so callers see the kernel's true d_ino /
@@ -1792,86 +1650,71 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 	if (libexec_path_len <= 0)
 		return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
 
-	eunion_dirs_lock();
-	struct eunion_dir_binding* binding = eunion_dir_find_locked(fd);
-	int created_binding = 0;
-	if (!binding) {
-		binding = eunion_dir_binding_alloc_locked(fd);
-		if (!binding) {
-			eunion_dirs_unlock();
-			return -LINUX_EMFILE;
-		}
-		binding->description = eunion_dir_description_alloc_locked();
-		if (!binding->description) {
-			eunion_dir_binding_close_locked(binding);
-			eunion_dirs_unlock();
-			return -LINUX_EMFILE;
-		}
-		created_binding = 1;
-	}
-	struct eunion_dir_description* description = binding->description;
+	char guest[4096];
+	struct vchroot_fdpath_args fp;
+	fp.fd = fd;
+	fp.path = guest;
+	fp.maxlen = sizeof(guest);
+	if (vchroot_fdpath(&fp) < 0)
+		return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
 
-	if (!description->ready)
-	{
-		// recover the guest dir path from the upper fd, then materialize the
-		// merged listing once.
-		char guest[4096];
-		struct vchroot_fdpath_args fp;
-		fp.fd = fd; fp.path = guest; fp.maxlen = sizeof(guest);
-		if (vchroot_fdpath(&fp) < 0) {
-			if (created_binding)
-				eunion_dir_binding_close_locked(binding);
-			eunion_dirs_unlock();
-			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
-		}
-
-		struct eunion_name_buffer hidden = {
-			.growable = 1,
-		};
-		int n = eunion_readdir_merge(
-			guest, &description->names, &hidden);
-		eunion_name_buffer_release(&hidden);
-		if (n < 0) {
-			eunion_name_buffer_release(&description->names);
-			description->names.growable = 1;
-			eunion_dirs_unlock();
-			return n;
-		}
-
-		// remember the guest dir path so the emitter can lstat each entry for a
-		// real d_type/d_ino (overlay presents valid types, not DT_UNKNOWN).
-		{
-			int gl = (int)strlen(guest);
-			if (gl + 1 > (int)sizeof(description->guest))
-				gl = (int)sizeof(description->guest) - 1;
-			memcpy(description->guest, guest, gl);
-			description->guest[gl] = '\0';
-		}
-
-		description->cursor = 0;
-		description->ready = 1;
+	struct eunion_name_buffer names = {
+		.growable = 1,
+	};
+	struct eunion_name_buffer hidden = {
+		.growable = 1,
+	};
+	int result = eunion_readdir_merge(guest, &names, &hidden);
+	eunion_name_buffer_release(&hidden);
+	if (result < 0) {
+		eunion_name_buffer_release(&names);
+		return result;
 	}
 
-	// page out from cursor
+	eunion_sidecar_view cursor_view = {{0}};
+	result = eunion_sidecar_view_open(
+		cursor_view, &eunion_anchored_runtime,
+		EUNION_SIDECAR_ACCESS_EXCLUSIVE);
+	if (result < 0) {
+		eunion_name_buffer_release(&names);
+		return result;
+	}
+
+	int cursor = LINUX_SYSCALL(
+		__NR_lseek, fd, 0, LINUX_SEEK_CUR);
+	if (cursor < 0)
+		result = cursor;
+	if (result >= 0 &&
+		(cursor > names.used ||
+		 (cursor > 0 && names.data[cursor - 1] != '\0')))
+		result = -LINUX_EINVAL;
+
 	int written = 0;
-	while (description->cursor < description->names.used)
+	while (result >= 0 && cursor < names.used)
 	{
-		const char* name =
-			description->names.data + description->cursor;
+		const char* name = names.data + cursor;
 		int w = eunion_emit_dirent(
-			out, cap, written, description->guest, name);
+			out, cap, written, guest, name);
 		if (!w)
 			break; // page full; resume here next call
 		written += w;
-		description->cursor += (int)strlen(name) + 1;
+		cursor += (int)strlen(name) + 1;
 	}
-	if (written == 0 &&
-		description->cursor < description->names.used) {
-		eunion_dirs_unlock();
-		return -LINUX_EINVAL;
+	if (result >= 0 && written == 0 && cursor < names.used)
+		result = -LINUX_EINVAL;
+	if (result >= 0 && written > 0) {
+		int seek_result = LINUX_SYSCALL(
+			__NR_lseek, fd, cursor, LINUX_SEEK_SET);
+		if (seek_result < 0)
+			result = seek_result;
+		else if (seek_result != cursor)
+			result = -LINUX_EIO;
 	}
-	eunion_dirs_unlock();
-	return written; // 0 when cursor reaches used -> end of merged stream
+	int close_result = eunion_sidecar_view_close(cursor_view);
+	if (result >= 0 && close_result < 0)
+		result = close_result;
+	eunion_name_buffer_release(&names);
+	return result < 0 ? result : written;
 }
 #endif
 
