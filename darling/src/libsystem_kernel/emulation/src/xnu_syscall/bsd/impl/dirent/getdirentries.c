@@ -53,7 +53,7 @@ long sys_getdirentries(int fd, char* ibuf, unsigned int len, long* basep)
 
 #ifdef EUNION
 	// E-UNION: merged listing (upper + lower template, whiteouts subtracted,
-	// opaque honoured). Per-fd state is freed by close() via vchroot_dir_closed.
+	// opaque honoured). Cursor state is the directory's kernel OFD offset.
 	ret = vchroot_getdents_merge(fd, buf, sizeof(buf));
 #else
 	ret = LINUX_SYSCALL(__NR_getdents64, fd, buf, sizeof(buf));

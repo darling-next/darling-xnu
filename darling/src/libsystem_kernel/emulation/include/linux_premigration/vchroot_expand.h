@@ -48,12 +48,9 @@ int vchroot_post_mkdir(const char* guest);
 // from the guest (getxattr -> ENOATTR, listxattr -> filtered out).
 int vchroot_xattr_is_marker(const char* name);
 int vchroot_readdir_merge(const char* guest, char* out, int cap);
-// Paged merged getdents for getdirentries (per-fd state); vchroot_dir_closed
-// MUST be called from close()/closedir() so the per-fd state is freed.
+// Paged merged getdents. The cursor is the kernel open-file-description offset,
+// so native dup/fork/exec/lseek/close semantics require no side table hooks.
 int vchroot_getdents_merge(int fd, char* out, int cap);
-void vchroot_dir_closed(int fd);
-void vchroot_dir_rewind(int fd);
-int vchroot_dir_dup(int oldfd, int newfd);
 // Thin policy helpers the syscall-emulation sites call (see vchroot_userspace.c):
 //   vchroot_prepare_write(guest) BEFORE a write/mutate (expand then hits upper);
 int vchroot_prepare_write(const char* guest);

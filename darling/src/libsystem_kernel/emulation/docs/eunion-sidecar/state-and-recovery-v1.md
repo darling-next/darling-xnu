@@ -123,6 +123,25 @@ Legacy/unversioned is never a migration source. Normal prepare returns
 recreate operation may replace it, after persistent lock, process and mount
 checks. The result is a fresh sidecar-v1 prefix; no legacy record is imported.
 
+Lifecycle publication produces a separate, versioned runtime state rather
+than claiming that the sidecar is already active:
+
+```text
+UNINITIALIZED =
+  valid .darling-prefix-state-v3 binding
+  + exact empty sidecar directory
+  + no active-v1
+
+UNINITIALIZED -> INITIALIZING -> VALID
+```
+
+`INITIALIZING` exists only under the persistent `lock-v1` and consists of the
+initializer-owned durable files recognized by the recovery routine. A second
+process either joins the named lock and observes `VALID`, or recovers that
+owned layout. An unbound empty sidecar is `PREFIX_RECREATE_REQUIRED`; an
+unrecognized nonempty layout is `CORRUPT`. Inspection never creates files and
+no guest operation runs until `VALID`.
+
 ## Durability order
 
 Staged prefix files (`passwd`, `master.passwd`, `group`) are individually

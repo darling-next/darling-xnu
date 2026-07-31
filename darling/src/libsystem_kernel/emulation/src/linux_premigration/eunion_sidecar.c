@@ -1429,10 +1429,23 @@ int eunion_sidecar_inspect_prefix(
 		int empty = 0;
 		int empty_result =
 			eunion_sidecar_directory_empty(sidecar, &empty);
-		inspection->verdict =
-			empty_result >= 0 && empty
-				? EUNION_PREFIX_FORMAT_UNINITIALIZED
-				: EUNION_PREFIX_FORMAT_CORRUPT;
+		struct eunion_sidecar_runtime inspected = {
+			.anchored = 1,
+			.upper_descriptor = upper,
+			.lower_descriptor = -1,
+			.sidecar_descriptor = sidecar,
+		};
+		int state_result = empty_result >= 0 && empty
+			? eunion_sidecar_prefix_state_v3_valid(&inspected)
+			: -LINUX_EIO;
+		if (empty_result < 0)
+			inspection->verdict = EUNION_PREFIX_FORMAT_CORRUPT;
+		else if (!empty)
+			inspection->verdict = EUNION_PREFIX_FORMAT_CORRUPT;
+		else if (state_result >= 0)
+			inspection->verdict = EUNION_PREFIX_FORMAT_UNINITIALIZED;
+		else
+			inspection->verdict = EUNION_PREFIX_RECREATE_REQUIRED;
 		eunion_sidecar_close_fd(&sidecar, 0);
 		eunion_sidecar_close_fd(&upper, 0);
 		return 0;

@@ -151,15 +151,6 @@ long sys_fcntl_nocancel(int fd, int cmd, long arg)
 		} break;
 		case F_DUPFD:
 		case F_DUPFD_CLOEXEC:
-		#ifdef EUNION
-			{
-				int state_ret = vchroot_dir_dup(fd, ret);
-				if (state_ret < 0) {
-					LINUX_SYSCALL1(__NR_close, ret);
-					return errno_linux_to_bsd(state_ret);
-				}
-			}
-		#endif
 			kqueue_dup(fd, ret);
 			break;
 	}

@@ -7,10 +7,6 @@
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/common/guarded/table.h>
-#ifdef EUNION
-#include <darling/emulation/linux_premigration/vchroot_expand.h>
-#endif
-
 __attribute__((weak))
 __attribute__((visibility("default")))
 int kqueue_close(int kq) { return 0; }
@@ -41,11 +37,6 @@ long sys_close_nocancel(int fd)
 		return 0;
 	}
 
-#ifdef EUNION
-	// release any per-fd directory-merge state before the fd number is recycled
-	vchroot_dir_closed(fd);
-#endif
-
 	ret = LINUX_SYSCALL1(__NR_close, fd);
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
@@ -58,10 +49,6 @@ long sys_close_nocancel(int fd)
 long close_internal(int fd)
 {
 	int ret;
-
-#ifdef EUNION
-	vchroot_dir_closed(fd);
-#endif
 
 	ret = LINUX_SYSCALL1(__NR_close, fd);
 	if (ret < 0)
