@@ -31,6 +31,53 @@ struct elf_calls* _elfcalls;
 static bool use_per_thread_driver_fd = false;
 
 extern void _xtrace_postfork_child(void);
+extern int __darling_vchroot(int dfd);
+
+#define VCHROOT_FD_APPLE_PREFIX "vchroot_fd="
+
+static int retained_vchroot_fd_from_apple(const char** applep)
+{
+	if (!applep)
+		return -1;
+
+	for (int i = 0; applep[i] != NULL; i++) {
+		const char* entry = applep[i];
+		if (strncmp(entry, VCHROOT_FD_APPLE_PREFIX,
+			sizeof(VCHROOT_FD_APPLE_PREFIX) - 1) != 0)
+			continue;
+
+		const char* cursor = entry + sizeof(VCHROOT_FD_APPLE_PREFIX) - 1;
+		unsigned int value = 0;
+		if (*cursor == '\0')
+			return -1;
+		for (; *cursor != '\0'; cursor++) {
+			if (*cursor < '0' || *cursor > '9')
+				return -1;
+			if (value > (0x7fffffffU - (unsigned int)(*cursor - '0')) / 10U)
+				return -1;
+			value = value * 10U + (unsigned int)(*cursor - '0');
+		}
+		return (int)value;
+	}
+	return -1;
+}
+
+static void anchor_retained_vchroot(const char** applep)
+{
+	int descriptor = retained_vchroot_fd_from_apple(applep);
+	if (descriptor < 0 || __darling_vchroot(descriptor) != 0) {
+		__simple_printf(
+			"invalid retained vchroot directory capability at image initialization\n");
+		__simple_abort();
+	}
+
+#ifndef VARIANT_DYLD
+	// dyld and libsystem_kernel have separate E-UNION state. Keep the original
+	// descriptor alive until both images have duplicated and validated it; the
+	// non-dyld initializer is the final consumer.
+	close_internal(descriptor);
+#endif
+}
 
 void mach_driver_init(const char** applep)
 {
@@ -67,6 +114,9 @@ void mach_driver_init(const char** applep)
 		}
 	}
 #endif
+
+	if (applep)
+		anchor_retained_vchroot(applep);
 
 	// mach_driver_init() gets called at several points in application's lifetime:
 	// 1) When dyld loads
