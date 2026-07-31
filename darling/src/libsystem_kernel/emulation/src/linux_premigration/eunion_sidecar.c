@@ -371,6 +371,25 @@ uint64_t eunion_test_sidecar_uuid[2] = {
 	0x1716151413121110ULL,
 	0x1f1e1d1c1b1a1918ULL,
 };
+
+/*
+ * E-UNION is anchored before libsystem has installed libplatform's optimized
+ * string-function table.  In that window libsystem_kernel's public memcmp()
+ * dispatcher has no generic implementation and calling it jumps through a
+ * null function pointer.  Keep sidecar validation self-contained so both the
+ * dyld and non-dyld anchors can inspect the same published format safely.
+ */
+static int eunion_sidecar_bytes_equal(
+	const void* left, const void* right, size_t length)
+{
+	const unsigned char* left_bytes = left;
+	const unsigned char* right_bytes = right;
+	for (size_t index = 0; index < length; ++index) {
+		if (left_bytes[index] != right_bytes[index])
+			return 0;
+	}
+	return 1;
+}
 void (*eunion_test_sidecar_checkpoint_hook)(
 	enum eunion_sidecar_test_checkpoint checkpoint,
 	const char* guest_path);
@@ -1276,14 +1295,15 @@ static int eunion_sidecar_line_equals(
 {
 	size_t expected_length = strlen(expected);
 	return length == expected_length &&
-		memcmp(line, expected, length) == 0;
+		eunion_sidecar_bytes_equal(line, expected, length);
 }
 
 static int eunion_sidecar_parse_field_u64(
 	const char* line, size_t length, const char* key, uint64_t* value)
 {
 	size_t key_length = strlen(key);
-	if (length <= key_length || memcmp(line, key, key_length) != 0)
+	if (length <= key_length ||
+		!eunion_sidecar_bytes_equal(line, key, key_length))
 		return -LINUX_EIO;
 	uint64_t parsed = 0;
 	for (size_t index = key_length; index < length; ++index) {
@@ -1474,7 +1494,8 @@ int eunion_sidecar_inspect_prefix(
 	if (result >= 0)
 		result = eunion_sidecar_fstat_identity(sidecar, &sidecar_identity);
 	if (result >= 0 &&
-		(memcmp(activation.uuid, format.uuid, sizeof(format.uuid)) != 0 ||
+		(!eunion_sidecar_bytes_equal(
+			activation.uuid, format.uuid, sizeof(format.uuid)) ||
 		 !eunion_sidecar_same_object(
 			&activation.upper_root, &upper_identity) ||
 		 !eunion_sidecar_same_object(
@@ -1617,8 +1638,8 @@ int eunion_sidecar_view_open(eunion_sidecar_view view,
 		if (result >= 0 &&
 			(!eunion_sidecar_same_object(&upper, &format.upper_root) ||
 			 !eunion_sidecar_same_object(&lower, &format.lower_root) ||
-			 memcmp(activation.uuid, format.uuid,
-				sizeof(format.uuid)) != 0 ||
+			 !eunion_sidecar_bytes_equal(
+				activation.uuid, format.uuid, sizeof(format.uuid)) ||
 			 !eunion_sidecar_same_object(
 				&upper, &activation.upper_root) ||
 			 !eunion_sidecar_same_object(
@@ -1828,7 +1849,7 @@ static int eunion_sidecar_open_child(eunion_sidecar_view view, int parent,
 	if (result >= 0 &&
 		(record->parent_generation != parent_generation ||
 		 record->name_length != length ||
-		 memcmp(record->name, component, length) != 0))
+		 !eunion_sidecar_bytes_equal(record->name, component, length)))
 		result = -LINUX_EIO;
 	if (result < 0)
 		eunion_sidecar_close_fd(child, 0);
@@ -2966,16 +2987,18 @@ static int eunion_sidecar_apply_rename_records(
 				journal->secondary_path, '/');
 			if (destination_leaf && destination_leaf[1] &&
 				record.name_length == strlen(destination_leaf + 1) &&
-				memcmp(record.name, destination_leaf + 1,
-					record.name_length) == 0 &&
+				eunion_sidecar_bytes_equal(
+					record.name, destination_leaf + 1,
+					record.name_length) &&
 				eunion_sidecar_same_object(
 					&record.upper, destination))
 				destination_is_new = 1;
 			const char* source_leaf = strrchr(journal->path, '/');
 			if (!destination_is_new && source_leaf && source_leaf[1] &&
 				record.name_length == strlen(source_leaf + 1) &&
-				memcmp(record.name, source_leaf + 1,
-					record.name_length) == 0 &&
+				eunion_sidecar_bytes_equal(
+					record.name, source_leaf + 1,
+					record.name_length) &&
 				eunion_sidecar_same_object(
 					&record.upper, &journal->upper) &&
 				eunion_sidecar_same_object(
