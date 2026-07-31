@@ -336,6 +336,25 @@ static int eunion_sidecar_transaction_release(
 	return release_result < 0 ? release_result : primary_result;
 }
 
+/*
+ * E-UNION is anchored before libsystem has installed libplatform's optimized
+ * string-function table.  In that window libsystem_kernel's public memcmp()
+ * dispatcher has no generic implementation and calling it jumps through a
+ * null function pointer.  Keep sidecar validation self-contained so both the
+ * dyld and non-dyld anchors can inspect the same published format safely.
+ */
+static int eunion_sidecar_bytes_equal(
+	const void* left, const void* right, size_t length)
+{
+	const unsigned char* left_bytes = left;
+	const unsigned char* right_bytes = right;
+	for (size_t index = 0; index < length; ++index) {
+		if (left_bytes[index] != right_bytes[index])
+			return 0;
+	}
+	return 1;
+}
+
 #ifdef TEST
 int eunion_sidecar_test_transaction_guards(
 	const struct eunion_sidecar_runtime* runtime)
@@ -371,25 +390,6 @@ uint64_t eunion_test_sidecar_uuid[2] = {
 	0x1716151413121110ULL,
 	0x1f1e1d1c1b1a1918ULL,
 };
-
-/*
- * E-UNION is anchored before libsystem has installed libplatform's optimized
- * string-function table.  In that window libsystem_kernel's public memcmp()
- * dispatcher has no generic implementation and calling it jumps through a
- * null function pointer.  Keep sidecar validation self-contained so both the
- * dyld and non-dyld anchors can inspect the same published format safely.
- */
-static int eunion_sidecar_bytes_equal(
-	const void* left, const void* right, size_t length)
-{
-	const unsigned char* left_bytes = left;
-	const unsigned char* right_bytes = right;
-	for (size_t index = 0; index < length; ++index) {
-		if (left_bytes[index] != right_bytes[index])
-			return 0;
-	}
-	return 1;
-}
 void (*eunion_test_sidecar_checkpoint_hook)(
 	enum eunion_sidecar_test_checkpoint checkpoint,
 	const char* guest_path);
