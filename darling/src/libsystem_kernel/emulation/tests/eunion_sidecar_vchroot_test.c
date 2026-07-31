@@ -50,6 +50,18 @@ static int contains_name(const char* names, int count, const char* wanted)
 
 int main(void)
 {
+	require(!eunion_sidecar_path_has_deleted_suffix(NULL, 0),
+		"NULL sidecar path is not deleted");
+	require(!eunion_sidecar_path_has_deleted_suffix("short", 5),
+		"short sidecar path is not deleted");
+	require(!eunion_sidecar_path_has_deleted_suffix(
+		"/tmp/upper (deleted)/child", 26),
+		"intermediate deleted text is not a suffix");
+	static const char deleted_path[] = "/tmp/upper (deleted)";
+	require(eunion_sidecar_path_has_deleted_suffix(
+		deleted_path, (int)sizeof(deleted_path) - 1),
+		"exact readlink deleted suffix is rejected");
+
 	char root[] = "/tmp/eunion-sidecar-vchroot.XXXXXX";
 	require(mkdtemp(root) != NULL, "create vchroot fixture");
 	char upper[512], lower[512], sidecar[512];

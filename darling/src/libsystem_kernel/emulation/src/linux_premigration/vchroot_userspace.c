@@ -155,6 +155,25 @@ extern void free(void* pointer);
 
 static int eunion_lstat(const char* host, stat_t* st); // defined below
 
+/*
+ * This check runs before libsystem has installed libplatform's optimized
+ * string-function table. Keep it self-contained: calling strstr() in this
+ * window can dispatch through an unresolved NULL function pointer.
+ */
+static int eunion_sidecar_path_has_deleted_suffix(
+	const char* path, int path_length)
+{
+	static const char suffix[] = " (deleted)";
+	const int suffix_length = (int)sizeof(suffix) - 1;
+	if (!path || path_length < suffix_length)
+		return 0;
+	for (int index = 0; index < suffix_length; ++index) {
+		if (path[path_length - suffix_length + index] != suffix[index])
+			return 0;
+	}
+	return 1;
+}
+
 // A sidecar-v1 prefix is the only supported E-UNION runtime format. The
 // external activation record is validated before the union becomes visible.
 // A missing activation is accepted only for the versioned UNINITIALIZED tuple:
@@ -242,7 +261,8 @@ static int eunion_init_from_prefix(int prefix_descriptor)
 			? host_path_length : -LINUX_ENAMETOOLONG;
 	}
 	eunion_sidecar_host_path[host_path_length] = '\0';
-	if (strstr(eunion_sidecar_host_path, " (deleted)") != NULL) {
+	if (eunion_sidecar_path_has_deleted_suffix(
+			eunion_sidecar_host_path, host_path_length)) {
 		eunion_sidecar_runtime_release(&eunion_anchored_runtime);
 		eunion_sidecar_path_len = -1;
 		eunion_sidecar_host_path_len = -1;
