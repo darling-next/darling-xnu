@@ -48,6 +48,22 @@ static int contains_name(const char* names, int count, const char* wanted)
 	return 0;
 }
 
+static void require_record_none(
+	const struct eunion_sidecar_runtime* runtime,
+	const char* path,
+	const char* message)
+{
+	eunion_sidecar_view reader = {{0}};
+	require(eunion_sidecar_view_open(reader, runtime,
+		EUNION_SIDECAR_ACCESS_SHARED) == 0,
+		"open record-retirement reader");
+	struct eunion_sidecar_lookup lookup;
+	require(eunion_sidecar_lookup_path(reader, path, &lookup) == 0 &&
+		lookup.kind == EUNION_SIDECAR_RECORD_NONE, message);
+	require(eunion_sidecar_view_close(reader) == 0,
+		"close record-retirement reader");
+}
+
 int main(void)
 {
 	require(!eunion_sidecar_path_has_deleted_suffix(NULL, 0),
@@ -185,6 +201,136 @@ int main(void)
 		"copy-up publishes upper file");
 	require(lstat(legacy_work, &status) == -1 && errno == ENOENT,
 		"sidecar copy-up creates no guest-visible work directory");
+
+	/* launchctl empty_dir() changes into the managed parent and calls the libc
+	 * remove() path with a relative leaf.  Exercise the exact vchroot boundary
+	 * used by unlink/rmdir before the syscall wrapper falls back to host unlink. */
+	char relative_parent[512], relative_leaf[512];
+	require(snprintf(relative_parent, sizeof(relative_parent),
+		"%s/relative-remove", upper) > 0,
+		"construct relative remove parent");
+	require(snprintf(relative_leaf, sizeof(relative_leaf),
+		"%s/leaf", relative_parent) > 0,
+		"construct relative remove leaf");
+	require(vchroot_mkdir_create("/relative-remove", 0700) == 0,
+		"create indexed relative remove parent");
+	int relative_fd = vchroot_open_create(
+		"/relative-remove/leaf", O_WRONLY | O_CREAT | O_EXCL, 0600);
+	require(relative_fd >= 0 && close(relative_fd) == 0,
+		"create indexed relative remove leaf");
+	int saved_cwd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	require(saved_cwd >= 0, "retain fixture cwd");
+	require(chdir(relative_parent) == 0,
+		"enter managed parent like launchctl empty_dir");
+	int handled = 0;
+	require(vchroot_remove_at(AT_FDCWD, "leaf", 0, &handled) == 0 && handled,
+		"AT_FDCWD relative remove uses sidecar transaction");
+	require(fchdir(saved_cwd) == 0 && close(saved_cwd) == 0,
+		"restore fixture cwd");
+	require(lstat(relative_leaf, &status) == -1 && errno == ENOENT,
+		"relative remove retires backing");
+	require_record_none(&runtime, "/relative-remove/leaf",
+		"relative remove retires INDEX record");
+
+	/* A real directory descriptor must resolve to the same canonical guest
+	 * path and transaction as AT_FDCWD. */
+	require(vchroot_mkdir_create("/relative-dirfd", 0700) == 0,
+		"create indexed real-dirfd parent");
+	int dirfd_leaf = vchroot_open_create(
+		"/relative-dirfd/leaf", O_WRONLY | O_CREAT | O_EXCL, 0600);
+	require(dirfd_leaf >= 0 && close(dirfd_leaf) == 0,
+		"create indexed real-dirfd leaf");
+	char real_dirfd_parent[512];
+	require(snprintf(real_dirfd_parent, sizeof(real_dirfd_parent),
+		"%s/relative-dirfd", upper) > 0,
+		"construct real-dirfd parent");
+	int real_dirfd = open(real_dirfd_parent,
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	require(real_dirfd >= 0, "open real managed dirfd");
+	handled = 0;
+	require(vchroot_remove_at(real_dirfd, "leaf", 0, &handled) == 0 &&
+		handled, "real dirfd relative unlink uses sidecar transaction");
+	require(close(real_dirfd) == 0, "close real managed dirfd");
+	require_record_none(&runtime, "/relative-dirfd/leaf",
+		"real dirfd unlink retires INDEX record");
+
+	/* libc remove(3) chooses rmdir for a directory after launchctl has changed
+	 * into its parent.  Exercise that directory arm at the syscall boundary. */
+	require(vchroot_mkdir_create("/relative-rmdir", 0700) == 0,
+		"create indexed relative-rmdir parent");
+	require(vchroot_mkdir_create("/relative-rmdir/empty", 0700) == 0,
+		"create indexed relative-rmdir leaf");
+	char relative_rmdir_parent[512];
+	require(snprintf(relative_rmdir_parent, sizeof(relative_rmdir_parent),
+		"%s/relative-rmdir", upper) > 0,
+		"construct relative-rmdir parent");
+	saved_cwd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	require(saved_cwd >= 0 && chdir(relative_rmdir_parent) == 0,
+		"enter relative-rmdir parent");
+	handled = 0;
+	require(vchroot_remove_at(AT_FDCWD, "empty", 1, &handled) == 0 &&
+		handled, "AT_FDCWD relative rmdir uses sidecar transaction");
+	require(fchdir(saved_cwd) == 0 && close(saved_cwd) == 0,
+		"restore cwd after relative rmdir");
+	require_record_none(&runtime, "/relative-rmdir/empty",
+		"relative rmdir retires INDEX record");
+
+	/* Exact launchctl boot-cleanup paths: /var/tmp/launchd is removed through
+	 * the directory arm, while the two /var/run markers use the file arm. */
+	require(vchroot_mkdir_create("/var", 0755) == 0,
+		"create indexed var directory");
+	require(vchroot_mkdir_create("/var/tmp", 01777) == 0,
+		"create indexed var/tmp directory");
+	require(vchroot_mkdir_create("/var/run", 0755) == 0,
+		"create indexed var/run directory");
+	require(vchroot_mkdir_create("/var/tmp/launchd", 0700) == 0,
+		"create indexed launchd directory");
+	char var_tmp[512];
+	require(snprintf(var_tmp, sizeof(var_tmp), "%s/var/tmp", upper) > 0,
+		"construct var/tmp backing path");
+	saved_cwd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	require(saved_cwd >= 0 && chdir(var_tmp) == 0,
+		"enter launchctl var/tmp cwd");
+	handled = 0;
+	require(vchroot_remove_at(AT_FDCWD, "launchd", 1, &handled) == 0 &&
+		handled, "launchctl launchd rmdir uses record-to-ABSENT transaction");
+	require(fchdir(saved_cwd) == 0 && close(saved_cwd) == 0,
+		"restore cwd after launchd rmdir");
+	require_record_none(&runtime, "/var/tmp/launchd",
+		"launchd rmdir retires INDEX record");
+
+	int utmpx_fd = vchroot_open_create(
+		"/var/run/utmpx", O_WRONLY | O_CREAT | O_EXCL, 0664);
+	require(utmpx_fd >= 0 && close(utmpx_fd) == 0,
+		"create indexed utmpx marker");
+	int starter_fd = vchroot_open_create(
+		"/var/run/.systemStarterRunning",
+		O_WRONLY | O_CREAT | O_EXCL, 0664);
+	require(starter_fd >= 0 && close(starter_fd) == 0,
+		"create indexed system-starter marker");
+	char var_run[512];
+	require(snprintf(var_run, sizeof(var_run), "%s/var/run", upper) > 0,
+		"construct var/run backing path");
+	saved_cwd = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	require(saved_cwd >= 0 && chdir(var_run) == 0,
+		"enter launchctl var/run cwd");
+	handled = 0;
+	require(vchroot_remove_at(AT_FDCWD, "utmpx", 0, &handled) == 0 &&
+		handled, "launchctl utmpx unlink uses record-to-ABSENT transaction");
+	require(fchdir(saved_cwd) == 0 && close(saved_cwd) == 0,
+		"restore cwd after utmpx unlink");
+	int var_run_fd = open(var_run,
+		O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+	require(var_run_fd >= 0, "open real var/run dirfd");
+	handled = 0;
+	require(vchroot_remove_at(var_run_fd, ".systemStarterRunning", 0,
+		&handled) == 0 && handled,
+		"real dirfd system-starter unlink uses record-to-ABSENT transaction");
+	require(close(var_run_fd) == 0, "close real var/run dirfd");
+	require_record_none(&runtime, "/var/run/utmpx",
+		"utmpx unlink retires INDEX record");
+	require_record_none(&runtime, "/var/run/.systemStarterRunning",
+		"system-starter unlink retires INDEX record");
 
 	eunion_sidecar_view recreate_writer = {{0}};
 	require(eunion_sidecar_view_open(recreate_writer, &runtime,
