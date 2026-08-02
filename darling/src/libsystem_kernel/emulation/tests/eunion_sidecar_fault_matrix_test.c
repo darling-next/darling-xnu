@@ -15,6 +15,7 @@
 
 enum fault_operation {
 	FAULT_REMOVE = 0,
+	FAULT_REMOVE_UPPER_ONLY,
 	FAULT_CREATE,
 	FAULT_COPY_UP,
 	FAULT_RENAME,
@@ -71,6 +72,7 @@ static int run_operation(enum fault_operation operation,
 {
 	switch (operation) {
 		case FAULT_REMOVE:
+		case FAULT_REMOVE_UPPER_ONLY:
 			return eunion_sidecar_remove_path(runtime, "/victim", 0);
 		case FAULT_CREATE: {
 			int descriptor = eunion_sidecar_open_create(runtime,
@@ -146,6 +148,14 @@ static void require_coherent_result(
 						: EUNION_SIDECAR_RECORD_WHITEOUT),
 				"remove fault left backing/record split");
 			break;
+		case FAULT_REMOVE_UPPER_ONLY:
+			require(lookup_kind(runtime, "/victim") ==
+					EUNION_SIDECAR_RECORD_NONE,
+				"upper-only remove fault exposed internal record state");
+			require(eunion_sidecar_test_record_present(
+					runtime, "/victim") == have_victim,
+				"upper-only remove fault left backing/record split");
+			break;
 		case FAULT_CREATE:
 			require(lookup_kind(runtime, "/victim") ==
 					(have_victim ? EUNION_SIDECAR_RECORD_NONE
@@ -178,7 +188,7 @@ static void run_case(enum fault_operation operation,
 	require(mkdtemp(root) != NULL, "create fault-matrix fixture");
 	char upper[512], lower[512], sidecar[512];
 	char upper_victim[512], lower_victim[512], upper_renamed[512];
-	char journal[512], staging[512];
+	char journal[512], staging[512], remove_staging[512];
 	join_path(upper, sizeof(upper), root, "/upper");
 	join_path(lower, sizeof(lower), root, "/lower");
 	join_path(sidecar, sizeof(sidecar), root, "/sidecar");
@@ -187,6 +197,8 @@ static void run_case(enum fault_operation operation,
 	join_path(upper_renamed, sizeof(upper_renamed), upper, "/renamed");
 	join_path(journal, sizeof(journal), sidecar, "/journal-v1");
 	join_path(staging, sizeof(staging), sidecar, "/staging-v1/copyup-v1");
+	join_path(remove_staging, sizeof(remove_staging), sidecar,
+		"/staging-v1/remove-v1");
 	require(mkdir(upper, 0700) == 0 &&
 			mkdir(lower, 0700) == 0 &&
 			mkdir(sidecar, 0700) == 0,
@@ -202,6 +214,12 @@ static void run_case(enum fault_operation operation,
 	if (operation == FAULT_REMOVE) {
 		write_file(upper_victim);
 		write_file(lower_victim);
+	} else if (operation == FAULT_REMOVE_UPPER_ONLY) {
+		int descriptor = eunion_sidecar_open_create(&runtime, "/victim",
+			O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+		require(descriptor >= 0 && write(descriptor, "x", 1) == 1 &&
+			fsync(descriptor) == 0 && close(descriptor) == 0,
+			"create indexed upper-only fault victim");
 	} else if (operation == FAULT_CREATE) {
 		write_file(lower_victim);
 		eunion_sidecar_view writer = {{0}};
@@ -239,6 +257,8 @@ static void run_case(enum fault_operation operation,
 	struct stat status;
 	require(lstat(staging, &status) == -1 && errno == ENOENT,
 		"fault recovery retained private copy-up staging");
+	require(lstat(remove_staging, &status) == -1 && errno == ENOENT,
+		"fault recovery retained private remove staging");
 	require_coherent_result(
 		operation, &runtime, upper_victim, upper_renamed);
 
@@ -277,6 +297,9 @@ int main(void)
 			run_case(FAULT_REMOVE, remove_phases[phase],
 				failure_errnos[failure]);
 			++cases;
+			run_case(FAULT_REMOVE_UPPER_ONLY, remove_phases[phase],
+				failure_errnos[failure]);
+			++cases;
 		}
 		for (enum fault_operation operation = FAULT_CREATE;
 				operation <= FAULT_RENAME; ++operation) {
@@ -290,7 +313,7 @@ int main(void)
 			}
 		}
 	}
-	require(cases == 48,
+	require(cases == 60,
 		"failure/EINTR operation-phase matrix was incomplete");
 	printf("EUNION_SIDECAR_FAULT_MATRIX_OK checks=%d cases=%u"
 		" errnos=EINTR,EIO\n", checks, cases);

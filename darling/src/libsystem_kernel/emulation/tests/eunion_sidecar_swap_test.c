@@ -163,18 +163,30 @@ int main(void)
 		"initialize swap sidecar");
 	eunion_test_sidecar_checkpoint_hook = swap_hook;
 
-	make_file(upper_remove, "original-remove");
+	int remove_descriptor = eunion_sidecar_open_create(&runtime, "/remove",
+		O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	require(remove_descriptor >= 0 &&
+		write(remove_descriptor, "original-remove", 15) == 15 &&
+		fsync(remove_descriptor) == 0 && close(remove_descriptor) == 0,
+		"create indexed upper-only remove source");
+	require(eunion_sidecar_test_record_present(&runtime, "/remove") == 1,
+		"upper-only remove source has INDEX record");
 	make_file(remove_replacement, "replacement-remove");
 	active_case = SWAP_REMOVE;
 	require(eunion_sidecar_remove_path(&runtime, "/remove", 0) ==
 		-EAGAIN, "remove accepted replaced leaf");
 	require_file(upper_remove, "replacement-remove");
 	require_file(remove_parked, "original-remove");
+	require(eunion_sidecar_test_record_present(&runtime, "/remove") == 1,
+		"failed remove preserves the original INDEX record");
 	require(access(journal, F_OK) == -1 && errno == ENOENT,
 		"remove replacement left a transaction journal");
 	require(rename(upper_remove, remove_replacement) == 0 &&
 		rename(remove_parked, upper_remove) == 0,
 		"restore remove fixture");
+	require(lookup_kind(&runtime, "/remove") ==
+		EUNION_SIDECAR_RECORD_NONE,
+		"restored remove fixture retains coherent INDEX binding");
 
 	active_case = SWAP_CREATE;
 	require(eunion_sidecar_open_create(&runtime, "/create",

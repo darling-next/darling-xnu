@@ -259,6 +259,9 @@ int eunion_sidecar_test_corrupt_record(
 	const struct eunion_sidecar_runtime* runtime,
 	const char* guest_path,
 	enum eunion_sidecar_test_corruption corruption);
+int eunion_sidecar_test_record_present(
+	const struct eunion_sidecar_runtime* runtime,
+	const char* guest_path);
 #endif
 
 #endif

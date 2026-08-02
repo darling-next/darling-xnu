@@ -245,6 +245,88 @@ static void run_boundary(enum eunion_sidecar_test_checkpoint checkpoint,
 	require(system(command) == 0, "remove recovery root");
 }
 
+static void run_upper_only_boundary(
+	enum eunion_sidecar_test_checkpoint checkpoint, int expect_removed)
+{
+	char root[] = "/tmp/eunion-sidecar-upper-only-recovery.XXXXXX";
+	require(mkdtemp(root) != NULL, "create upper-only recovery root");
+	char upper[512], lower[512], sidecar[512];
+	char upper_file[512], journal[512], staging[512];
+	join_path(upper, sizeof(upper), root, "/upper");
+	join_path(lower, sizeof(lower), root, "/lower");
+	join_path(sidecar, sizeof(sidecar), root, "/sidecar");
+	join_path(upper_file, sizeof(upper_file), upper, "/upper-only");
+	join_path(journal, sizeof(journal), sidecar, "/journal-v1");
+	join_path(staging, sizeof(staging), sidecar,
+		"/staging-v1/remove-v1");
+	require(mkdir(upper, 0700) == 0 && mkdir(lower, 0700) == 0 &&
+		mkdir(sidecar, 0700) == 0,
+		"create upper-only recovery roots");
+	struct eunion_sidecar_runtime runtime = {
+		.upper_root = upper,
+		.lower_root = lower,
+		.sidecar_root = sidecar,
+	};
+	require(eunion_sidecar_test_write_prefix_state(&runtime) == 0 &&
+		eunion_sidecar_initialize(&runtime) == 0,
+		"initialize upper-only recovery sidecar");
+	int descriptor = eunion_sidecar_open_create(&runtime, "/upper-only",
+		O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	require(descriptor >= 0 && write(descriptor, "x", 1) == 1 &&
+		fsync(descriptor) == 0 && close(descriptor) == 0,
+		"create indexed upper-only recovery backing");
+	require(eunion_sidecar_test_record_present(
+		&runtime, "/upper-only") == 1,
+		"upper-only recovery precondition has INDEX");
+
+	pid_t child = fork();
+	require(child >= 0, "fork upper-only boundary child");
+	if (child == 0) {
+		kill_path = "/upper-only";
+		kill_checkpoint = checkpoint;
+		eunion_test_sidecar_checkpoint_hook = kill_at_boundary;
+		(void)eunion_sidecar_remove_path(&runtime, "/upper-only", 0);
+		_exit(90);
+	}
+	int child_status;
+	require(waitpid(child, &child_status, 0) == child,
+		"wait upper-only boundary child");
+	require(WIFSIGNALED(child_status) &&
+		WTERMSIG(child_status) == termination_signal,
+		"upper-only child is interrupted at journal boundary");
+	struct stat status;
+	require(lstat(journal, &status) == 0,
+		"upper-only journal survives interruption");
+	eunion_sidecar_view recovery = {{0}};
+	require(eunion_sidecar_view_open(recovery, &runtime,
+		EUNION_SIDECAR_ACCESS_EXCLUSIVE) == 0,
+		"exclusive open recovers upper-only removal");
+	require(eunion_sidecar_view_close(recovery) == 0,
+		"close upper-only recovery");
+	require(lstat(journal, &status) == -1 && errno == ENOENT,
+		"upper-only recovery consumes journal");
+	require(lstat(staging, &status) == -1 && errno == ENOENT,
+		"upper-only recovery consumes private staged record");
+	require((lstat(upper_file, &status) == -1 && errno == ENOENT) ==
+		expect_removed,
+		"upper-only backing matches recovery direction");
+	require(eunion_sidecar_test_record_present(
+		&runtime, "/upper-only") == !expect_removed,
+		"upper-only record matches recovery direction");
+	eunion_sidecar_view repeated = {{0}};
+	require(eunion_sidecar_view_open(repeated, &runtime,
+		EUNION_SIDECAR_ACCESS_EXCLUSIVE) == 0 &&
+		eunion_sidecar_view_close(repeated) == 0,
+		"upper-only recovery is idempotent");
+
+	char command[640];
+	int length = snprintf(command, sizeof(command),
+		"rm -rf -- '%s'", root);
+	require(length > 0 && (size_t)length < sizeof(command),
+		"construct upper-only cleanup command");
+	require(system(command) == 0, "remove upper-only recovery root");
+}
+
 static void run_create_boundary(
 	enum eunion_sidecar_test_checkpoint checkpoint, int expect_committed)
 {
@@ -570,6 +652,12 @@ static void run_all_boundaries(void)
 	run_boundary(EUNION_SIDECAR_TEST_LOGICALLY_PUBLISHED, 0);
 	run_boundary(EUNION_SIDECAR_TEST_BACKING_COMMITTED, 1);
 	run_boundary(EUNION_SIDECAR_TEST_DURABLE, 1);
+	run_upper_only_boundary(EUNION_SIDECAR_TEST_JOURNAL_PREPARED, 0);
+	run_upper_only_boundary(
+		EUNION_SIDECAR_TEST_LOGICALLY_PUBLISHED, 0);
+	run_upper_only_boundary(
+		EUNION_SIDECAR_TEST_BACKING_COMMITTED, 1);
+	run_upper_only_boundary(EUNION_SIDECAR_TEST_DURABLE, 1);
 	run_create_boundary(EUNION_SIDECAR_TEST_JOURNAL_PREPARED, 0);
 	run_create_boundary(EUNION_SIDECAR_TEST_PRE_BACKING, 0);
 	run_create_boundary(EUNION_SIDECAR_TEST_POST_BACKING_PRE_JOURNAL, 1);
@@ -614,7 +702,7 @@ int main(void)
 		EUNION_SIDECAR_TEST_BACKING_COMMITTED, __NR_fsync, 1);
 	run_remove_fault(
 		EUNION_SIDECAR_TEST_DURABLE, __NR_unlinkat, 1);
-	printf("EUNION_SIDECAR_RECOVERY_OK checks=%d boundaries=48"
-		" sigkill=24 sigint=24 faults=8\n", checks);
+	printf("EUNION_SIDECAR_RECOVERY_OK checks=%d boundaries=56"
+		" sigkill=28 sigint=28 upper_only=8 faults=8\n", checks);
 	return 0;
 }

@@ -42,6 +42,34 @@ static void remove_tree(const char* root)
 	require(system(command) == 0, "cleanup");
 }
 
+static void require_upper_only_remove(
+	const struct eunion_sidecar_runtime* runtime,
+	const char* guest_path, const char* upper_path, int directory)
+{
+	require(eunion_sidecar_remove_path(runtime, guest_path, directory) == 0,
+		"remove upper-only object");
+	struct stat status;
+	require(lstat(upper_path, &status) == -1 && errno == ENOENT,
+		"upper-only backing object is absent");
+	require(eunion_sidecar_test_record_present(runtime, guest_path) == 0,
+		"upper-only removal publishes record ABSENT");
+	eunion_sidecar_view reader = {{0}};
+	require(eunion_sidecar_view_open(reader, runtime,
+		EUNION_SIDECAR_ACCESS_SHARED) == 0,
+		"open upper-only removal reader");
+	struct eunion_sidecar_lookup lookup;
+	require(eunion_sidecar_lookup_path(reader, guest_path, &lookup) == 0 &&
+		lookup.kind == EUNION_SIDECAR_RECORD_NONE,
+		"upper-only removal remains guest-visible absent");
+	require(eunion_sidecar_view_close(reader) == 0,
+		"close upper-only removal reader");
+	require(eunion_sidecar_remove_path(
+		runtime, guest_path, directory) == -ENOENT,
+		"repeat upper-only removal is idempotently absent");
+	require(eunion_sidecar_test_record_present(runtime, guest_path) == 0,
+		"repeat upper-only removal does not recreate a record");
+}
+
 int main(void)
 {
 	char root[] = "/tmp/eunion-sidecar-storage.XXXXXX";
@@ -80,6 +108,7 @@ int main(void)
 	char upper_hardlink[512];
 	char upper_fifo[512];
 	char upper_socket[512];
+	char upper_empty_directory[512];
 	char lower_locked_tree[512];
 	char lower_locked_child[512];
 	char upper_locked_tree[512];
@@ -136,6 +165,8 @@ int main(void)
 		upper, "/hardlink");
 	join_path(upper_fifo, sizeof(upper_fifo), upper, "/fifo");
 	join_path(upper_socket, sizeof(upper_socket), upper, "/socket");
+	join_path(upper_empty_directory, sizeof(upper_empty_directory),
+		upper, "/empty-directory");
 	join_path(lower_locked_tree, sizeof(lower_locked_tree),
 		lower, "/locked-tree");
 	join_path(lower_locked_child, sizeof(lower_locked_child),
@@ -366,6 +397,17 @@ int main(void)
 		"transactional unix socket bind");
 	require(close(socket_descriptor) == 0,
 		"close transactional unix socket");
+	require(eunion_sidecar_mkdir_create(
+		&runtime, "/empty-directory", 0700) == 0,
+		"create transactional empty directory");
+	require_upper_only_remove(
+		&runtime, "/socket", upper_socket, 0);
+	require_upper_only_remove(
+		&runtime, "/created", upper_created, 0);
+	require_upper_only_remove(
+		&runtime, "/link", upper_link, 0);
+	require_upper_only_remove(
+		&runtime, "/empty-directory", upper_empty_directory, 1);
 
 	mode_t tree_umask = umask(0777);
 	require(eunion_sidecar_copy_up_tree(&runtime, "/tree") == 0,

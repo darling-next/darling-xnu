@@ -2741,6 +2741,13 @@ static int eunion_sidecar_publish_created_record(
 	return eunion_sidecar_close_fd(&node, result);
 }
 
+static int eunion_sidecar_restore_staged_remove_record(
+	eunion_sidecar_view view,
+	const struct eunion_sidecar_journal_disk* journal);
+static int eunion_sidecar_finalize_absent_remove_record(
+	eunion_sidecar_view view,
+	const struct eunion_sidecar_journal_disk* journal);
+
 static int eunion_sidecar_restore_journal_record(
 	eunion_sidecar_view view,
 	const struct eunion_sidecar_journal_disk* journal, int forward)
@@ -2749,6 +2756,13 @@ static int eunion_sidecar_restore_journal_record(
 		forward ? &journal->new_record : &journal->old_record;
 	int wanted_valid =
 		forward ? journal->new_record_valid : journal->old_record_valid;
+	if (journal->operation == EUNION_SIDECAR_OPERATION_REMOVE &&
+		!journal->new_record_valid && journal->old_record_valid) {
+		if (forward)
+			return eunion_sidecar_finalize_absent_remove_record(
+				view, journal);
+		return eunion_sidecar_restore_staged_remove_record(view, journal);
+	}
 	if (forward && !wanted_valid)
 		return 0;
 	int node = -1;
@@ -2918,6 +2932,219 @@ static int eunion_sidecar_open_tree_parent(
 	eunion_sidecar_path_release(&path);
 	return result;
 }
+
+static int eunion_sidecar_records_equal(
+	const struct eunion_sidecar_node_disk* left,
+	const struct eunion_sidecar_node_disk* right)
+{
+	return eunion_sidecar_bytes_equal(left, right, sizeof(*left));
+}
+
+static int eunion_sidecar_open_remove_staging(eunion_sidecar_view view)
+{
+	return SIDECAR_SYSCALL(__NR_openat,
+		view->sidecar_descriptor, "staging-v1",
+		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+			LINUX_O_CLOEXEC, 0);
+}
+
+static int eunion_sidecar_read_named_record(
+	int parent, const char* name, struct eunion_sidecar_node_disk* record)
+{
+	int node = SIDECAR_SYSCALL(__NR_openat, parent, name,
+		LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
+			LINUX_O_CLOEXEC, 0);
+	if (node < 0)
+		return node;
+	int result = eunion_sidecar_read_node(node, record);
+	return eunion_sidecar_close_fd(&node, result);
+}
+
+static int eunion_sidecar_stage_absent_remove_record(
+	eunion_sidecar_view view, const char* guest_path,
+	const struct eunion_sidecar_node_disk* expected)
+{
+	int children = -1;
+	int staging = -1;
+	uint64_t parent_generation = 0;
+	char hash[17];
+	int result = eunion_sidecar_open_tree_parent(
+		view, guest_path, &children, &parent_generation, hash);
+	(void)parent_generation;
+	if (result < 0)
+		goto done;
+	struct eunion_sidecar_node_disk named;
+	result = eunion_sidecar_read_named_record(children, hash, &named);
+	if (result >= 0 && !eunion_sidecar_records_equal(&named, expected))
+		result = -LINUX_EAGAIN;
+	if (result < 0)
+		goto done;
+	staging = eunion_sidecar_open_remove_staging(view);
+	if (staging < 0) {
+		result = staging;
+		goto done;
+	}
+	sidecar_stat_t status;
+	result = SIDECAR_SYSCALL(__NR_newfstatat,
+		staging, "remove-v1", &status, LINUX_AT_SYMLINK_NOFOLLOW);
+	if (result >= 0) {
+		result = -LINUX_EBUSY;
+		goto done;
+	}
+	if (result != -LINUX_ENOENT)
+		goto done;
+	result = SIDECAR_SYSCALL(__NR_renameat2,
+		children, hash, staging, "remove-v1", LINUX_RENAME_NOREPLACE);
+	if (result >= 0)
+		result = SIDECAR_SYSCALL(__NR_fsync, children);
+	if (result >= 0)
+		result = SIDECAR_SYSCALL(__NR_fsync, staging);
+done:
+	eunion_sidecar_close_fd(&staging, 0);
+	eunion_sidecar_close_fd(&children, 0);
+	return result;
+}
+
+static int eunion_sidecar_restore_staged_remove_record(
+	eunion_sidecar_view view,
+	const struct eunion_sidecar_journal_disk* journal)
+{
+	int children = -1;
+	int staging = -1;
+	uint64_t parent_generation = 0;
+	char hash[17];
+	int result = eunion_sidecar_open_tree_parent(
+		view, journal->path, &children, &parent_generation, hash);
+	(void)parent_generation;
+	if (result < 0)
+		goto done;
+	struct eunion_sidecar_node_disk named;
+	int named_result = eunion_sidecar_read_named_record(
+		children, hash, &named);
+	if (named_result >= 0) {
+		result = eunion_sidecar_records_equal(
+			&named, &journal->old_record) ? 0 : -LINUX_EAGAIN;
+		goto done;
+	}
+	if (named_result != -LINUX_ENOENT) {
+		result = named_result;
+		goto done;
+	}
+	staging = eunion_sidecar_open_remove_staging(view);
+	if (staging < 0) {
+		result = staging;
+		goto done;
+	}
+	struct eunion_sidecar_node_disk staged;
+	result = eunion_sidecar_read_named_record(
+		staging, "remove-v1", &staged);
+	if (result >= 0 && !eunion_sidecar_records_equal(
+			&staged, &journal->old_record))
+		result = -LINUX_EAGAIN;
+	if (result < 0)
+		goto done;
+	result = SIDECAR_SYSCALL(__NR_renameat2,
+		staging, "remove-v1", children, hash, LINUX_RENAME_NOREPLACE);
+	if (result >= 0)
+		result = SIDECAR_SYSCALL(__NR_fsync, children);
+	if (result >= 0)
+		result = SIDECAR_SYSCALL(__NR_fsync, staging);
+done:
+	eunion_sidecar_close_fd(&staging, 0);
+	eunion_sidecar_close_fd(&children, 0);
+	return result;
+}
+
+static int eunion_sidecar_finalize_absent_remove_record(
+	eunion_sidecar_view view,
+	const struct eunion_sidecar_journal_disk* journal)
+{
+	int children = -1;
+	int staging = -1;
+	uint64_t parent_generation = 0;
+	char hash[17];
+	int result = eunion_sidecar_open_tree_parent(
+		view, journal->path, &children, &parent_generation, hash);
+	(void)parent_generation;
+	if (result < 0)
+		goto done;
+	struct eunion_sidecar_node_disk named;
+	int named_result = eunion_sidecar_read_named_record(
+		children, hash, &named);
+	if (named_result >= 0) {
+		if (!eunion_sidecar_records_equal(&named, &journal->old_record)) {
+			result = -LINUX_EAGAIN;
+			goto done;
+		}
+		result = eunion_sidecar_stage_absent_remove_record(
+			view, journal->path, &journal->old_record);
+		if (result < 0)
+			goto done;
+	} else if (named_result != -LINUX_ENOENT) {
+		result = named_result;
+		goto done;
+	}
+	staging = eunion_sidecar_open_remove_staging(view);
+	if (staging < 0) {
+		result = staging;
+		goto done;
+	}
+	struct eunion_sidecar_node_disk staged;
+	int staged_result = eunion_sidecar_read_named_record(
+		staging, "remove-v1", &staged);
+	if (staged_result == -LINUX_ENOENT) {
+		result = 0;
+		goto done;
+	}
+	if (staged_result < 0) {
+		result = staged_result;
+		goto done;
+	}
+	if (!eunion_sidecar_records_equal(&staged, &journal->old_record)) {
+		result = -LINUX_EAGAIN;
+		goto done;
+	}
+	result = eunion_sidecar_dispose_node(staging, "remove-v1");
+done:
+	eunion_sidecar_close_fd(&staging, 0);
+	eunion_sidecar_close_fd(&children, 0);
+	return result;
+}
+
+#ifdef TEST
+int eunion_sidecar_test_record_present(
+	const struct eunion_sidecar_runtime* runtime,
+	const char* guest_path)
+{
+	eunion_sidecar_view view = {{0}};
+	int result = eunion_sidecar_view_open(
+		view, runtime, EUNION_SIDECAR_ACCESS_SHARED);
+	if (result < 0)
+		return result;
+	int children = -1;
+	uint64_t parent_generation = 0;
+	char hash[17];
+	result = eunion_sidecar_open_tree_parent(
+		view, guest_path, &children, &parent_generation, hash);
+	(void)parent_generation;
+	if (result >= 0) {
+		sidecar_stat_t status;
+		result = SIDECAR_SYSCALL(__NR_newfstatat,
+			children, hash, &status, LINUX_AT_SYMLINK_NOFOLLOW);
+		if (result == -LINUX_ENOENT)
+			result = 0;
+		else if (result >= 0)
+			result = 1;
+	}
+	eunion_sidecar_close_fd(&children, 0);
+	{
+		int close_result = eunion_sidecar_view_close(view);
+		if (result >= 0 && close_result < 0)
+			result = close_result;
+	}
+	return result;
+}
+#endif
 
 static int eunion_sidecar_update_renamed_node(
 	int node, const char* new_guest_path, uint64_t parent_generation,
@@ -3327,6 +3554,7 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 	struct eunion_sidecar_node_disk old_record;
 	struct eunion_sidecar_node_disk new_record;
 	int record_published = 0;
+	int record_staged_absent = 0;
 	int old_record_valid = 0;
 	int journal_active = 0;
 	struct eunion_sidecar_journal_disk journal;
@@ -3530,6 +3758,18 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 		record_published = 1;
 		journal.new_record_valid = 1;
 		journal.new_record = new_record;
+	} else if (visible_upper && old_record_valid) {
+		if (old_record.kind != EUNION_SIDECAR_RECORD_INDEX ||
+			!eunion_sidecar_same_object(&old_record.upper, &upper) ||
+			old_record.lower.present) {
+			result = -LINUX_EAGAIN;
+			goto rollback;
+		}
+		result = eunion_sidecar_stage_absent_remove_record(
+			view, guest_path, &old_record);
+		if (result < 0)
+			goto rollback;
+		record_staged_absent = 1;
 	}
 	journal.phase = EUNION_SIDECAR_JOURNAL_LOGICALLY_PUBLISHED;
 	result = eunion_sidecar_write_journal(view, &journal);
@@ -3593,6 +3833,9 @@ int eunion_sidecar_remove_path(const struct eunion_sidecar_runtime* runtime,
 #endif
 	if (record_published)
 		result = SIDECAR_SYSCALL(__NR_fsync, sidecar_node);
+	if (result >= 0 && record_staged_absent)
+		result = eunion_sidecar_finalize_absent_remove_record(
+			view, &journal);
 	if (result < 0)
 		goto done;
 	journal.phase = EUNION_SIDECAR_JOURNAL_DURABLE;
