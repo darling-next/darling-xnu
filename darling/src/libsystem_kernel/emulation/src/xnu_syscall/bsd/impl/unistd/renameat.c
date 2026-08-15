@@ -8,6 +8,7 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
+#include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 
 extern char* strcpy(char* dst, const char* src);
 
@@ -15,6 +16,12 @@ long sys_renameat(int oldfd, const char* oldpath, int newfd, const char* newpath
 {
 	int ret;
 	struct vchroot_expand_args vc, vc2;
+	if (!oldpath || !newpath) return -EFAULT;
+	if (darling_guest_namespace_state() == DARLING_GUEST_NAMESPACE_REQUIRED) {
+		if (oldpath[0] != '/' || newpath[0] != '/') return -ENOTSUP;
+		ret = darling_guest_namespace_rename(oldpath, newpath);
+		return ret < 0 ? errno_linux_to_bsd(ret) : ret;
+	}
 
 	vc.flags = 0;
 	vc.dfd = atfd(oldfd);

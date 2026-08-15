@@ -43,6 +43,11 @@ void __mldr_postfork_child(void)
 	return elfcalls()->postfork_child();
 }
 
+int __mldr_guest_namespace_capability_fd(unsigned int index)
+{
+	return elfcalls()->guest_namespace_capability_fd(index);
+}
+
 void* __darling_thread_create(unsigned long stack_size, unsigned long pthobj_size,
 			void* entry_point, uintptr_t arg3,
 			uintptr_t arg4, uintptr_t arg5, uintptr_t arg6,

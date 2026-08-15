@@ -8,6 +8,7 @@
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
+#include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 
 
 extern char* strcpy(char* dst, const char* src);
@@ -23,6 +24,13 @@ long sys_unlinkat(int fd, const char* path, int flag)
 	
 	if (!path)
 		return -EFAULT;
+	if (darling_guest_namespace_state() == DARLING_GUEST_NAMESPACE_REQUIRED) {
+		if (path[0] != '/') return -ENOTSUP;
+		linux_flags = atflags_bsd_to_linux(flag);
+		if (linux_flags == LINUX_AT_INVALID) return -EINVAL;
+		ret = darling_guest_namespace_unlink(path, linux_flags);
+		return ret < 0 ? errno_linux_to_bsd(ret) : ret;
+	}
 
 	strcpy(vc.path, path);
 

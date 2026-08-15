@@ -51,6 +51,7 @@ set(conversion_sources
 )
 
 set(linux_premigration_sources
+	src/linux_premigration/guest_namespace_authority.c
 	src/linux_premigration/ext/clock_gettime.c
 	src/linux_premigration/ext/clock_nanosleep.c
 	src/linux_premigration/ext/epoll_create.c
@@ -438,4 +439,3 @@ endif()
 
 make_fat(emulation)
 make_fat(emulation_dyld)
-

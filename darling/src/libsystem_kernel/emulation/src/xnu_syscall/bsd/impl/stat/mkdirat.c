@@ -9,6 +9,7 @@
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 #include <darling/emulation/other/mach/lkm.h>
+#include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 
 extern char* strcpy(char* dst, const char* src);
 
@@ -19,6 +20,11 @@ long sys_mkdirat(int fd, const char* path, unsigned int mode)
 
 	if (!path)
 		return -EFAULT;
+	if (darling_guest_namespace_state() == DARLING_GUEST_NAMESPACE_REQUIRED) {
+		if (path[0] != '/') return -ENOTSUP;
+		ret = darling_guest_namespace_mkdir(path, mode);
+		return ret < 0 ? errno_linux_to_bsd(ret) : ret;
+	}
 
 	vc.flags = 0;
 	vc.dfd = atfd(fd);

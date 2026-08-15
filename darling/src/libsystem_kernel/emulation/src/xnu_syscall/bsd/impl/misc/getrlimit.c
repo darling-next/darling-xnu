@@ -5,6 +5,7 @@
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 
 long sys_getrlimit(unsigned int which, struct xnu_rlimit* rlp)
 {
@@ -22,6 +23,10 @@ long sys_getrlimit(unsigned int which, struct xnu_rlimit* rlp)
 	{
 		rlp->rlim_cur--;
 		rlp->rlim_max--;
+		if (darling_guest_namespace_state() == DARLING_GUEST_NAMESPACE_REQUIRED) {
+			if (rlp->rlim_cur > 1008) rlp->rlim_cur = 1008;
+			if (rlp->rlim_max > 1008) rlp->rlim_max = 1008;
+		}
 	}
 
 	return ret;

@@ -13,6 +13,7 @@
 #include <darling/emulation/common/guarded/table.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
 #include <darling/emulation/linux_premigration/ext/sys/linux_time.h>
+#include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 
 #include <elfcalls.h>
 
@@ -67,6 +68,24 @@ void mach_driver_init(const char** applep)
 		}
 	}
 #endif
+	int guest_namespace_state = darling_guest_namespace_initialize();
+	if (guest_namespace_state == DARLING_GUEST_NAMESPACE_INVALID) {
+		__simple_printf("invalid required guest namespace bootstrap\n");
+		__simple_abort();
+	}
+	#ifndef VARIANT_DYLD
+	if (guest_namespace_state == DARLING_GUEST_NAMESPACE_REQUIRED && applep) {
+		guard_entry_options_t options = { 0 };
+		for (unsigned int index = 0; index < 4; ++index) {
+			int capability = darling_guest_namespace_protected_fd(index);
+			if (capability < 0 || guard_table_add(capability,
+				guard_flag_prevent_close, &options) != 0) {
+				__simple_printf("cannot protect required guest namespace capability\n");
+				__simple_abort();
+			}
+		}
+	}
+	#endif
 
 	// mach_driver_init() gets called at several points in application's lifetime:
 	// 1) When dyld loads

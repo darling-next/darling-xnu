@@ -11,6 +11,7 @@
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/bsdthread/cancelable.h>
+#include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 
 #include <darlingserver/rpc.h>
 
@@ -44,6 +45,16 @@ long sys_openat_nocancel(int fd, const char* filename, int flags, unsigned int m
 	if (sizeof(void*) == 4)
 	{
 		linux_flags |= LINUX_O_LARGEFILE;
+	}
+
+	if (darling_guest_namespace_state() == DARLING_GUEST_NAMESPACE_REQUIRED &&
+		((flags & 0x3) == BSD_O_WRONLY || (flags & 0x3) == BSD_O_RDWR ||
+		 (flags & BSD_O_CREAT) || (flags & BSD_O_TRUNC))) {
+		if (filename[0] == '/' && (flags & BSD_O_CREAT) && (flags & BSD_O_EXCL)) {
+			ret = darling_guest_namespace_create(filename, linux_flags, mode);
+			return ret < 0 ? errno_linux_to_bsd(ret) : ret;
+		}
+		return -ENOTSUP;
 	}
 
 	// XNU /dev/random behaves like Linux /dev/urandom

@@ -17,6 +17,7 @@ void native_exit(int ec);
 
 long native_sysconf(int name);
 void __mldr_postfork_child(void);
+int __mldr_guest_namespace_capability_fd(unsigned int index);
 
 // Native thread wrapping
 void* __darling_thread_create(unsigned long stack_size, unsigned long pthobj_size,
