@@ -4,6 +4,7 @@
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/dirent/getdirentries.h>
+#include <darling/emulation/conversion/duct_errno.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/linux_premigration/guest_namespace_authority.h>
@@ -122,7 +123,7 @@ read_next_page:
 	 * Continue to the actual EOF (or a bounded fail-closed error). */
 	if (ret > 0 && opos == 0 && bpos >= ret) {
 		if (++hidden_only_pages > 64)
-			return errno_linux_to_bsd(-EIO);
+			return errno_linux_to_bsd(-LINUX_EIO);
 		goto read_next_page;
 	}
 
@@ -190,7 +191,7 @@ read_next_page64:
 	}
 	if (ret > 0 && opos == 0 && bpos >= ret) {
 		if (++hidden_only_pages > 64)
-			return errno_linux_to_bsd(-EIO);
+			return errno_linux_to_bsd(-LINUX_EIO);
 		goto read_next_page64;
 	}
 

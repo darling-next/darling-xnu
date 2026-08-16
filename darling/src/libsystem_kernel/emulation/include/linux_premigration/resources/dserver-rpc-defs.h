@@ -115,6 +115,10 @@ static long int dserver_rpc_hooks_send_message(int socket, const dserver_rpc_hoo
 #define DARLING_GUEST_RECVSPIN 512
 #endif
 
+#ifndef LINUX_MSG_CMSG_CLOEXEC
+#define LINUX_MSG_CMSG_CLOEXEC 0x40000000
+#endif
+
 static inline void __dserver_recvspin_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
 	__builtin_ia32_pause();
@@ -135,9 +139,9 @@ retry:
 		// sleep/wakeup. Capped, so a genuinely slow reply falls through to the real
 		// blocking recvmsg below and never busy-waits unboundedly.
 #ifdef __NR_socketcall
-		ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVMSG, ((long[6]) { socket, out_message, LINUX_MSG_DONTWAIT }));
+		ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVMSG, ((long[6]) { socket, out_message, LINUX_MSG_DONTWAIT | LINUX_MSG_CMSG_CLOEXEC }));
 #else
-		ret = LINUX_SYSCALL(__NR_recvmsg, socket, out_message, LINUX_MSG_DONTWAIT);
+		ret = LINUX_SYSCALL(__NR_recvmsg, socket, out_message, LINUX_MSG_DONTWAIT | LINUX_MSG_CMSG_CLOEXEC);
 #endif
 		if (ret >= 0) {
 			goto got_message;
@@ -152,9 +156,9 @@ retry:
 #endif
 
 #ifdef __NR_socketcall
-	ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVMSG, ((long[6]) { socket, out_message, 0 }));
+	ret = LINUX_SYSCALL(__NR_socketcall, LINUX_SYS_RECVMSG, ((long[6]) { socket, out_message, LINUX_MSG_CMSG_CLOEXEC }));
 #else
-	ret = LINUX_SYSCALL(__NR_recvmsg, socket, out_message, 0);
+	ret = LINUX_SYSCALL(__NR_recvmsg, socket, out_message, LINUX_MSG_CMSG_CLOEXEC);
 #endif
 	if (ret < 0) {
 		return ret;

@@ -41,7 +41,11 @@ long darling_guest_namespace_unlink(const char* path, int linux_flags);
 long darling_guest_namespace_rename(const char* source, const char* destination);
 
 #ifdef TEST
+typedef long (*darling_guest_namespace_test_transaction_fn)(uint32_t operation,
+	const char* source, const char* destination, int flags, uint32_t mode);
 void darling_guest_namespace_test_set_capability(unsigned int index, int fd);
+void darling_guest_namespace_test_set_transaction(
+	darling_guest_namespace_test_transaction_fn transaction);
 void darling_guest_namespace_test_reset(void);
 #endif
 
