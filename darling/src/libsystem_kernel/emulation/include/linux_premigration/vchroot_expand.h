@@ -52,6 +52,9 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap);
 // MUST be called from close()/closedir() so the per-fd state is freed.
 int vchroot_getdents_merge(int fd, char* out, int cap);
 void vchroot_dir_closed(int fd);
+// Synchronize the synthetic merged-directory cursor after a successful seek.
+// The offset is a cookie previously returned in linux_dirent64.d_off.
+int vchroot_dir_seek(int fd, long long offset);
 // Thin policy helpers the syscall-emulation sites call (see vchroot_userspace.c):
 //   vchroot_prepare_write(guest) BEFORE a write/mutate (expand then hits upper);
 //   vchroot_post_unlink(guest)   AFTER a successful unlink/rmdir;

@@ -1285,14 +1285,27 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 						continue;
 					memcpy(child, up, hl); child[hl] = '/'; memcpy(child + hl + 1, nm, nl + 1);
 
+					int emit_result;
 					if (eunion_has_marker(child, EUNION_WH_XATTR))
-						eunion_emit_name(whbuf, sizeof(whbuf), &whused, &whcount, nm); // hidden
+						emit_result = eunion_emit_name(
+							whbuf, sizeof(whbuf), &whused, &whcount, nm);
 					else
-						eunion_emit_name(out, cap, &used, &count, nm); // visible upper entry
+						emit_result = eunion_emit_name(
+							out, cap, &used, &count, nm);
+					if (emit_result < 0) {
+						LINUX_SYSCALL(__NR_close, dfd);
+						return emit_result;
+					}
 				}
+			}
+			if (len < 0) {
+				LINUX_SYSCALL(__NR_close, dfd);
+				return len;
 			}
 			LINUX_SYSCALL(__NR_close, dfd);
 		}
+		else if (dfd != -LINUX_ENOENT && dfd != -LINUX_ENOTDIR)
+			return dfd;
 
 		// 2. opaque upper dir -> do not merge lower
 		if (eunion_has_marker(up, EUNION_OPAQUE_XATTR))
@@ -1321,11 +1334,22 @@ int vchroot_readdir_merge(const char* guest, char* out, int cap)
 					// suppressed by a whiteout in the upper?
 					if (name_in_set(whbuf, whcount, nm))
 						continue;
-					eunion_emit_name(out, cap, &used, &count, nm);
+					int emit_result = eunion_emit_name(
+						out, cap, &used, &count, nm);
+					if (emit_result < 0) {
+						LINUX_SYSCALL(__NR_close, dfd);
+						return emit_result;
+					}
 				}
+			}
+			if (len < 0) {
+				LINUX_SYSCALL(__NR_close, dfd);
+				return len;
 			}
 			LINUX_SYSCALL(__NR_close, dfd);
 		}
+		else if (dfd != -LINUX_ENOENT && dfd != -LINUX_ENOTDIR)
+			return dfd;
 	}
 
 	return count;
@@ -1352,6 +1376,8 @@ struct eunion_dir_state
 {
 	int  fd;                    // upper fd this state tracks (-1 = free slot)
 	int  ready;                 // names[] materialized?
+	unsigned long long device;  // retained directory identity
+	unsigned long long inode;
 	int  count;                 // number of names
 	int  cursor;                // byte offset of the next name to emit
 	int  used;                  // bytes used in names[]
@@ -1389,6 +1415,33 @@ void vchroot_dir_closed(int fd)
 		return;
 	s->fd = -1;
 	s->ready = 0;
+}
+
+int vchroot_dir_seek(int fd, long long offset)
+{
+	if (offset < 0 || offset > EUNION_NAMEBUF)
+		return -LINUX_EINVAL;
+	struct eunion_dir_state* s = eunion_dir_find(fd);
+	if (!s)
+		return 0;
+	if (s->ready && offset > s->used)
+		return -LINUX_EINVAL;
+	if (offset == 0) {
+		/* Re-materialize on rewind. This also makes a close/reopen of the same
+		 * directory inode observe changes made between the two opens. */
+		s->ready = 0;
+		s->cursor = 0;
+		return 0;
+	}
+	if (s->ready) {
+		int cursor = 0;
+		while (cursor < s->used && cursor != offset)
+			cursor += (int)strlen(s->names + cursor) + 1;
+		if (cursor != offset)
+			return -LINUX_EINVAL;
+	}
+	s->cursor = (int)offset;
+	return 0;
 }
 
 static struct eunion_dir_state* eunion_dir_alloc(int fd)
@@ -1442,7 +1495,7 @@ static unsigned char eunion_dt_from_mode(unsigned int mode)
 // DT_UNKNOWN fallback rather than dropping it -- a missing entry is worse than an
 // unknown type a caller can recover from with its own stat.
 static int eunion_emit_dirent(char* out, int cap, int used,
-		const char* dirguest, const char* name)
+		const char* dirguest, const char* name, int next_cursor)
 {
 	int nl = (int)strlen(name) + 1;
 	int hdr = (int)__builtin_offsetof(struct linux_dirent64, d_name);
@@ -1485,7 +1538,7 @@ static int eunion_emit_dirent(char* out, int cap, int used,
 
 	struct linux_dirent64* de = (struct linux_dirent64*) (out + used);
 	de->d_ino = dino ? dino : 1; // real inode; 1 only as a last-resort fallback
-	de->d_off = 0;
+	de->d_off = next_cursor;
 	de->d_reclen = (unsigned short) reclen;
 	de->d_type = dtype;
 	memcpy(de->d_name, name, nl);
@@ -1511,15 +1564,43 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 		return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
 
 	struct eunion_dir_state* s = eunion_dir_find(fd);
+	if (s && s->ready) {
+		stat_t identity;
+		int status = LINUX_SYSCALL(__NR_fstat, fd, &identity);
+		if (status < 0) {
+			vchroot_dir_closed(fd);
+			return status;
+		}
+		long long kernel_cursor = LINUX_SYSCALL(__NR_lseek, fd, 0, 1);
+		if (kernel_cursor < 0) {
+			vchroot_dir_closed(fd);
+			return (int)kernel_cursor;
+		}
+		if (s->device != (unsigned long long)identity.st_dev ||
+			s->inode != (unsigned long long)identity.st_ino ||
+			kernel_cursor != s->cursor) {
+			/* The numeric FD was reused, rewound outside sys_lseek(), or moved
+			 * independently. Never serve a previous open-file description's
+			 * synthetic EOF or names through the new capability. */
+			s->ready = 0;
+			s->cursor = 0;
+		}
+	}
 	if (!s)
 	{
 		s = eunion_dir_alloc(fd);
-		if (!s) // table full: degrade gracefully to plain upper stream
-			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		if (!s)
+			return -LINUX_EMFILE;
 	}
 
 	if (!s->ready)
 	{
+		stat_t identity;
+		int identity_status = LINUX_SYSCALL(__NR_fstat, fd, &identity);
+		if (identity_status < 0) {
+			vchroot_dir_closed(fd);
+			return identity_status;
+		}
 		// recover the guest dir path from the upper fd, then materialize the
 		// merged listing once.
 		char guest[4096];
@@ -1527,10 +1608,19 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 		fp.fd = fd; fp.path = guest; fp.maxlen = sizeof(guest);
 		if (vchroot_fdpath(&fp) < 0) // not under the prefix: no merge to do
 			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		static const char escape_root[] = "/Volumes/SystemRoot";
+		if (strncmp(guest, escape_root, sizeof(escape_root) - 1) == 0 &&
+			(guest[sizeof(escape_root) - 1] == '\0' ||
+			 guest[sizeof(escape_root) - 1] == '/')) {
+			vchroot_dir_closed(fd);
+			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		}
 
 		int n = vchroot_readdir_merge(guest, s->names, sizeof(s->names));
-		if (n < 0) // fall back to the raw stream on any merge error
-			return LINUX_SYSCALL(__NR_getdents64, fd, out, cap);
+		if (n < 0) {
+			vchroot_dir_closed(fd);
+			return n;
+		}
 
 		// remember the guest dir path so the emitter can lstat each entry for a
 		// real d_type/d_ino (overlay presents valid types, not DT_UNKNOWN).
@@ -1544,6 +1634,8 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 
 		s->count = n;
 		s->cursor = 0;
+		s->device = (unsigned long long)identity.st_dev;
+		s->inode = (unsigned long long)identity.st_ino;
 		s->used = 0;
 		// compute total bytes for cursor walking
 		const char* p = s->names;
@@ -1555,14 +1647,26 @@ int vchroot_getdents_merge(int fd, char* out, int cap)
 
 	// page out from cursor
 	int written = 0;
+	int initial_cursor = s->cursor;
 	while (s->cursor < s->used)
 	{
 		const char* name = s->names + s->cursor;
-		int w = eunion_emit_dirent(out, cap, written, s->guest, name);
+		int next_cursor = s->cursor + (int)strlen(name) + 1;
+		int w = eunion_emit_dirent(
+			out, cap, written, s->guest, name, next_cursor);
 		if (!w)
 			break; // page full; resume here next call
 		written += w;
-		s->cursor += (int)strlen(name) + 1;
+		s->cursor = next_cursor;
+	}
+	if (written == 0 && s->cursor < s->used)
+		return -LINUX_EINVAL;
+	if (written > 0) {
+		long long seek_result = LINUX_SYSCALL(__NR_lseek, fd, s->cursor, 0);
+		if (seek_result < 0 || seek_result != s->cursor) {
+			s->cursor = initial_cursor;
+			return seek_result < 0 ? (int)seek_result : -LINUX_EIO;
+		}
 	}
 	return written; // 0 when cursor reaches used -> end of merged stream
 }
@@ -1848,8 +1952,6 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 					return -LINUX_ENOENT;
 				
 				// Append the component
-				const int prevlen = ctxt->current_path_len;
-
 				memcpy(ctxt->current_path + ctxt->current_path_len, input_path, len);
 				ctxt->current_path_len += len;
 				ctxt->current_path[ctxt->current_path_len] = '\0';
@@ -1998,18 +2100,26 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 						}
 					}
 #endif
+					/* Layer selection can replace the host root with one of a
+					 * different byte length. Component boundaries must therefore be
+					 * derived from the currently resolved host path plus the logical
+					 * guest component length, never from an offset captured before
+					 * the layer transition. */
+					const int component_start =
+						ctxt->current_path_len - (int)len;
+					const int parent_slash = component_start - 1;
 
 					if (icase_enabled && status == -LINUX_ENOENT)
 					{
 						// Case insensitive search
 
 						// Examine the directory above
-						ctxt->current_path[prevlen-1] = '\0';
+						ctxt->current_path[parent_slash] = '\0';
 						
 						#if defined(__NR_open)
-							int dfd = LINUX_SYSCALL(__NR_open, (prevlen > 1) ? ctxt->current_path : "/", LINUX_O_RDONLY);
+							int dfd = LINUX_SYSCALL(__NR_open, (parent_slash > 0) ? ctxt->current_path : "/", LINUX_O_RDONLY);
 						#else
-							int dfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, (prevlen > 1) ? ctxt->current_path : "/", LINUX_O_RDONLY);
+							int dfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, (parent_slash > 0) ? ctxt->current_path : "/", LINUX_O_RDONLY);
 						#endif
 						char dirents[4096]; // buffer space for struct linux_dirent64 entries
 						int len;
@@ -2029,10 +2139,10 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 							while (pos < len)
 							{
 								struct linux_dirent64* de = (struct linux_dirent64*) &dirents[pos];
-								if (strcasecmp(de->d_name, ctxt->current_path + prevlen) == 0)
+								if (strcasecmp(de->d_name, ctxt->current_path + component_start) == 0)
 								{
 									// Fix up the case and be done with it
-									strcpy(ctxt->current_path + prevlen, de->d_name);
+									strcpy(ctxt->current_path + component_start, de->d_name);
 									goto done_getdents;
 								}
 								pos += de->d_reclen;
@@ -2041,7 +2151,7 @@ static int vchroot_run(const char* input_path, struct context* ctxt)
 						ctxt->unknown_component = true;
 done_getdents:
 						// Restore the / we removed a few lines above
-						ctxt->current_path[prevlen-1] = '/';
+						ctxt->current_path[parent_slash] = '/';
 						LINUX_SYSCALL(__NR_close, dfd);
 					}
 					else if (status == 0 && (st.st_mode & LINUX_S_IFMT) == LINUX_S_IFLNK)
@@ -2077,7 +2187,7 @@ done_getdents:
 							// Remove the last component (because it will be substituted with symlink contents)
 							if (link[0] != '/') // Only bother to do that if we know that the symlink is not absolute
 							{
-								ctxt->current_path_len = prevlen - 1; // kill the last slash as well
+								ctxt->current_path_len = parent_slash;
 								ctxt->current_path[ctxt->current_path_len] = '\0';
 							}
 
@@ -2150,6 +2260,15 @@ int vchroot_fdpath(struct vchroot_fdpath_args* args)
 #ifndef TEST
 	if (prefix_path_len == -1)
 		init_vchroot_path();
+#endif
+#ifdef EUNION
+	/* A retained vchroot capability can initialize prefix_path before the
+	 * ordinary path-expansion entrypoint runs.  Retry E-UNION activation here
+	 * so F_GETPATH on a directly-opened lower directory is detranslated to its
+	 * guest path, rather than leaking a /Volumes/SystemRoot host path to
+	 * readdir callers such as launchctl. */
+	if (libexec_path_len <= 0)
+		eunion_init_from_prefix();
 #endif
 
 	char buf[50];

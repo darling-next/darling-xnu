@@ -3,6 +3,9 @@
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#ifdef EUNION
+#include <darling/emulation/linux_premigration/vchroot_expand.h>
+#endif
 
 long long sys_lseek(int fd, long long offset, int whence)
 {
@@ -20,6 +23,13 @@ long long sys_lseek(int fd, long long offset, int whence)
 #endif
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
+#ifdef EUNION
+	else if (whence == 0) {
+		int merge_result = vchroot_dir_seek(fd, offset);
+		if (merge_result < 0)
+			ret = errno_linux_to_bsd(merge_result);
+	}
+#endif
 
 	return ret;
 }
