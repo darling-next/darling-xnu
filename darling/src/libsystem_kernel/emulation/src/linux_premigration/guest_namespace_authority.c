@@ -32,7 +32,7 @@
 #define CAP_POLL(capfd) ({ struct pollfd p = {.fd = (capfd), .events = POLLIN | POLLHUP | POLLERR}; poll(&p, 1, 0); })
 #define CAP_YIELD() sched_yield()
 typedef struct stat cap_stat_t;
-static int test_capabilities[5] = {-1, -1, -1, -1, -1};
+static int test_capabilities[6] = {-1, -1, -1, -1, -1, -1};
 #else
 #include <darling/emulation/linux_premigration/guest_namespace_authority.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
@@ -117,12 +117,13 @@ static void cap_copy(void* destination, const void* source, __SIZE_TYPE__ size) 
 	for (__SIZE_TYPE__ index = 0; index < size; ++index) output[index] = input[index];
 }
 
-#define CAPABILITY_COUNT 5
+#define CAPABILITY_COUNT 6
 #define LEASE_INDEX 0
 #define GATE_INDEX 1
 #define PREFIX_INDEX 2
 #define LOCK_INDEX 3
 #define CONTROLLER_PIDFD_INDEX 4
+#define LOWER_INDEX 5
 #define ACTIVE 1u
 
 #ifndef TEST
@@ -176,6 +177,8 @@ struct lease_page {
 	struct cap_identity prefix;
 	struct cap_identity lock;
 	struct cap_identity gate;
+	_Atomic uint64_t lower_device;
+	_Atomic uint64_t lower_inode;
 	int32_t controller_pid;
 };
 
@@ -183,7 +186,7 @@ enum initialization_state { INIT_UNINITIALIZED, INIT_INITIALIZING, INIT_OFF, INI
 static _Atomic int initialized = INIT_UNINITIALIZED;
 static _Atomic int session_state = DARLING_GUEST_NAMESPACE_OFF;
 static struct lease_page* lease_page;
-static int capabilities[CAPABILITY_COUNT] = {-1, -1, -1, -1, -1};
+static int capabilities[CAPABILITY_COUNT] = {-1, -1, -1, -1, -1, -1};
 #ifdef TEST
 static darling_guest_namespace_test_transaction_fn test_transaction;
 #endif
@@ -304,7 +307,7 @@ int darling_guest_namespace_initialize(void) {
 	lease_page = CAP_MMAP(capabilities[LEASE_INDEX], sizeof(*lease_page));
 	if ((unsigned long)lease_page >= (unsigned long)-4095 || !lease_page)
 		return invalid_bootstrap("lease mapping");
-	if (!cap_bytes_equal(lease_page->magic, "DLGNSA2", 8) || lease_page->version != 2 ||
+	if (!cap_bytes_equal(lease_page->magic, "DLGNSA3", 8) || lease_page->version != 3 ||
 		lease_page->generation == 0 || lease_page->controller_pid <= 0)
 		return invalid_bootstrap("lease envelope");
 	if (atomic_load_explicit(&lease_page->state, memory_order_acquire) != ACTIVE)
@@ -315,6 +318,12 @@ int darling_guest_namespace_initialize(void) {
 		return invalid_bootstrap("lock identity");
 	if (!same_identity(capabilities[GATE_INDEX], lease_page->gate))
 		return invalid_bootstrap("gate identity");
+	struct cap_identity lower_identity = {
+		atomic_load_explicit(&lease_page->lower_device, memory_order_acquire),
+		atomic_load_explicit(&lease_page->lower_inode, memory_order_acquire),
+	};
+	if (!same_identity(capabilities[LOWER_INDEX], lower_identity))
+		return invalid_bootstrap("lower identity");
 	if (CAP_POLL(capabilities[CONTROLLER_PIDFD_INDEX]) != 0)
 		return invalid_bootstrap("controller death");
 	atomic_store_explicit(&session_state, DARLING_GUEST_NAMESPACE_REQUIRED, memory_order_release);

@@ -4,6 +4,8 @@
 #include <sys/fcntl.h>
 
 #include <darling/emulation/conversion/stat/common.h>
+#include <darling/emulation/conversion/common_at.h>
+#include <darling/emulation/conversion/fcntl/open.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/common/simple.h>
@@ -54,9 +56,16 @@ long sys_fstatfs64(int fd, struct bsd_statfs64* buf)
 	if (ret < 0)
 		return ret;
 
-	fd_m = sys_open("/proc/self/mounts", O_RDONLY, 0);
+	/* `/proc/self/mounts` is host-kernel metadata used to describe an already
+	 * retained descriptor.  Routing this internal lookup through sys_open()
+	 * applies the guest vchroot a second time; in E-UNION that turns it into a
+	 * nonexistent lower-root path and makes opendir() fail after its directory
+	 * open already succeeded.  Keep the metadata acquisition on the raw Linux
+	 * side, exactly like the fstatfs syscall above. */
+	fd_m = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, "/proc/self/mounts",
+		LINUX_O_RDONLY | LINUX_O_CLOEXEC, 0);
 	if (fd_m < 0)
-		return fd_m;
+		return errno_linux_to_bsd(fd_m);
 	
 	__simple_readline_init(&rbuf);
 
@@ -96,6 +105,6 @@ long sys_fstatfs64(int fd, struct bsd_statfs64* buf)
 		strlcpy(buf->f_mntfromname, mntfrom, sizeof(buf->f_mntfromname));
 	}
 
-	close_internal(fd_m);
+	LINUX_SYSCALL(__NR_close, fd_m);
 	return 0;
 }

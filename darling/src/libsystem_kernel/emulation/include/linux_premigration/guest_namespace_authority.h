@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define DARLING_GUEST_NAMESPACE_PROTECTED_FD_COUNT 6
+
 enum darling_guest_namespace_bootstrap_state {
 	DARLING_GUEST_NAMESPACE_OFF = 0,
 	DARLING_GUEST_NAMESPACE_REQUIRED = 1,

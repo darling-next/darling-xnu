@@ -76,7 +76,7 @@ void mach_driver_init(const char** applep)
 	#ifndef VARIANT_DYLD
 	if (guest_namespace_state == DARLING_GUEST_NAMESPACE_REQUIRED && applep) {
 		guard_entry_options_t options = { 0 };
-		for (unsigned int index = 0; index < 4; ++index) {
+		for (unsigned int index = 0; index < DARLING_GUEST_NAMESPACE_PROTECTED_FD_COUNT; ++index) {
 			int capability = darling_guest_namespace_protected_fd(index);
 			if (capability < 0 || guard_table_add(capability,
 				guard_flag_prevent_close, &options) != 0) {
