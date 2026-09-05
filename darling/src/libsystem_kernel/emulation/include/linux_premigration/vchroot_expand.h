@@ -59,6 +59,11 @@ int vchroot_dir_dup(int oldfd, int newfd);
 //   vchroot_post_unlink(guest)   AFTER a successful unlink/rmdir;
 //   vchroot_pre_mkdir(guest)     BEFORE re-creating a possibly-deleted name.
 int vchroot_prepare_write(const char* guest);
+// Resolve with args->flags (including final-symlink follow), require an existing
+// target, and copy that canonical node up. Returns a concrete writable host
+// path in args, or a negative Linux errno. The caller must not follow the final
+// host symlink again: use AT_SYMLINK_NOFOLLOW for ownership changes.
+int vchroot_expand_for_meta_write(struct vchroot_expand_args* args);
 // Convert an absolute or dirfd-relative syscall path into a canonical absolute
 // guest path. Returns 0 for a path inside the union, 1 for an unmanaged path,
 // or a negative Linux errno. The caller owns `out`.
@@ -74,11 +79,12 @@ int vchroot_prepare_write_at(int dfd, const char* rel);
 // recovers the fd's guest path, copies it up, returns the guest path in `out`
 // (len > 0) so the caller can re-open the upper copy. 0 = not union-managed.
 int vchroot_prepare_write_fd(int fd, char* out, int cap);
-// High-level fd-metadata helper: copy up the fd's object if lower-only and return
-// a FRESH fd on the upper copy (caller applies the metadata op to it and closes
-// it). Returns the ORIGINAL fd unchanged if unmanaged/escape/no-copyup (caller
-// keeps using it, does not close it), or a negative errno. Used by fchmod/
-// fchmod_extended/futimes/fsetxattr/fremovexattr.
+// High-level fd-metadata helper: copy up a lower fd's object and return a FRESH
+// fd on the upper copy. Caller closes it iff it differs from the original fd.
+// Upper/unmanaged fds retain their original inode (including unlinked upper
+// objects). Invalid/unmappable/stale lower descriptors fail closed with a
+// negative Linux errno. Used by fchmod/fchown/fchmod_extended/futimes/
+// fsetxattr/fremovexattr.
 int vchroot_fd_for_meta_write(int fd);
 // High-level helper for CONTENT-mutating fd ops (ftruncate): like
 // vchroot_fd_for_meta_write but the returned fd is opened O_RDWR (ftruncate needs
