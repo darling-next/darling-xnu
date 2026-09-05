@@ -2344,8 +2344,20 @@ done_getdents:
 						// Restore the / we removed a few lines above
 						ctxt->current_path[prevlen-1] = '/';
 						LINUX_SYSCALL(__NR_close, dfd);
+						if (!ctxt->unknown_component)
+						{
+							// Case correction can reveal a symlink. Inspect the corrected
+							// name before applying the normal guest follow policy below.
+							#if defined(__NR_lstat)
+								status = LINUX_SYSCALL(__NR_lstat, ctxt->current_path, &st);
+							#elif defined(__NR_newfstatat)
+								status = LINUX_SYSCALL(__NR_newfstatat, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+							#else
+								status = LINUX_SYSCALL(__NR_fstatat64, LINUX_AT_FDCWD, ctxt->current_path, &st, LINUX_AT_SYMLINK_NOFOLLOW);
+							#endif
+						}
 					}
-					else if (status == 0 && (st.st_mode & LINUX_S_IFMT) == LINUX_S_IFLNK)
+					if (status == 0 && (st.st_mode & LINUX_S_IFMT) == LINUX_S_IFLNK)
 					{
 						// Follow symlink if follow is true or if we haven't reached the end of the input path yet
 						if (ctxt->follow || *end)
