@@ -23,6 +23,10 @@
 #	define LINUX_ELOOP ELOOP
 #	define LINUX_ENAMETOOLONG ENAMETOOLONG
 #	define LINUX_EPERM EPERM
+#	define LINUX_EBADF EBADF
+#	define LINUX_ESTALE ESTALE
+#	define LINUX_F_GETFL F_GETFL
+#	define LINUX_O_CLOEXEC O_CLOEXEC
 
 #	define LINUX_S_IFMT S_IFMT
 #	define LINUX_S_IFLNK S_IFLNK
@@ -46,6 +50,7 @@ typedef struct stat stat_t;
 #	include <darling/emulation/conversion/dirent/getdirentries.h>
 #	include <darling/emulation/conversion/errno.h>
 #	include <darling/emulation/conversion/fcntl/open.h>
+#	include <darling/emulation/conversion/fcntl/fcntl.h>
 #	include <darling/emulation/conversion/duct_errno.h>
 #	include <darling/emulation/conversion/stat/common.h>
 #	include <darling/emulation/xnu_syscall/bsd/impl/dirent/getdirentries.h>
@@ -68,6 +73,33 @@ static bool next_component(const char* from, const char** end);
 
 static char prefix_path[4096] = {0}; // MUST NOT end with '/'
 static int prefix_path_len = -1;
+
+#ifndef TEST
+static void init_vchroot_path(void);
+#endif
+
+// Shared procfs fd spelling; do not detranslate until the caller has decided
+// whether the descriptor refers to an upper, lower, or unmanaged inode.
+static int vchroot_read_fd_path(int fd, char* path, int cap)
+{
+#ifndef TEST
+	if (prefix_path_len == -1)
+		init_vchroot_path();
+#endif
+	char proc[50];
+	__simple_sprintf(proc, "/proc/self/fd/%d", fd);
+#if defined(__NR_readlink)
+	int length = LINUX_SYSCALL(__NR_readlink, proc, path, cap);
+#else
+	int length = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, proc, path, cap);
+#endif
+	if (length < 0)
+		return length;
+	if (length >= cap)
+		return -LINUX_ENAMETOOLONG;
+	path[length] = '\0';
+	return length;
+}
 
 #ifdef EUNION
 // ============================ E-UNION provenance ============================
@@ -932,6 +964,40 @@ int vchroot_prepare_write(const char* guest)
 	return r; // 0 if copied up or already upper; negative on real error
 }
 
+int vchroot_expand_for_meta_write(struct vchroot_expand_args* args)
+{
+	int length = (int)strlen(args->path);
+	int directory = length > 0 && args->path[length - 1] == '/';
+	int status = vchroot_expand(args);
+	if (status < 0)
+		return status;
+
+	// expand also supports creation, but metadata changes must neither create
+	// absent nodes nor resurrect whiteouts.
+	stat_t st;
+	status = eunion_lstat(args->path, &st);
+	if (status < 0)
+		return status;
+	if (directory && (st.st_mode & LINUX_S_IFMT) != LINUX_S_IFDIR)
+		return -LINUX_ENOTDIR;
+
+	char guest[4096];
+	struct eunion_resolver resolver = eunion_current_resolver();
+	status = eunion_guest_path_from_host(&resolver, args->path,
+		guest, sizeof(guest));
+	if (status < 0)
+		return -LINUX_ENAMETOOLONG;
+	if (status > 0 || !eunion_manage(guest))
+		return 0;
+
+	// args->flags selected the target or the link during expansion. Copy that
+	// canonical node, not the original spelling (which may be a symlink alias).
+	status = vchroot_copyup(guest);
+	if (status < 0)
+		return status;
+	return vchroot_upper_guest_path(guest, args->path, sizeof(args->path));
+}
+
 // Canonicalize a syscall path through the real vchroot resolver and convert the
 // resulting host path back to a guest path. AT_FDCWD cannot be passed to
 // vchroot_fdpath(), so it must go through vchroot_expand() using the process cwd.
@@ -1129,60 +1195,75 @@ int vchroot_prepare_write_fd(int fd, char* out, int cap)
 #ifndef LINUX_O_RDWR
 #define LINUX_O_RDWR 02 // Linux O_RDWR; for content-mutating fd ops (ftruncate)
 #endif
-// High-level helper for the fd-metadata syscall sites (fchmod/fchmod_extended/
-// futimes/fsetxattr/fremovexattr). A metadata op on an fd has no path, so if the
-// fd was opened on a lower-only object the op hits the SHARED template. This
-// copies the object up (via vchroot_prepare_write_fd) and RE-OPENS the upper copy,
-// returning a fresh fd the caller must apply the op to -- the original fd still
-// references the lower inode after copy-up, so mutating it would still corrupt the
-// template.
-//
-// Caller contract (uniform): apply the metadata op to the RETURNED fd, and close
-// the returned fd iff it differs from the original.
-//
-// Returns:
-//   == fd            -> not union-managed / fd escapes the union; caller uses the
-//                       ORIGINAL fd and must NOT close it here.
-//   >= 0 and != fd   -> a fresh fd on the upper copy (after copy-up if the object
-//                       was lower-only; for an already-upper object this just
-//                       re-opens the same upper inode). Caller applies the op to
-//                       it and MUST close it when done.
-//   < 0              -> negative Linux errno.
+#ifndef LINUX_O_PATH
+#define LINUX_O_PATH 010000000
+#endif
+
+// Preserve upper/unmanaged fd identity. A lower fd must still name the same
+// inode before copy-up; deleted or replaced lower paths cannot safely be
+// retargeted by this path-based policy and fail closed.
 int vchroot_fd_for_meta_write(int fd)
 {
-	char guest[4096];
-	int r = vchroot_prepare_write_fd(fd, guest, sizeof(guest));
-	if (r < 0)
-		return r;          // negative errno
-	if (r == 0)
-		return fd;         // unmanaged / escape / no path: use the original fd
+	int flags = LINUX_SYSCALL(__NR_fcntl, fd, LINUX_F_GETFL, 0);
+	if (flags < 0)
+		return flags;
+	if (flags & LINUX_O_PATH)
+		return -LINUX_EBADF;
 
-	// The object was copied up; guest now resolves to the UPPER copy. The caller's
-	// original fd still references the LOWER inode, so re-open the upper copy and
-	// hand back a fresh fd. Expand the guest path (resolves to upper after copy-up)
-	// and open it. O_RDONLY is sufficient on Linux for fchmod/utimensat/fsetxattr/
-	// fremovexattr (they check inode perms, not the fd's open mode). O_NOFOLLOW so
-	// we mutate the object itself, never a symlink target.
-	struct vchroot_expand_args vc;
-	vc.flags = 0;          // do not follow the final symlink
-	vc.dfd = -100;         // AT_FDCWD-equivalent; guest is absolute
-	int gl = (int)strlen(guest);
-	if (gl + 1 > (int)sizeof(vc.path))
+	char host[4096], guest[4096];
+	int status = vchroot_read_fd_path(fd, host, sizeof(host));
+	if (status < 0)
+		return status;
+	if (libexec_path_len <= 0 || prefix_path_len < 0)
+		return fd;
+	struct eunion_resolver resolver = eunion_current_resolver();
+	status = eunion_guest_path_from_host(&resolver, host, guest, sizeof(guest));
+	if (status < 0)
 		return -LINUX_ENAMETOOLONG;
-	memcpy(vc.path, guest, gl + 1);
-	int er = vchroot_expand(&vc);
-	if (er < 0)
-		return er;
+	if (status > 0)
+		return fd;
 
-	int nfd = LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, vc.path,
-		LINUX_O_RDONLY | LINUX_O_NOFOLLOW, 0);
-	if (nfd < 0)
-		return nfd;
-	return nfd;            // != fd: caller applies the op to nfd and closes it
+	char upper[4096];
+	status = vchroot_upper_guest_path(guest, upper, sizeof(upper));
+	if (status < 0)
+		return status;
+	if (strcmp(host, upper) == 0)
+		return fd; // includes renamed/unlinked upper objects
+
+	stat_t original, named;
+#ifdef __NR_fstat64
+	status = LINUX_SYSCALL(__NR_fstat64, fd, &original);
+#else
+	status = LINUX_SYSCALL(__NR_fstat, fd, &original);
+#endif
+	if (status < 0)
+		return status;
+	status = eunion_lstat(host, &named);
+	if (status < 0)
+		return status == -LINUX_ENOENT ? -LINUX_ESTALE : status;
+	if (original.st_dev != named.st_dev || original.st_ino != named.st_ino)
+		return -LINUX_ESTALE;
+
+	struct eunion_resolver_result resolution;
+	if (eunion_resolve_path(&resolver, guest, &resolution) != 0)
+		return -LINUX_ENAMETOOLONG;
+	if (resolution.layer == EUNION_RESOLVER_ERROR)
+		return resolution.error;
+	if (resolution.layer == EUNION_RESOLVER_WHITEOUT ||
+		resolution.layer == EUNION_RESOLVER_MISSING)
+		return -LINUX_ESTALE;
+	status = vchroot_copyup(guest);
+	if (status < 0)
+		return status;
+
+	// Never expand again: an upper symlink replacing the fd's name must fail,
+	// not redirect the metadata operation onto its target.
+	return LINUX_SYSCALL(__NR_openat, LINUX_AT_FDCWD, upper,
+		LINUX_O_RDONLY | LINUX_O_NOFOLLOW | LINUX_O_CLOEXEC, 0);
 }
 
-// High-level helper for CONTENT-mutating fd ops (ftruncate). Identical to
-// vchroot_fd_for_meta_write but re-opens the upper copy O_RDWR: unlike fchmod/
+// High-level helper for CONTENT-mutating fd ops (ftruncate). Re-opens the upper
+// copy O_RDWR: unlike fchmod/
 // utimensat/fsetxattr (which only check inode perms and work on an O_RDONLY fd),
 // ftruncate REQUIRES a writable fd (an O_RDONLY fd yields EINVAL). Copy up the
 // fd's object if lower-only and hand back a FRESH writable fd on the upper copy
@@ -2367,25 +2448,10 @@ static bool next_component(const char* from, const char** end)
 
 int vchroot_fdpath(struct vchroot_fdpath_args* args)
 {
-#ifndef TEST
-	if (prefix_path_len == -1)
-		init_vchroot_path();
-#endif
-
-	char buf[50];
 	char link[4096];
-
-	__simple_sprintf(buf, "/proc/self/fd/%d", args->fd);
-
-	#if defined(__NR_readlink)
-		int rv = LINUX_SYSCALL(__NR_readlink, buf, link, sizeof(link) - 1);
-	#else
-		int rv = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, buf, link, sizeof(link) - 1);
-	#endif
+	int rv = vchroot_read_fd_path(args->fd, link, sizeof(link));
 	if (rv < 0)
 		return rv;
-
-	link[rv] = '\0';
 
 #ifdef EUNION
 	char guest_path[sizeof(link)];
