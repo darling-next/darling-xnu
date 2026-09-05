@@ -1289,22 +1289,23 @@ static int eunion_copyup_dir_resolved(const char* dir)
 		if (r < 0 && r != -LINUX_ENOENT)
 			return r;
 
-		// inspect the LOWER object to see if it is a symlink we must follow.
-		char lo[4096];
-		if (eunion_host_path(libexec_path, libexec_path_len, cur, lo, sizeof(lo)) < 0)
+		// Copy-up has selected the effective upper object. A lower symlink may
+		// be masked by an existing upper directory and must not redirect it.
+		char up[4096];
+		if (eunion_host_path(prefix_path, prefix_path_len, cur, up, sizeof(up)) < 0)
 			return -LINUX_ENAMETOOLONG;
-		stat_t lst;
-		if (eunion_lstat(lo, &lst) != 0)
-			return 0; // not in the template: nothing more to resolve
-		if ((lst.st_mode & LINUX_S_IFMT) != LINUX_S_IFLNK)
+		stat_t ust;
+		if (eunion_lstat(up, &ust) != 0)
+			return 0; // absent in both layers: nothing more to resolve
+		if ((ust.st_mode & LINUX_S_IFMT) != LINUX_S_IFLNK)
 			return 0; // a real dir (or file): done
 
 		// read the symlink target and rebase it to a guest-absolute dir path.
 		char link[4096];
 		#if defined(__NR_readlink)
-			int ln = LINUX_SYSCALL(__NR_readlink, lo, link, sizeof(link) - 1);
+			int ln = LINUX_SYSCALL(__NR_readlink, up, link, sizeof(link) - 1);
 		#else
-			int ln = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, lo, link, sizeof(link) - 1);
+			int ln = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, up, link, sizeof(link) - 1);
 		#endif
 		if (ln < 0)
 			return ln;
