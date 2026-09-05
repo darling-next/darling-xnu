@@ -3,54 +3,68 @@
 #include <sys/errno.h>
 #include <string.h>
 
-#include <darling/emulation/other/mach/lkm.h>
-#include <darling/emulation/xnu_syscall/bsd/impl/unistd/chown.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
+#include <darling/emulation/conversion/stat/common.h>
 
 long sys_fchownat(int fd, const char* path, int uid, int gid, int flag)
 {
 	if (!path)
 		return -EFAULT;
-
-	// E-UNION HAZARD (dar-test-infra-sp5.8.4.4.8): this stub is SAFE only because
-	// it is disabled (returns ENOTSUP, no mutation). If it is ever un-stubbed, it
-	// becomes
-	// an immediate template-corruption path: the body below vchroot_expand()s the
-	// guest path and chowns it -- but for a lower-only target that expanded path is
-	// the shared LOWER template, so the chown mutates ownership for ALL prefixes.
-	// Before re-enabling, copy the target up first -- vchroot_prepare_write(path)
-	// (path-based copy-up, as the path-based write syscalls already do under EUNION)
-	// -- so vchroot_expand resolves to the writable UPPER copy. Mind AT_SYMLINK_*
-	// flags: copy up the link itself vs its target consistently with `flag`.
-#if 0
-	int ret;
-	struct vchroot_expand_args vc;
-	int linux_flags;
-
-	vc.flags = VCHROOT_FOLLOW;
-	vc.dfd = atfd(fd);
-	
-	strcpy(vc.path, path);
-
-	ret = vchroot_expand(&vc);
-	if (ret < 0)
-		return errno_linux_to_bsd(ret);
-
-	linux_flags = atflags_bsd_to_linux(flag);
-	if (linux_flags == LINUX_AT_INVALID)
+	if (flag & ~BSD_AT_SYMLINK_NOFOLLOW)
 		return -EINVAL;
 
-	ret = LINUX_SYSCALL(__NR_fchownat, vc.dfd, vc.path, uid, gid, linux_flags);
+	struct vchroot_expand_args vc;
+	size_t length = strnlen(path, sizeof(vc.path));
+	if (length == sizeof(vc.path))
+		return -ENAMETOOLONG;
+	if (!length)
+		return -ENOENT;
+	vc.flags = (flag & BSD_AT_SYMLINK_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
+	vc.dfd = atfd(fd);
 
-	if (ret < 0)
-		ret = errno_linux_to_bsd(ret);
-
-	return ret;
+	// vchroot resolves dirfds through procfs, which does not itself enforce
+	// EBADF/ENOTDIR (and would accept a regular-file fd followed by "..").
+	int ret;
+	if (path[0] != '/' && vc.dfd != LINUX_AT_FDCWD)
+	{
+		struct linux_stat st;
+#ifdef __NR_fstat64
+		ret = LINUX_SYSCALL(__NR_fstat64, vc.dfd, &st);
 #else
-	return -ENOTSUP;
+		ret = LINUX_SYSCALL(__NR_fstat, vc.dfd, &st);
 #endif
+		if (ret < 0)
+			return errno_linux_to_bsd(ret);
+		if ((st.st_mode & 0170000) != 0040000)
+			return -ENOTDIR;
+	}
+
+	memcpy(vc.path, path, length + 1);
+#ifdef EUNION
+	ret = vchroot_expand_for_meta_write(&vc);
+#else
+	ret = vchroot_expand(&vc);
+#endif
+	if (ret < 0)
+		return errno_linux_to_bsd(ret);
+#ifndef EUNION
+	if (path[length - 1] == '/')
+	{
+		size_t resolved_length = strlen(vc.path);
+		if (resolved_length + 1 >= sizeof(vc.path))
+			return -ENAMETOOLONG;
+		vc.path[resolved_length] = '/';
+		vc.path[resolved_length + 1] = '\0';
+	}
+#endif
+
+	// The resolver has already followed the guest target when requested.
+	// Never let Linux follow a copied guest-absolute symlink a second time.
+	ret = LINUX_SYSCALL(__NR_fchownat, vc.dfd, vc.path, uid, gid,
+		LINUX_AT_SYMLINK_NOFOLLOW);
+	return ret < 0 ? errno_linux_to_bsd(ret) : ret;
 }
