@@ -33,6 +33,7 @@
 
 #	define LINUX_AT_FDCWD AT_FDCWD
 #	define LINUX_O_RDONLY O_RDONLY
+#	define LINUX_O_WRONLY O_WRONLY
 
 #	define __simple_sprintf sprintf
 #	define __simple_snprintf snprintf
@@ -1271,6 +1272,14 @@ int vchroot_fd_for_meta_write(int fd)
 // unmanaged/escape/no-copyup, or a negative errno.
 int vchroot_fd_for_content_write(int fd)
 {
+	int flags = LINUX_SYSCALL(__NR_fcntl, fd, LINUX_F_GETFL, 0);
+	if (flags < 0)
+		return flags;
+	int access = flags & (LINUX_O_WRONLY | LINUX_O_RDWR);
+	if ((flags & LINUX_O_PATH) ||
+		(access != LINUX_O_WRONLY && access != LINUX_O_RDWR))
+		return -LINUX_EBADF;
+
 	char guest[4096];
 	int r = vchroot_prepare_write_fd(fd, guest, sizeof(guest));
 	if (r < 0)
