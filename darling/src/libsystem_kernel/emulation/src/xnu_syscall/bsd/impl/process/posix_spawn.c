@@ -28,6 +28,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigprocmask.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/common/guarded/table.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/fork.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/chdir.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchdir.h>
@@ -110,15 +111,16 @@ no_fork:
 			}
 
 			if (desc->attrp->psa_flags & POSIX_SPAWN_CLOEXEC_DEFAULT) {
-				// set O_CLOEXEC on everything
-				int dir = sys_open("/proc/self/fd", BSD_O_RDONLY, 0);
+				// Enumerate host descriptors without resolving /proc through the guest root.
+				int dir = LINUX_SYSCALL(__NR_open, "/proc/self/fd",
+					LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_CLOEXEC, 0);
 				char buf[4096];
 				int len = 0;
 
 				//__simple_kprintf("asked for cloexec default\n");
 
 				if (dir < 0) {
-					ret = dir;
+					ret = errno_linux_to_bsd(dir);
 					goto fail;
 				}
 
@@ -134,9 +136,8 @@ no_fork:
 
 						fd = __simple_atoi(dirent->d_name, NULL);
 
-						// FIXME: pretty sure this should not be hardcoded
-						if (fd == 1023) {
-							// special commpage fd
+						// Preserve the commpage FD and guarded runtime-owned descriptors.
+						if (fd == 1023 || guard_table_check(fd, guard_flag_prevent_close)) {
 							continue;
 						}
 
