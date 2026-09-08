@@ -12,11 +12,11 @@ long sys_sigpending(sigset_t* set)
 	linux_sigset_t set_linux;
 	int ret;
 
-	ret = LINUX_SYSCALL(__NR_rt_sigpending, set ? &set_linux : NULL, sizeof(set_linux));
+	ret = LINUX_SYSCALL(__NR_rt_sigpending, &set_linux, sizeof(set_linux));
 
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
-	else
+	else if (set != NULL)
 		sigset_linux_to_bsd(&set_linux, set);
 
 	return ret;
