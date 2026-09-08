@@ -44,6 +44,8 @@
 
 #define LINUX_ADDR_NO_RANDOMIZE 0x40000
 #define LINUX_WCLONE 0x80000000U
+#define LINUX_WEXITED 0x00000004
+#define LINUX_P_PIDFD 3
 
 extern _libkernel_functions_t _libkernel_functions;
 
@@ -52,6 +54,8 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 {
 	int ret, my_pid;
 	int pipe[2] = { -1, -1 };
+	/* Transient, like the error pipe; never published to application code. */
+	int pidfd = -1;
 
 	if (desc && desc->attrp && desc->attrp->psa_flags & POSIX_SPAWN_SETEXEC)
 		goto no_fork;
@@ -66,7 +70,7 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 
 	_libkernel_functions->posix_spawn_prepare();
 
-	if ((my_pid = fork_for_spawn()) == 0)
+	if ((my_pid = fork_for_spawn(&pidfd)) == 0)
 	{
 		// child
 		// close the reading side
@@ -379,13 +383,19 @@ fail:
 		 * Failed setup/exec children remain private and cannot notify or be
 		 * reaped by application SIGCHLD handlers. Successful exec changes the
 		 * Linux exit signal to SIGCHLD, so __WCLONE returns ECHILD without
-		 * consuming the public child. Reap even an unexpectedly killed private
-		 * child whose error pipe closed without a complete error record.
+		 * consuming the public child. The atomically acquired pidfd retains
+		 * identity even if a SIGCHLD handler reaps that child and Linux reuses
+		 * its numeric PID for a different private clone. Reap even an
+		 * unexpectedly killed private child whose error pipe closed without
+		 * a complete error record.
 		 */
 		do {
-			err = LINUX_SYSCALL(__NR_wait4, my_pid, NULL, LINUX_WCLONE, NULL);
+			/* Raw Linux waitid permits NULL siginfo and returns 0 on reap. */
+			err = LINUX_SYSCALL(__NR_waitid, LINUX_P_PIDFD, pidfd, NULL,
+				LINUX_WEXITED | LINUX_WCLONE, NULL);
 		} while (err == -EINTR);
-		if (err == my_pid && ret == 0)
+		close_internal(pidfd);
+		if (err == 0 && ret == 0)
 			ret = -EIO;
 		else if (err < 0 && err != -ECHILD && ret == 0)
 			ret = errno_linux_to_bsd(err);

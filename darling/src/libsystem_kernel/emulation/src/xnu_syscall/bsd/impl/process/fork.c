@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/process/fork.h>
 
 #include <_libkernel_init.h>
+#include <stddef.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -18,19 +19,29 @@
 
 extern _libkernel_functions_t _libkernel_functions;
 
-static long fork_with_exit_signal(int exit_signal)
+#define LINUX_CLONE_PIDFD 0x00001000
+
+static long fork_with_exit_signal(int exit_signal, int* pidfd)
 {
 	int ret;
 	int wdfd = get_perthread_wd();
 
+	if (pidfd != NULL) {
+		/*
+		 * parent_tid is argument 3 on x86_64, i386 and arm64. The last two
+		 * arguments (child_tid/tls) differ in order but are both unused.
+		 * Only the parent receives the new CLOEXEC descriptor.
+		 */
+		*pidfd = -1;
+		ret = LINUX_SYSCALL(__NR_clone, exit_signal | LINUX_CLONE_PIDFD,
+			0, pidfd, 0, 0);
+	} else {
 #ifdef SYS_fork
-	if (exit_signal == LINUX_SIGCHLD)
 		ret = LINUX_SYSCALL(__NR_fork);
-	else
-		ret = LINUX_SYSCALL(__NR_clone, exit_signal, 0);
 #else
-	ret = LINUX_SYSCALL(__NR_clone, exit_signal, 0);
+		ret = LINUX_SYSCALL(__NR_clone, exit_signal, 0);
 #endif
+	}
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 	else if (ret == 0)
@@ -77,11 +88,11 @@ static long fork_with_exit_signal(int exit_signal)
 
 long sys_fork(void)
 {
-	return fork_with_exit_signal(LINUX_SIGCHLD);
+	return fork_with_exit_signal(LINUX_SIGCHLD, NULL);
 }
 
-long fork_for_spawn(void)
+long fork_for_spawn(int* pidfd)
 {
 	/* Linux exec resets the exit signal to SIGCHLD before closing CLOEXEC fds. */
-	return fork_with_exit_signal(0);
+	return fork_with_exit_signal(0, pidfd);
 }
