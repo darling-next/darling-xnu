@@ -18,15 +18,18 @@
 
 extern _libkernel_functions_t _libkernel_functions;
 
-long sys_fork(void)
+static long fork_with_exit_signal(int exit_signal)
 {
 	int ret;
 	int wdfd = get_perthread_wd();
 
 #ifdef SYS_fork
-	ret = LINUX_SYSCALL(__NR_fork);
+	if (exit_signal == LINUX_SIGCHLD)
+		ret = LINUX_SYSCALL(__NR_fork);
+	else
+		ret = LINUX_SYSCALL(__NR_clone, exit_signal, 0);
 #else
-	ret = LINUX_SYSCALL(__NR_clone, LINUX_SIGCHLD, 0);
+	ret = LINUX_SYSCALL(__NR_clone, exit_signal, 0);
 #endif
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
@@ -70,4 +73,15 @@ long sys_fork(void)
 	}
 
 	return ret;
+}
+
+long sys_fork(void)
+{
+	return fork_with_exit_signal(LINUX_SIGCHLD);
+}
+
+long fork_for_spawn(void)
+{
+	/* Linux exec resets the exit signal to SIGCHLD before closing CLOEXEC fds. */
+	return fork_with_exit_signal(0);
 }

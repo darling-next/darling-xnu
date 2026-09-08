@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/spawn.h>
 #include <sys/fcntl.h>
+#include <sys/errno.h>
 #include <_libkernel_init.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/process/execve.h>
@@ -42,6 +43,7 @@
 #endif
 
 #define LINUX_ADDR_NO_RANDOMIZE 0x40000
+#define LINUX_WCLONE 0x80000000U
 
 extern _libkernel_functions_t _libkernel_functions;
 
@@ -64,7 +66,7 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 
 	_libkernel_functions->posix_spawn_prepare();
 
-	if ((my_pid = sys_fork()) == 0)
+	if ((my_pid = fork_for_spawn()) == 0)
 	{
 		// child
 		// close the reading side
@@ -358,16 +360,37 @@ fail:
 
 		if (my_pid < 0)
 		{
+			close_internal(pipe[0]);
 			ret = my_pid;
 			goto out;
 		}
 
-		if (pid != NULL)
-			*pid = my_pid;
-
-		if (sys_read(pipe[0], &ret, sizeof(ret)) != sizeof(ret))
-			ret = 0;
+		long received;
+		do {
+			received = sys_read(pipe[0], &ret, sizeof(ret));
+		} while (received == -EINTR);
 		close_internal(pipe[0]);
+		if (received == 0)
+			ret = 0;
+		else if (received != sizeof(ret))
+			ret = received < 0 ? (int)received : -EIO;
+
+		/*
+		 * Failed setup/exec children remain private and cannot notify or be
+		 * reaped by application SIGCHLD handlers. Successful exec changes the
+		 * Linux exit signal to SIGCHLD, so __WCLONE returns ECHILD without
+		 * consuming the public child. Reap even an unexpectedly killed private
+		 * child whose error pipe closed without a complete error record.
+		 */
+		do {
+			err = LINUX_SYSCALL(__NR_wait4, my_pid, NULL, LINUX_WCLONE, NULL);
+		} while (err == -EINTR);
+		if (err == my_pid && ret == 0)
+			ret = -EIO;
+		else if (err < 0 && err != -ECHILD && ret == 0)
+			ret = errno_linux_to_bsd(err);
+		if (ret == 0 && pid != NULL)
+			*pid = my_pid;
 	}
 
 out:
