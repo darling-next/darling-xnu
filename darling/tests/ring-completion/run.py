@@ -4,6 +4,8 @@
 By default the paired server is the sibling darlingserver source directory.
 DSERVER_SOURCE and DSERVER_GEN_INC may select explicit paired source/headers.
 Otherwise rpc.h is generated in temporary state from the paired server.
+RING_COMPLETION_PROFILE_ROOT locates the paired profile when West relocates this
+fixture into an isolated source-base proof tree.
 Requires Python 3 and a Linux C compiler with UBSan.
 No server process or guest prefix is used. RING_COMPLETION_SOURCE_ROOT may select
 an older XNU source tree for a regression RED run with this same fixture.
@@ -17,8 +19,9 @@ import tempfile
 
 here = Path(__file__).resolve().parent
 source = Path(os.environ.get("RING_COMPLETION_SOURCE_ROOT", here.parents[2]))
+profile = Path(os.environ.get("RING_COMPLETION_PROFILE_ROOT", here.parents[2]))
 emulation = source / "darling/src/libsystem_kernel/emulation"
-server = Path(os.environ.get("DSERVER_SOURCE", here.parents[2].parent / "darlingserver"))
+server = Path(os.environ.get("DSERVER_SOURCE", profile.parent / "darlingserver"))
 generated_override = os.environ.get("DSERVER_GEN_INC")
 if not (server / "include/darlingserver/rpc-supplement.h").is_file():
     raise SystemExit("DSERVER_SOURCE must contain the paired server source")
