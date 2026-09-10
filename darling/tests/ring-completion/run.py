@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Run production guest ring completion paths with a controlled host peer.
 
-DSERVER_SOURCE=/path/to/darlingserver DSERVER_GEN_INC=/path/to/generated/include \
-  python3 darling/tests/ring-completion/run.py
-Requires Python 3, a Linux C compiler, and rpc.h generated from the paired server.
+By default the paired server is the sibling darlingserver source directory.
+DSERVER_SOURCE and DSERVER_GEN_INC may select explicit paired source/headers.
+Otherwise rpc.h is generated in temporary state from the paired server.
+Requires Python 3 and a Linux C compiler with UBSan.
 No server process or guest prefix is used. RING_COMPLETION_SOURCE_ROOT may select
 an older XNU source tree for a regression RED run with this same fixture.
 """
@@ -11,20 +12,30 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 here = Path(__file__).resolve().parent
 source = Path(os.environ.get("RING_COMPLETION_SOURCE_ROOT", here.parents[2]))
 emulation = source / "darling/src/libsystem_kernel/emulation"
-server = Path(os.environ["DSERVER_SOURCE"])
-generated = Path(os.environ["DSERVER_GEN_INC"])
-if not (generated / "darlingserver/rpc.h").is_file():
-    raise SystemExit("DSERVER_GEN_INC must contain the paired generated darlingserver/rpc.h")
+server = Path(os.environ.get("DSERVER_SOURCE", here.parents[2].parent / "darlingserver"))
+generated_override = os.environ.get("DSERVER_GEN_INC")
 if not (server / "include/darlingserver/rpc-supplement.h").is_file():
     raise SystemExit("DSERVER_SOURCE must contain the paired server source")
 
 with tempfile.TemporaryDirectory(prefix="ring-completion-") as temporary:
     root = Path(temporary)
+    generated = Path(generated_override) if generated_override else root / "generated/include"
+    if generated_override is None:
+        internal = root / "generated/internal-include/darlingserver/rpc.internal.h"
+        wrapper = root / "generated/src/rpc.c"
+        for directory in (generated / "darlingserver", internal.parent, wrapper.parent):
+            directory.mkdir(parents=True, exist_ok=True)
+        subprocess.run([sys.executable, "-B", str(server / "scripts/generate-rpc-wrappers.py"),
+                        str(generated / "darlingserver/rpc.h"), str(internal), str(wrapper),
+                        '"../include/darlingserver/rpc.h"'], check=True)
+    if not (generated / "darlingserver/rpc.h").is_file():
+        raise SystemExit("DSERVER_GEN_INC must contain the paired generated darlingserver/rpc.h")
     includes = root / "include"
     # As in spawn-pidfd, replace only platform-service headers. The complete
     # production dserver-ring.c is included unchanged, with the real server ABI.
