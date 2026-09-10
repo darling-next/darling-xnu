@@ -103,8 +103,11 @@ static void port_callers(void) {
     };
     for (unsigned i = 0; i < sizeof(callers) / sizeof(callers[0]); ++i) {
         setup(WRONG_SEQ);
-        assert(callers[i]() == MACH_PORT_NULL);
-        assert(published == 1 && uds_calls == 0);
+        uint32_t result = callers[i]();
+        if (result != MACH_PORT_NULL || published != 1 || uds_calls != 0) {
+            fputs("RING_COMPLETION_PUBLISHED_FAILURE_REPLAYED\n", stderr);
+            exit(1);
+        }
         setup(GOOD);
         assert(callers[i]() == reply_port);
         assert(published == 1 && uds_calls == 0);
