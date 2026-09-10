@@ -29,6 +29,7 @@
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/conversion/duct_errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
@@ -529,13 +530,15 @@ static int gr_port_trap(uint32_t callnum, uint32_t* out_port) {
 	int rc = KERN_FAILURE; // bad/mismatched reply after publish: fail closed, do NOT UDS-retry
 	if (rep->seq == seq && rep->callnum == callnum) {
 		uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
-		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) + sizeof(uint32_t) && rep->length <= inlineCap) {
+		if (rep->length == sizeof(dserver_ring_reply_hdr_t) + sizeof(uint32_t) && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
 			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
-			uint32_t port;
-			memcpy(&port, payload + sizeof(dserver_ring_reply_hdr_t), sizeof(port));
-			if (out_port) *out_port = port;
-			rc = rh->code;
+			if (rh->code == 0) {
+				uint32_t port;
+				memcpy(&port, payload + sizeof(dserver_ring_reply_hdr_t), sizeof(port));
+				if (out_port) *out_port = port;
+				rc = 0;
+			} // any server error after publication remains KERN_FAILURE, never a retry sentinel
 		}
 	}
 	dserver_ring_consumer_advance(gr_s2c(L));
@@ -636,7 +639,7 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 	int rc = 0;
 	if (out_code) *out_code = KERN_FAILURE; // bad/mismatched reply after publish: no UDS retry
 	if (rep->seq == seq && rep->callnum == callnum) {
-		if (rep->length >= sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
+		if (rep->length == sizeof(dserver_ring_reply_hdr_t) && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
 			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
 			if (out_code) *out_code = rh->code;
@@ -660,12 +663,12 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 // small inline reply BODY (not just the kern_return code). Unlike gr_body_trap (header-only reply),
 // this also copies `replylen` bytes of reply body out of the slot into `reply_out` -- the over-the-wire
 // reply body is byte-identical to the UDS dserver_reply_<op>_t struct, because the server publishes
-// everything after the reply hdr onto the ring (_publishReplyToRingLocked). The result code is split
-// from the transport-miss sentinel exactly like gr_body_trap: returns 0 on a VALID ring round-trip and
-// writes *out_code (the kern_return_t, verbatim) + reply_out; returns -1 on ANY transport miss (no ring
-// / full) in which case the caller MUST UDS-fall-back. Once published, timeout/bad-reply/shape
-// mismatch is committed-unknown: return 0 with *out_code=KERN_FAILURE so the caller observes failure
-// without re-running the operation over UDS. `replylen` is the EXACT expected reply-body size (0 for a
+// everything after the reply hdr onto the ring (_publishReplyToRingLocked). These calls use the
+// BSD/internal RPC convention: zero on success, negative Linux errno on failure, not kern_return_t.
+// The transport result stays separate: -1 permits a pre-publication UDS fallback; 0 means the
+// operation was published. An unknown completion returns 0 with *out_code=-LINUX_EIO, so callers
+// observe failure rather than consuming an uninitialized reply or repeating the operation.
+// `replylen` is the EXACT expected reply-body size (0 for a
 // header-only reply -- then reply_out may be NULL); the reply is accepted only if rep->length ==
 // sizeof(reply_hdr) + replylen.
 static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
@@ -707,7 +710,7 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 #endif
 	gr_wait_result_t wait = gr_wait_reply(L);
 	if (wait.state == GR_WAIT_COMMITTED_UNKNOWN) {
-		if (out_code) *out_code = KERN_FAILURE;
+		if (out_code) *out_code = -LINUX_EIO;
 		return 0; // published: do NOT retry over UDS
 	}
 	dserver_ring_slot_t* rep = wait.slot;
@@ -717,15 +720,15 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 
 	// Validate the reply belongs to our request before trusting it. The reply must be EXACTLY
 	// {reply_hdr, replylen-byte body}; a different length means the server replied with a different
-	// shape (error/wrong op) -> treat as a transport miss so the caller UDS-falls-back and re-runs.
+	// shape (error/wrong op) -> fail closed without retrying the published operation.
 	int rc = 0;
-	if (out_code) *out_code = KERN_FAILURE; // bad/mismatched reply after publish: no UDS retry
+	if (out_code) *out_code = -LINUX_EIO;
 	if (rep->seq == seq && rep->callnum == callnum) {
 		if (rep->length == (uint32_t)sizeof(dserver_ring_reply_hdr_t) + replylen && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
 			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
 			if (out_code) *out_code = rh->code;
-			if (replylen > 0 && reply_out) {
+			if (rh->code == 0 && replylen > 0 && reply_out) {
 				memcpy(reply_out, payload + sizeof(dserver_ring_reply_hdr_t), replylen);
 			}
 			rc = 0; // valid ring round-trip
@@ -744,11 +747,11 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 	return rc;
 }
 
-// perf #18 D11 (dar-1il.6): the 5 bulk Lane-1 op wrappers. Each mirrors the matching UDS
-// dserver_rpc_<op> contract: returns 0 + writes the out-params on a valid ring round-trip; returns
-// negative on any transport miss -> caller MUST UDS-fall-back. The request/reply body layouts below
-// are byte-identical to the generated dserver_call_<op>_t / dserver_reply_<op>_t structs (verified
-// against the generated rpc.h), so the server rebuilds {callhdr, body} and dispatches via the SAME
+// The five closed BSD/internal RPC wrappers. A negative transport return permits UDS fallback;
+// zero means published, with the operation status in *out_code. Copy reply fields only on
+// successful completion, never on committed-unknown or a server error.
+// The request/reply layouts match generated dserver_call_<op>_t / dserver_reply_<op>_t structs,
+// so the server rebuilds {callhdr, body} and dispatches via the SAME
 // generic Call path / dtape primitive as over UDS -- behavior is byte-identical, only the transport
 // differs. None is destroy-capable or caller-S2C (canon rules 1-2 hold); they ride the GENERIC fiber
 // doWork() path (Tier-1, NOT the no-fiber inline fast path).
@@ -759,7 +762,7 @@ int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid
 	struct { int32_t old_uid; int32_t old_gid; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_uidgid, &body, (uint32_t)sizeof(body),
 	                      &reply, (uint32_t)sizeof(reply), out_code);
-	if (rc == 0) {
+	if (rc == 0 && out_code && *out_code == 0) {
 		if (out_old_uid) *out_old_uid = reply.old_uid;
 		if (out_old_gid) *out_old_gid = reply.old_gid;
 	}
@@ -781,7 +784,7 @@ int __dserver_ring_started_suspended(bool* out_suspended, int* out_code) {
 	struct { bool suspended; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_started_suspended, (void*)0, 0,
 	                      &reply, (uint32_t)sizeof(reply), out_code);
-	if (rc == 0 && out_suspended) *out_suspended = reply.suspended;
+	if (rc == 0 && out_code && *out_code == 0 && out_suspended) *out_suspended = reply.suspended;
 	return rc;
 }
 
@@ -790,7 +793,7 @@ int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code) {
 	struct { int32_t tracer; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_get_tracer, (void*)0, 0,
 	                      &reply, (uint32_t)sizeof(reply), out_code);
-	if (rc == 0 && out_tracer) *out_tracer = reply.tracer;
+	if (rc == 0 && out_code && *out_code == 0 && out_tracer) *out_tracer = reply.tracer;
 	return rc;
 }
 
@@ -800,7 +803,7 @@ int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code
 	struct { bool is_64_bit; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_task_is_64_bit, &body, (uint32_t)sizeof(body),
 	                      &reply, (uint32_t)sizeof(reply), out_code);
-	if (rc == 0 && out_is_64_bit) *out_is_64_bit = reply.is_64_bit;
+	if (rc == 0 && out_code && *out_code == 0 && out_is_64_bit) *out_is_64_bit = reply.is_64_bit;
 	return rc;
 }
 
@@ -824,7 +827,7 @@ int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t*
 	struct { uint64_t length __attribute__((aligned(8))); } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_vchroot_path, &body, (uint32_t)sizeof(body),
 	                      &reply, (uint32_t)sizeof(reply), out_code);
-	if (rc == 0 && out_length) *out_length = reply.length;
+	if (rc == 0 && out_code && *out_code == 0 && out_length) *out_length = reply.length;
 	return rc;
 }
 
@@ -838,7 +841,7 @@ int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* ou
 	struct { uint64_t length __attribute__((aligned(8))); } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_mldr_path, &body, (uint32_t)sizeof(body),
 	                      &reply, (uint32_t)sizeof(reply), out_code);
-	if (rc == 0 && out_length) *out_length = reply.length;
+	if (rc == 0 && out_code && *out_code == 0 && out_length) *out_length = reply.length;
 	return rc;
 }
 

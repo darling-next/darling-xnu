@@ -404,17 +404,10 @@ if (DARLING_RPC_SLEEP_ACCOUNT)
 	target_compile_definitions(emulation_dyld PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
 endif()
 
-# perf #18 (dar-dar6x4-perf-5dq.30): guest-side shared-memory ring transport. OFF by default
-# -> dserver-ring.c compiles to an empty TU and the call-site fast paths (the inline stubs in
-# dserver-ring.h) fold away, so the emulation builds byte-identical to baseline. When ON, the
-# guest builds a memfd ring, negotiates it via ring_attach, and routes eligible calls (P3:
-# task_self_trap) over the ring with a futex wake instead of the UDS round-trip. Compiled into
-# BOTH the dylib (emulation) and dyld (emulation_dyld) since the trap path lives in both
-# (see the perf#7-generalize / gate-hotpath-kprintf lessons about dual-target deploy). The
-# matching server side is darlingserver's -DDSERVER_RING_TRANSPORT.
-# perf#18 Phase B Stage 1 (2026-06-29): default flipped OFF->ON for dev/nightly (paired with the
-# server option). Frozen op set; rollback = this default back to OFF + rebuild. Release/prod policy
-# is separate and unchanged. See darlingserver tests/PERF18-RING-DEFAULT-ON-DECISION.md.
+# Shared-memory ring transport is compiled into BOTH the dylib (emulation) and dyld
+# (emulation_dyld), since both contain trap paths. OFF leaves dserver-ring.c empty and
+# folds the helper calls into ordinary UDS fallbacks. Pair this option with the server's
+# DSERVER_RING_TRANSPORT when building matched OFF/ON runtimes from the same sources.
 option(DARLING_RING_TRANSPORT "Enable guest-side shared-memory ring RPC transport (perf #18)" ON)
 if (DARLING_RING_TRANSPORT)
 	target_compile_definitions(emulation PRIVATE DARLING_RING_TRANSPORT)

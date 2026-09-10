@@ -5,9 +5,9 @@
 // calls publishes a request onto the c2s ring + writes the wake eventfd and waits for the
 // reply on the s2c ring instead of paying a full UDS sendmsg/recvmsg round-trip.
 //
-// Entire interface is a no-op unless the dylib is built with -DDARLING_RING_TRANSPORT. When
-// off, __dserver_ring_enabled() is a compile-time 0 and every call-site fast-path folds away,
-// so the build is byte-identical to a non-ring dylib. See dserver-ring.c for the design.
+// The interface is compiled out unless DARLING_RING_TRANSPORT is enabled for the dylib
+// and dyld emulation targets. With it off, helpers return a pre-publication miss and
+// call sites use the ordinary UDS wrappers. See dserver-ring.c for the design.
 
 #ifndef _DARLING_DSERVER_RING_H_
 #define _DARLING_DSERVER_RING_H_
@@ -57,13 +57,12 @@ int __dserver_ring_mach_port_deallocate(uint32_t target, uint32_t name, int* out
 int __dserver_ring_mach_port_allocate(uint32_t target, int32_t right, uint64_t name_ptr, int* out_code);
 int __dserver_ring_mach_port_insert_right(uint32_t target, uint32_t name, uint32_t poly, int32_t polyPoly, int* out_code);
 
-// perf #18 D11 (dar-1il.6): bulk closed-fast Lane-1 batch (generic-fiber Tier-1). Each mirrors the
-// matching UDS dserver_rpc_<op> contract: on a VALID ring round-trip writes the out-params + *out_code
-// (the kern_return_t, verbatim) and returns 0; returns negative only before publish. After publish,
-// timeout/bad-reply returns 0 with *out_code=KERN_FAILURE and never UDS-falls-back. Unlike the
-// header-only mach_port_* helpers, these also carry a small FIXED reply BODY
-// (uidgid's old uid/gid, started_suspended's bool, get_tracer's tracer, task_is_64_bit's bool) which
-// the server publishes onto the ring verbatim. None is destroy-capable or caller-S2C (canon rules hold).
+// Closed BSD/internal RPCs (generic-fiber lane). The required *out_code receives the
+// operation status: 0 on success, negative Linux errno on failure. Out-values are copied
+// only on success. The helper returns negative only before publication, permitting UDS
+// fallback; after publication it returns 0, including committed-unknown, which sets
+// *out_code=-LINUX_EIO without retrying. Replies carry a fixed body except for the
+// header-only set_thread_handles. None is destroy-capable or caller-S2C.
 int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid, int32_t* out_old_gid, int* out_code);
 int __dserver_ring_set_thread_handles(uint64_t pthread_handle, uint64_t dispatch_qaddr, int* out_code);
 int __dserver_ring_started_suspended(bool* out_suspended, int* out_code);
@@ -72,9 +71,9 @@ int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code
 
 // perf #18 D13 (dar-1il.8): path ops. The char*/path is delivered via the server's writeMemory on the
 // guest /proc/mem (transport-agnostic), so the ring body is the FIXED { uint64_t buffer; uint64_t
-// buffer_size; } and the reply is { uint64_t length; } -- NO arena. 0 + *out_length on a valid ring
-// round-trip; negative only before publish. After publish, timeout/bad-reply returns 0 with
-// *out_code=KERN_FAILURE and never UDS-falls-back.
+// buffer_size; } and the reply is { uint64_t length; } -- NO arena. These use the same
+// BSD/internal status contract above: out_length is set only on success; committed-unknown
+// returns 0 with *out_code=-LINUX_EIO, never UDS fallback.
 int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
 int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
 

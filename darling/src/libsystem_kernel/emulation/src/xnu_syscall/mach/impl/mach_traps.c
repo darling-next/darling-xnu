@@ -39,10 +39,11 @@ mach_port_name_t mach_reply_port_impl(void)
 	unsigned int port_name;
 	// perf #18 P3: mach_reply_port is the UNCACHED high-frequency op (every Mach RPC round-trip
 	// needs a reply port), so unlike task_self_trap it actually exercises the ring's latency win.
-	// Try the shared-memory ring first; on any failure fall back to the UDS wrapper. Folded away
-	// (always returns -1) unless built with -DDARLING_RING_TRANSPORT.
-	if (__dserver_ring_mach_reply_port(&port_name) == 0) {
-		return port_name;
+	// Only a negative pre-publication miss permits UDS fallback. A published failure
+	// must return MACH_PORT_NULL without minting another port over UDS.
+	int ring_code = __dserver_ring_mach_reply_port(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
 	}
 	if (dserver_rpc_mach_reply_port(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
@@ -53,11 +54,10 @@ mach_port_name_t mach_reply_port_impl(void)
 mach_port_name_t thread_self_trap_impl(void)
 {
 	unsigned int port_name;
-	// perf #18 D10 (dar-1il.5): try the shared-memory ring first; on any miss fall back to the UDS
-	// wrapper. Folds away (always returns -1) unless built with -DDARLING_RING_TRANSPORT. Uncached
-	// (per-thread port), unlike task_self_trap.
-	if (__dserver_ring_thread_self_trap(&port_name) == 0) {
-		return port_name;
+	// Uncached, per-thread port. Retry only if the ring did not publish.
+	int ring_code = __dserver_ring_thread_self_trap(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
 	}
 	if (dserver_rpc_thread_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
@@ -68,10 +68,10 @@ mach_port_name_t thread_self_trap_impl(void)
 mach_port_name_t host_self_trap_impl(void)
 {
 	unsigned int port_name;
-	// perf #18 D10 (dar-1il.5): try the ring first, UDS fallback on any miss. Folds away when the ring
-	// is compiled out.
-	if (__dserver_ring_host_self_trap(&port_name) == 0) {
-		return port_name;
+	// A published ring failure must not mint a second send right over UDS.
+	int ring_code = __dserver_ring_host_self_trap(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
 	}
 	if (dserver_rpc_host_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
@@ -787,10 +787,11 @@ kern_return_t syscall_thread_switch_impl(
 static cached_port_name_t __task_self_trap_rpc(void)
 {
 	unsigned int port_name;
-	// perf #18 P3: try the shared-memory ring first; on any failure fall back to the UDS
-	// wrapper. Folded away (always returns -1) unless built with -DDARLING_RING_TRANSPORT.
-	if (__dserver_ring_task_self_trap(&port_name) == 0) {
-		return port_name;
+	// Return a failed published request as NULL; the cache does not retain failures.
+	// Only a pre-publication miss may use UDS for this invocation.
+	int ring_code = __dserver_ring_task_self_trap(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
 	}
 	if (dserver_rpc_task_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
