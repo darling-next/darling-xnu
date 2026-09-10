@@ -47,6 +47,8 @@ struct linux_cmsghdr
 
 int socket_level_bsd_to_linux(int level);
 int socket_level_linux_to_bsd(int level);
+int socket_cmsg_type_bsd_to_linux(int level, int type);
+int socket_cmsg_type_linux_to_bsd(int level, int type);
 
 #define LINUX_SYS_RECVMSG	17
 

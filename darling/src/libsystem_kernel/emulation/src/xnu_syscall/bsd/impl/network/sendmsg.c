@@ -1,6 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/network/sendmsg.h>
 
 #include <stddef.h>
+#include <sys/errno.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -42,10 +43,24 @@ long sys_sendmsg_nocancel(int socket, const struct bsd_msghdr* msg, int flags)
 	lmsg.msg_iov = msg->msg_iov;
 	lmsg.msg_iovlen = msg->msg_iovlen;
 
-	if (sizeof(unsigned long) == 4)
+	if (sizeof(unsigned long) == 4 && msg->msg_control != NULL && msg->msg_controllen > 0)
 	{
-		lmsg.msg_control = msg->msg_control;
 		lmsg.msg_controllen = msg->msg_controllen;
+		lchdr = malloc(lmsg.msg_controllen);
+		if (lchdr == NULL)
+			return -ENOMEM;
+		memcpy(lchdr, msg->msg_control, lmsg.msg_controllen);
+		lmsg.msg_control = lchdr;
+		for (size_t pos = 0; pos + sizeof(*lchdr) <= lmsg.msg_controllen;) {
+			struct linux_cmsghdr* header = (struct linux_cmsghdr*)((char*)lchdr + pos);
+			if (header->cmsg_len < sizeof(*header) || header->cmsg_len > lmsg.msg_controllen - pos) {
+				free(lchdr);
+				return -EINVAL;
+			}
+			header->cmsg_type = socket_cmsg_type_bsd_to_linux(header->cmsg_level, header->cmsg_type);
+			header->cmsg_level = socket_level_bsd_to_linux(header->cmsg_level);
+			pos += LINUX_CMSG_ALIGN(header->cmsg_len);
+		}
 	}
 	else if (msg->msg_control != NULL && msg->msg_controllen > 0)
 	{
@@ -61,7 +76,7 @@ long sys_sendmsg_nocancel(int socket, const struct bsd_msghdr* msg, int flags)
 
 		lchdr->cmsg_len = bchdr->cmsg_len + LINUX_BSD_CMSGHDR_SIZE_DIFFERENCE;
 		lchdr->cmsg_level = socket_level_bsd_to_linux(bchdr->cmsg_level);
-		lchdr->cmsg_type = bchdr->cmsg_type;
+		lchdr->cmsg_type = socket_cmsg_type_bsd_to_linux(bchdr->cmsg_level, bchdr->cmsg_type);
 
 		memcpy(lchdr->cmsg_data, bchdr->cmsg_data,
 				bchdr->cmsg_len - sizeof(struct bsd_cmsghdr));
