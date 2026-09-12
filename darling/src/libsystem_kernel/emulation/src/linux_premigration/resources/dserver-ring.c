@@ -360,6 +360,12 @@ static gr_lane_t* gr_lane_for_this_thread(void) {
 	int tid = (int)LINUX_SYSCALL(__NR_gettid);
 	gr_lane_t* L = gr_find_lane(tid);
 	if (L) {
+		if (L->state == 1 &&
+		    __atomic_load_n(&gr_cb(L)->server_state, __ATOMIC_ACQUIRE) == DSERVER_RING_SRV_RETIRED) {
+			// Another image now owns this thread's server-side lane. Keep this
+			// image on UDS rather than stealing it back on every image switch.
+			L->state = -1;
+		}
 		return (L->state == 1) ? L : 0;
 	}
 	return gr_attach_lane(tid);

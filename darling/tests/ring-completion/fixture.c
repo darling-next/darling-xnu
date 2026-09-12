@@ -116,6 +116,10 @@ static void port_callers(void) {
         assert(callers[i]() == reply_port);
         assert(published == 1 && uds_calls == 0);
         setup(GOOD);
+        gr_cb(lane)->server_state = DSERVER_RING_SRV_RETIRED;
+        assert(callers[i]() == reply_port);
+        assert(published == 0 && uds_calls == 1);
+        setup(GOOD);
         lane->state = -1; /* a pre-publication miss must still permit UDS */
         assert(callers[i]() == reply_port);
         assert(published == 0 && uds_calls == 1);
