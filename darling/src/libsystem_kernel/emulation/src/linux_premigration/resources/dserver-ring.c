@@ -668,18 +668,19 @@ static int gr_body_trap(uint32_t callnum, const void* body, uint32_t bodylen, in
 // The transport result stays separate: -1 permits a pre-publication UDS fallback; 0 means the
 // operation was published. An unknown completion returns 0 with *out_code=-LINUX_EIO, so callers
 // observe failure rather than consuming an uninitialized reply or repeating the operation.
-// `replylen` is the EXACT expected reply-body size (0 for a
-// header-only reply -- then reply_out may be NULL); the reply is accepted only if rep->length ==
-// sizeof(reply_hdr) + replylen.
+// Validate the complete generated wire body, including RPC tail padding, but
+// copy only the actual fields. For example a bool body occupies one byte while
+// its enclosing RPC reply has three bytes of tail padding.
+#define GR_REPLY_WIRE_SIZE(op) (sizeof(dserver_rpc_reply_##op##_t) - sizeof(dserver_rpc_replyhdr_t))
 static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
-                        void* reply_out, uint32_t replylen, int* out_code) {
+                        void* reply_out, uint32_t replylen, uint32_t wirelen, int* out_code) {
 	gr_lane_t* L = gr_lane_for_this_thread();
 	if (!L) {
 		return -1; // no ring for this thread -> UDS fallback
 	}
 
 	uint32_t inlineCap = GR_SLOT_SIZE - (uint32_t)sizeof(dserver_ring_slot_t);
-	if (bodylen > inlineCap || (uint32_t)sizeof(dserver_ring_reply_hdr_t) + replylen > inlineCap) {
+	if (bodylen > inlineCap || replylen > wirelen || (uint32_t)sizeof(dserver_ring_reply_hdr_t) + wirelen > inlineCap) {
 		return -1; // body/reply won't fit the slot -> UDS fallback (shouldn't happen for our small ops)
 	}
 
@@ -719,12 +720,12 @@ static int gr_full_trap(uint32_t callnum, const void* body, uint32_t bodylen,
 #endif
 
 	// Validate the reply belongs to our request before trusting it. The reply must be EXACTLY
-	// {reply_hdr, replylen-byte body}; a different length means the server replied with a different
-	// shape (error/wrong op) -> fail closed without retrying the published operation.
+	// {reply_hdr, wirelen-byte body}; padding is part of the wire shape, not the
+	// fields copied to the caller. Malformed replies must never trigger replay.
 	int rc = 0;
 	if (out_code) *out_code = -LINUX_EIO;
 	if (rep->seq == seq && rep->callnum == callnum) {
-		if (rep->length == (uint32_t)sizeof(dserver_ring_reply_hdr_t) + replylen && rep->length <= inlineCap) {
+		if (rep->length == (uint32_t)sizeof(dserver_ring_reply_hdr_t) + wirelen && rep->length <= inlineCap) {
 			char* payload = (char*)rep + sizeof(dserver_ring_slot_t);
 			dserver_ring_reply_hdr_t* rh = (dserver_ring_reply_hdr_t*)payload;
 			if (out_code) *out_code = rh->code;
@@ -761,7 +762,7 @@ int __dserver_ring_uidgid(int32_t new_uid, int32_t new_gid, int32_t* out_old_uid
 	struct { int32_t new_uid; int32_t new_gid; } body = { new_uid, new_gid };
 	struct { int32_t old_uid; int32_t old_gid; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_uidgid, &body, (uint32_t)sizeof(body),
-	                      &reply, (uint32_t)sizeof(reply), out_code);
+	                      &reply, (uint32_t)sizeof(reply), GR_REPLY_WIRE_SIZE(uidgid), out_code);
 	if (rc == 0 && out_code && *out_code == 0) {
 		if (out_old_uid) *out_old_uid = reply.old_uid;
 		if (out_old_gid) *out_old_gid = reply.old_gid;
@@ -776,14 +777,14 @@ int __dserver_ring_set_thread_handles(uint64_t pthread_handle, uint64_t dispatch
 		uint64_t dispatch_qaddr __attribute__((aligned(8)));
 	} body = { pthread_handle, dispatch_qaddr };
 	return gr_full_trap((uint32_t)dserver_callnum_set_thread_handles, &body, (uint32_t)sizeof(body),
-	                    (void*)0, 0, out_code);
+	                    (void*)0, 0, GR_REPLY_WIRE_SIZE(set_thread_handles), out_code);
 }
 
 int __dserver_ring_started_suspended(bool* out_suspended, int* out_code) {
 	// empty request -> dserver_reply_started_suspended_t { bool suspended; }
 	struct { bool suspended; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_started_suspended, (void*)0, 0,
-	                      &reply, (uint32_t)sizeof(reply), out_code);
+	                      &reply, (uint32_t)sizeof(reply), GR_REPLY_WIRE_SIZE(started_suspended), out_code);
 	if (rc == 0 && out_code && *out_code == 0 && out_suspended) *out_suspended = reply.suspended;
 	return rc;
 }
@@ -792,7 +793,7 @@ int __dserver_ring_get_tracer(int32_t* out_tracer, int* out_code) {
 	// empty request -> dserver_reply_get_tracer_t { int32_t tracer; }
 	struct { int32_t tracer; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_get_tracer, (void*)0, 0,
-	                      &reply, (uint32_t)sizeof(reply), out_code);
+	                      &reply, (uint32_t)sizeof(reply), GR_REPLY_WIRE_SIZE(get_tracer), out_code);
 	if (rc == 0 && out_code && *out_code == 0 && out_tracer) *out_tracer = reply.tracer;
 	return rc;
 }
@@ -802,7 +803,7 @@ int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code
 	struct { int32_t id; } body = { id };
 	struct { bool is_64_bit; } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_task_is_64_bit, &body, (uint32_t)sizeof(body),
-	                      &reply, (uint32_t)sizeof(reply), out_code);
+	                      &reply, (uint32_t)sizeof(reply), GR_REPLY_WIRE_SIZE(task_is_64_bit), out_code);
 	if (rc == 0 && out_code && *out_code == 0 && out_is_64_bit) *out_is_64_bit = reply.is_64_bit;
 	return rc;
 }
@@ -826,7 +827,7 @@ int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t*
 	} body = { buffer, buffer_size };
 	struct { uint64_t length __attribute__((aligned(8))); } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_vchroot_path, &body, (uint32_t)sizeof(body),
-	                      &reply, (uint32_t)sizeof(reply), out_code);
+	                      &reply, (uint32_t)sizeof(reply), GR_REPLY_WIRE_SIZE(vchroot_path), out_code);
 	if (rc == 0 && out_code && *out_code == 0 && out_length) *out_length = reply.length;
 	return rc;
 }
@@ -840,7 +841,7 @@ int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* ou
 	} body = { buffer, buffer_size };
 	struct { uint64_t length __attribute__((aligned(8))); } reply;
 	int rc = gr_full_trap((uint32_t)dserver_callnum_mldr_path, &body, (uint32_t)sizeof(body),
-	                      &reply, (uint32_t)sizeof(reply), out_code);
+	                      &reply, (uint32_t)sizeof(reply), GR_REPLY_WIRE_SIZE(mldr_path), out_code);
 	if (rc == 0 && out_code && *out_code == 0 && out_length) *out_length = reply.length;
 	return rc;
 }

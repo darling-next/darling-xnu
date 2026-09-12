@@ -59,14 +59,18 @@ static long peer_syscall(long number) {
         if (request->callnum == dserver_callnum_uidgid || request->callnum == dserver_callnum_mldr_path ||
             request->callnum == dserver_callnum_vchroot_path) size = 8;
         if (request->callnum == dserver_callnum_started_suspended ||
-            request->callnum == dserver_callnum_task_is_64_bit) size = sizeof(bool);
+            request->callnum == dserver_callnum_task_is_64_bit)
+            size = sizeof(dserver_rpc_reply_started_suspended_t) - sizeof(dserver_rpc_replyhdr_t);
         if (request->callnum == dserver_callnum_set_thread_handles ||
             request->callnum == dserver_callnum_mach_port_allocate) size = 0;
         reply->length = sizeof(dserver_ring_reply_hdr_t) + size + (response == WRONG_SIZE);
         dserver_ring_reply_hdr_t *header = (void *)((char *)reply + sizeof(*reply));
         header->code = response == NEGATIVE_ERROR ? -EIO : 0;
         memset(header + 1, 0, size);
-        if (size == sizeof(uint32_t)) memcpy(header + 1, &reply_port, sizeof(reply_port));
+        if (size == sizeof(uint32_t) &&
+            request->callnum != dserver_callnum_started_suspended &&
+            request->callnum != dserver_callnum_task_is_64_bit)
+            memcpy(header + 1, &reply_port, sizeof(reply_port));
         dserver_ring_producer_publish(gr_s2c(lane));
     }
     dserver_ring_consumer_advance(gr_c2s(lane));
@@ -153,6 +157,15 @@ static void bsd_completion(void) {
     setup(GOOD);
     assert(__dserver_ring_uidgid(-1, -1, &uid, &gid, &code) == 0);
     assert(code == 0 && uid == 0 && gid == 0 && published == 1);
+    setup(GOOD);
+    assert(__dserver_ring_started_suspended(&suspended, &code) == 0);
+    if (code != 0 || suspended || published != 1) {
+        fputs("RING_COMPLETION_WIRE_PADDING_REJECTED\n", stderr);
+        exit(1);
+    }
+    setup(GOOD);
+    assert(__dserver_ring_task_is_64_bit(42, &is64, &code) == 0);
+    assert(code == 0 && !is64 && published == 1);
     setup(WRONG_SIZE);
     assert(__dserver_ring_mach_port_allocate(1, 1, 0, &code) == 0);
     assert(code == KERN_FAILURE && published == 1); /* Mach remains positive. */
