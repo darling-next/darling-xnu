@@ -17,6 +17,8 @@ void native_exit(int ec);
 
 long native_sysconf(int name);
 void __mldr_postfork_child(void);
+void __mldr_prefork_prepare(void);
+void __mldr_postfork_parent(void);
 
 // Native thread wrapping
 void* __darling_thread_create(unsigned long stack_size, unsigned long pthobj_size,
@@ -33,6 +35,8 @@ const void* __dserver_socket_address(void);
 int __dserver_per_thread_socket(void);
 void __dserver_per_thread_socket_refresh(void);
 void __dserver_close_socket(int socket);
+int __dserver_adopt_ring_fd(int fd);
+bool __dserver_fd_is_internal(int fd);
 
 int __dserver_get_process_lifetime_pipe(void);
 int __dserver_process_lifetime_pipe_refresh(void);

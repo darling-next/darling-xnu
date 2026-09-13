@@ -42,7 +42,8 @@ with tempfile.TemporaryDirectory(prefix="ring-completion-") as temporary:
     includes = root / "include"
     # As in spawn-pidfd, replace only platform-service headers. The complete
     # production dserver-ring.c is included unchanged, with the real server ABI.
-    for name in ("common/base.h", "common/simple.h", "linux_premigration/linux-syscalls/linux.h"):
+    for name in ("common/base.h", "common/simple.h", "linux_premigration/linux-syscalls/linux.h",
+                 "linux_premigration/elfcalls_wrapper.h"):
         target = includes / "darling/emulation" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("")

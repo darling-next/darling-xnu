@@ -5,6 +5,7 @@
 #include <errno.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
+#include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
 
 #define MAX_GUARD_COUNT 1024
 
@@ -183,6 +184,11 @@ int guard_table_remove(int fd) {
 }
 
 int guard_table_check(int fd, guard_flags_t flags) {
+	// The loader's FD ownership spans dyld and libsystem_kernel, unlike this
+	// image-local table. In particular, neither image may close a ring wake FD.
+	if ((flags & guard_flag_prevent_close) && __dserver_fd_is_internal(fd)) {
+		return 1;
+	}
 #ifdef VARIANT_DYLD
 	return 0;
 #else

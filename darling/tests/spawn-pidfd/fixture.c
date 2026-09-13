@@ -49,6 +49,9 @@ static void guard_table_postfork_child(void) {}
 static int guard_table_add(int fd, int flags, guard_entry_options_t* options) { return 0; }
 static int guard_table_check(int fd, int flags) { return 0; }
 static int get_perthread_wd(void) { return -1; }
+static void __mldr_prefork_prepare(void) {}
+static void __mldr_postfork_parent(void) {}
+static void __mldr_postfork_child(void) {}
 static void __dserver_per_thread_socket_refresh(void) {}
 static int __dserver_process_lifetime_pipe_refresh(void) { return -1; }
 static void __dserver_close_socket(int fd) {}

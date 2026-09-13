@@ -11,6 +11,7 @@
 /* A controlled syscall boundary, not a replacement ring implementation. The
  * peer consumes and publishes using the paired server's actual SPSC helpers. */
 static long peer_syscall(long number);
+static int __dserver_adopt_ring_fd(int fd) { (void)fd; abort(); }
 #define LINUX_SYSCALL(number, ...) peer_syscall(number)
 #define LINUX_SYSCALL0(number) peer_syscall(number)
 #define LINUX_SYSCALL1(number, ...) peer_syscall(number)
