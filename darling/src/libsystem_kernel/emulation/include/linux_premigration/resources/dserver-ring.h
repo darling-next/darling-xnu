@@ -77,8 +77,8 @@ int __dserver_ring_task_is_64_bit(int32_t id, bool* out_is_64_bit, int* out_code
 int __dserver_ring_vchroot_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
 int __dserver_ring_mldr_path(uint64_t buffer, uint64_t buffer_size, uint64_t* out_length, int* out_code);
 
-// Reset ring state in the forked child (the parent's ring + wake fd are not valid post-fork;
-// the child re-attaches lazily). Called from the fork path alongside the socket refresh.
+// Reset image-local mappings in the forked child after the shared loader closes
+// inherited ring FDs. This must not close saved FD numbers; the child re-attaches lazily.
 void __dserver_ring_postfork_reset(void);
 
 // perf #18 D17 (dar-1il.12): dump this process's per-thread lane stats (acquired / exhausted / reclaimed

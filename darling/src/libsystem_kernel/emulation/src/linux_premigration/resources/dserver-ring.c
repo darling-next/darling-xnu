@@ -154,11 +154,7 @@ static gr_lane_t* gr_claim_lane(int tid) {
 		// CAS 0 -> 2 ("claiming"): wins the slot exclusively without yet advertising it as usable (==1).
 		if (__atomic_compare_exchange_n(&L->active, &expected, 2u, false,
 		                                __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
-			// dar-j7e7: establish the honest "no fd" sentinel the instant we own the slot, BEFORE any
-			// attach failure path can release it. The slot came from zero-init (wake_fd==0 == valid fd 0);
-			// setting -1 now means an attach that bails between claim and fill never leaves a 0 that a
-			// later reader/reset could mistake for a live fd. Fully redundant with the active-gated reset,
-			// but keeps the field's invariant true at every lifecycle point (defence in depth).
+			// No descriptor is usable until shared-loader adoption succeeds.
 			L->wake_fd = -1;
 			return L;
 		}
