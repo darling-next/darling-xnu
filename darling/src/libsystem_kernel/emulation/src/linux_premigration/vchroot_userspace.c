@@ -1625,24 +1625,33 @@ VISIBLE
 int __darling_vchroot(int dfd)
 {
 	int rv;
-
-#ifndef TEST
-	rv = errno_linux_to_bsd(dserver_rpc_vchroot(dfd));
-	if (rv != 0)
-		return rv;
-#endif
-
 	char buf[50];
+	char path_snapshot[sizeof(prefix_path)];
 
 	__simple_sprintf(buf, "/proc/self/fd/%d", dfd);
 
 	#if defined(__NR_readlink)
-		rv = LINUX_SYSCALL(__NR_readlink, buf, prefix_path, sizeof(prefix_path) - 1);
+		rv = LINUX_SYSCALL(__NR_readlink, buf, path_snapshot, sizeof(path_snapshot) - 1);
 	#else
-		rv = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, buf, prefix_path, sizeof(prefix_path) - 1);
+		rv = LINUX_SYSCALL(__NR_readlinkat, LINUX_AT_FDCWD, buf, path_snapshot, sizeof(path_snapshot) - 1);
 	#endif
-	prefix_path[rv] = '\0';
-	prefix_path_len = rv;
+	if (rv < 0)
+		return errno_linux_to_bsd(rv);
+
+	int path_len = rv;
+	path_snapshot[path_len] = '\0';
+
+#ifndef TEST
+	// The guest snapshots /proc/self/fd exactly once. The same bytes are sent
+	// to the server and, only after RPC success, published locally. This removes
+	// the old FD-transfer + second-read race under close/dup2 replacement.
+	rv = errno_linux_to_bsd(dserver_rpc_vchroot(path_snapshot, (uint64_t)path_len + 1));
+	if (rv != 0)
+		return rv;
+#endif
+
+	memcpy(prefix_path, path_snapshot, (size_t)path_len + 1);
+	prefix_path_len = path_len;
 
 #ifdef EUNION
 	eunion_init_from_prefix();
