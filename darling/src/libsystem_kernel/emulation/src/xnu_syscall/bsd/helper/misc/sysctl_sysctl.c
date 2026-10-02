@@ -4,7 +4,6 @@
 #include <sys/errno.h>
 
 #include <darlingserver/rpc.h>
-#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 enum {
 	_PROC_CPUTYPE = 1000,
@@ -23,12 +22,7 @@ sysctl_handler(handle_proc_cputype)
 		return -ENOENT;
 
 	bool is64bit;
-	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber); on any ring miss fall back to UDS.
-	int t64_code;
-	if (__dserver_ring_task_is_64_bit(name[2], &is64bit, &t64_code) != 0) {
-		t64_code = dserver_rpc_task_is_64_bit(name[2], &is64bit);
-	}
-	if (t64_code < 0) {
+	if (dserver_rpc_task_is_64_bit(name[2], &is64bit) < 0) {
 		return -ENOENT;
 	}
 

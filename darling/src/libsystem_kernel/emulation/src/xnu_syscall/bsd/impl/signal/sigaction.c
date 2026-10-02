@@ -100,6 +100,26 @@ long sys_sigaction(int signum, const struct bsd___sigaction* nsa, struct bsd_sig
 			osa->sa_flags = sig_flags[linux_signum];
 			osa->sa_mask = sig_masks[linux_signum];
 		}
+
+		if (nsa != NULL && linux_signum != LINUX_SIGKILL && linux_signum != LINUX_SIGSTOP
+				&& (nsa->sa_sigaction == XNU_SIG_IGN || sig_handlers[linux_signum] == XNU_SIG_IGN))
+		{
+			// Ignoring only in sigexc_handler leaves blocked signals pending.
+			// Let Linux discard them, retaining the internal mask, flags and restorer.
+			ret = LINUX_SYSCALL(__NR_rt_sigaction, linux_signum, NULL, &sa,
+				sizeof(sa.sa_mask));
+			if (ret < 0)
+				return errno_linux_to_bsd(ret);
+
+			// Both a user handler and SIG_DFL must return through sigexc when
+			// leaving ignore, rather than keeping Linux's SIG_IGN disposition.
+			sa.sa_sigaction = nsa->sa_sigaction == XNU_SIG_IGN
+				? (linux_sig_handler*) XNU_SIG_IGN : (linux_sig_handler*) sigexc_handler;
+			ret = LINUX_SYSCALL(__NR_rt_sigaction, linux_signum, &sa, NULL,
+				sizeof(sa.sa_mask));
+			if (ret < 0)
+				return errno_linux_to_bsd(ret);
+		}
 	}
 	
 	if (nsa != NULL && ret >= 0)

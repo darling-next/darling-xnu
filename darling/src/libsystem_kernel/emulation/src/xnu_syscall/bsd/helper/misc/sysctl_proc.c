@@ -15,7 +15,6 @@
 #include <darling/emulation/conversion/fcntl/open.h>
 
 #include <darlingserver/rpc.h>
-#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 #ifndef isdigit
 #	define isdigit(c) (c >= '0' && c <= '9')
@@ -200,12 +199,7 @@ static struct kinfo_proc_chain* load_proc(const char* name, int what, int flag)
 	kinfo->kinfo.kp_proc.p_pid = __simple_atoi(name, NULL);
 
 	bool is_64_bit;
-	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber); on any ring miss fall back to UDS.
-	int t64_code;
-	if (__dserver_ring_task_is_64_bit(kinfo->kinfo.kp_proc.p_pid, &is_64_bit, &t64_code) != 0) {
-		t64_code = dserver_rpc_task_is_64_bit(kinfo->kinfo.kp_proc.p_pid, &is_64_bit);
-	}
-	if (t64_code < 0) {
+	if (dserver_rpc_task_is_64_bit(kinfo->kinfo.kp_proc.p_pid, &is_64_bit) < 0) {
 		is_64_bit = false;
 	}
 	if (is_64_bit)
