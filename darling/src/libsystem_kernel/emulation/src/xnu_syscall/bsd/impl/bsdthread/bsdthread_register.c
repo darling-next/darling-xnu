@@ -11,6 +11,7 @@
 #include <darling/emulation/common/simple.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 int pthread_obj_size;
 bsdthread_entry_t pthread_entry_point;
@@ -45,7 +46,13 @@ long sys_bsdthread_register(void* thread_start, void* wqthread, int pthsize,
 
 	uintptr_t pthread_handle = _pthread_getspecific_direct(_PTHREAD_TSD_SLOT_PTHREAD_SELF);
 	uintptr_t dispatch_qaddr = pthread_handle + g_pth_regdata.tsd_offset + g_pth_regdata.dispatch_queue_offset;
-	if (dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr) < 0) {
+	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber, header-only reply); on any ring
+	// miss fall back to UDS. Byte-identical to UDS (same dtape primitive via the generic Call path).
+	int sth_code;
+	if (__dserver_ring_set_thread_handles(pthread_handle, dispatch_qaddr, &sth_code) != 0) {
+		sth_code = dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr);
+	}
+	if (sth_code < 0) {
 		__simple_abort();
 	}
 
@@ -63,7 +70,14 @@ void pthread_entry_point_wrapper(void* self, int thread_port, void* funptr,
 
 	uintptr_t pthread_handle = (unsigned long) self;
 	uintptr_t dispatch_qaddr = pthread_handle + g_pth_regdata.tsd_offset + g_pth_regdata.dispatch_queue_offset;
-	if (dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr) < 0) {
+	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber, header-only reply); on any ring
+	// miss fall back to UDS. This is before the register-clobber-sensitive tail below (which starts
+	// after this block), so a normal function call here is as safe as the existing UDS call was.
+	int sth_code;
+	if (__dserver_ring_set_thread_handles(pthread_handle, dispatch_qaddr, &sth_code) != 0) {
+		sth_code = dserver_rpc_set_thread_handles(pthread_handle, dispatch_qaddr);
+	}
+	if (sth_code < 0) {
 		__simple_abort();
 	}
 

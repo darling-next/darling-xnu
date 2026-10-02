@@ -1,10 +1,12 @@
 #include <darling/emulation/common/guarded/table.h>
+#include <darling/emulation/common/signal_atomic.h>
 
 #include <libsimple/lock.h>
 #include <stddef.h>
 #include <errno.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
+#include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
 
 #define MAX_GUARD_COUNT 1024
 
@@ -41,6 +43,19 @@ static guard_entry_t guard_table[MAX_GUARD_COUNT] = {
 
 // TODO: this should be an RW lock
 static libsimple_lock_t guard_table_lock = LIBSIMPLE_LOCK_INITIALIZER;
+
+// close() may reenter this table from a signal handler on the same thread.
+static sigset_t guard_table_lock_signals(void) {
+	sigset_t saved_mask;
+	signal_atomic_begin(&saved_mask);
+	libsimple_lock_lock(&guard_table_lock);
+	return saved_mask;
+}
+
+static void guard_table_unlock_signals(const sigset_t* saved_mask) {
+	libsimple_lock_unlock(&guard_table_lock);
+	signal_atomic_end(saved_mask);
+}
 
 // normal search
 static guard_entry_t* guard_table_find_locked(int fd) {
@@ -108,7 +123,7 @@ int guard_table_add(int fd, guard_flags_t flags, guard_entry_options_t* options)
 #else
 	int result = 0;
 
-	libsimple_lock_lock(&guard_table_lock);
+	sigset_t saved_mask = guard_table_lock_signals();
 
 	guard_entry_t* entry = guard_table_find_locked(fd);
 	if (entry) {
@@ -128,7 +143,7 @@ int guard_table_add(int fd, guard_flags_t flags, guard_entry_options_t* options)
 		}
 	}
 
-	libsimple_lock_unlock(&guard_table_lock);
+	guard_table_unlock_signals(&saved_mask);
 
 	return result;
 #endif
@@ -140,7 +155,7 @@ int guard_table_modify(int fd, guard_flags_t flags, guard_entry_options_t* optio
 #else
 	int result = 0;
 
-	libsimple_lock_lock(&guard_table_lock);
+	sigset_t saved_mask = guard_table_lock_signals();
 
 	guard_entry_t* entry = guard_table_find_locked(fd);
 	if (entry) {
@@ -154,7 +169,7 @@ int guard_table_modify(int fd, guard_flags_t flags, guard_entry_options_t* optio
 		result = -ENOENT;
 	}
 
-	libsimple_lock_unlock(&guard_table_lock);
+	guard_table_unlock_signals(&saved_mask);
 
 	return result;
 #endif
@@ -166,7 +181,7 @@ int guard_table_remove(int fd) {
 #else
 	int result = 0;
 
-	libsimple_lock_lock(&guard_table_lock);
+	sigset_t saved_mask = guard_table_lock_signals();
 
 	guard_entry_t* entry = guard_table_find_locked(fd);
 	if (entry) {
@@ -176,21 +191,26 @@ int guard_table_remove(int fd) {
 		result = -ENOENT;
 	}
 
-	libsimple_lock_unlock(&guard_table_lock);
+	guard_table_unlock_signals(&saved_mask);
 
 	return result;
 #endif
 }
 
 int guard_table_check(int fd, guard_flags_t flags) {
+	// The loader's FD ownership spans dyld and libsystem_kernel, unlike this
+	// image-local table. In particular, neither image may close a ring wake FD.
+	if ((flags & guard_flag_prevent_close) && __dserver_fd_is_internal(fd)) {
+		return 1;
+	}
 #ifdef VARIANT_DYLD
 	return 0;
 #else
 	int result = 0;
-	libsimple_lock_lock(&guard_table_lock);
+	sigset_t saved_mask = guard_table_lock_signals();
 	guard_entry_t* entry = guard_table_find_locked(fd);
 	result = entry && (entry->flags & flags) != 0;
-	libsimple_lock_unlock(&guard_table_lock);
+	guard_table_unlock_signals(&saved_mask);
 	return result;
 #endif
 }

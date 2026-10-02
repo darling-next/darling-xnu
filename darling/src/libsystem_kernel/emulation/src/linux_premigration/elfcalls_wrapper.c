@@ -43,6 +43,16 @@ void __mldr_postfork_child(void)
 	return elfcalls()->postfork_child();
 }
 
+void __mldr_prefork_prepare(void)
+{
+	return elfcalls()->prefork_prepare();
+}
+
+void __mldr_postfork_parent(void)
+{
+	return elfcalls()->postfork_parent();
+}
+
 void* __darling_thread_create(unsigned long stack_size, unsigned long pthobj_size,
 			void* entry_point, uintptr_t arg3,
 			uintptr_t arg4, uintptr_t arg5, uintptr_t arg6,
@@ -98,6 +108,14 @@ void __dserver_per_thread_socket_refresh(void) {
 void __dserver_close_socket(int socket) {
 	return elfcalls()->dserver_close_socket(socket);
 };
+
+int __dserver_adopt_ring_fd(int fd) {
+	return elfcalls()->dserver_adopt_ring_fd(fd);
+}
+
+bool __dserver_fd_is_internal(int fd) {
+	return elfcalls()->dserver_fd_is_internal(fd);
+}
 
 int __dserver_get_process_lifetime_pipe() {
 	return elfcalls()->dserver_get_process_lifetime_pipe();

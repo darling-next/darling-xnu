@@ -46,7 +46,8 @@ with tempfile.TemporaryDirectory(prefix="spawn-pidfd-") as temporary:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text("")
     for name in ("common/base.h", "xnu_syscall/bsd/impl/process/fork.h",
-                 "xnu_syscall/bsd/impl/process/posix_spawn.h", "conversion/process/posix_spawn.h"):
+                 "xnu_syscall/bsd/impl/process/posix_spawn.h", "conversion/process/posix_spawn.h",
+                 "linux_premigration/resources/dserver-ring.h"):
         target = includes / "darling/emulation" / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text((emulation / "include" / name).read_text())

@@ -12,7 +12,7 @@
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
 #include <darling/emulation/common/simple.h>
-#include <darling/emulation/xnu_syscall/bsd/impl/signal/sigprocmask.h>
+#include <darling/emulation/common/signal_atomic.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 
@@ -348,15 +348,8 @@ void __dserver_rpc_hooks_printf(const char* format, ...);
 
 #define dserver_rpc_hooks_atomic_save_t sigset_t
 
-static void dserver_rpc_hooks_atomic_begin(dserver_rpc_hooks_atomic_save_t* atomic_save) {
-	// block standard unix signals (not real-time signals, though)
-	sigset_t set = 0x7fffffff;
-	sys_sigprocmask(SIG_BLOCK, &set, atomic_save);
-};
-
-static void dserver_rpc_hooks_atomic_end(dserver_rpc_hooks_atomic_save_t* atomic_save) {
-	sys_sigprocmask(SIG_SETMASK, atomic_save, NULL);
-};
+#define dserver_rpc_hooks_atomic_begin signal_atomic_begin
+#define dserver_rpc_hooks_atomic_end signal_atomic_end
 
 #define dserver_rpc_hooks_get_interrupt_status() (-LINUX_EINTR)
 

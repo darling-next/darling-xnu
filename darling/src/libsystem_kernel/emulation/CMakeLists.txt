@@ -84,6 +84,7 @@ set(linux_premigration_sources
 	src/linux_premigration/misc/ioctl.c
 	src/linux_premigration/resources/dserver-rpc-defs.c
 	src/linux_premigration/resources/rpc-sleep-account.c
+	src/linux_premigration/resources/dserver-ring.c
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
@@ -401,6 +402,16 @@ option(DARLING_RPC_SLEEP_ACCOUNT "Enable guest-side per-callnum recvmsg-sleep ac
 if (DARLING_RPC_SLEEP_ACCOUNT)
 	target_compile_definitions(emulation PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
 	target_compile_definitions(emulation_dyld PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
+endif()
+
+# Shared-memory ring transport is compiled into BOTH the dylib (emulation) and dyld
+# (emulation_dyld), since both contain trap paths. OFF leaves dserver-ring.c empty and
+# folds the helper calls into ordinary UDS fallbacks. Pair this option with the server's
+# DSERVER_RING_TRANSPORT when building matched OFF/ON runtimes from the same sources.
+option(DARLING_RING_TRANSPORT "Enable guest-side shared-memory ring RPC transport (perf #18)" ON)
+if (DARLING_RING_TRANSPORT)
+	target_compile_definitions(emulation PRIVATE DARLING_RING_TRANSPORT)
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_RING_TRANSPORT)
 endif()
 
 # perf #7-generalize (dar-dar6x4-perf-5dq.14): guest-side adaptive recv-spin budget.

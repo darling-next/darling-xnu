@@ -16,6 +16,7 @@
 #include <darlingserver/rpc.h>
 
 #include <darling/emulation/xnu_syscall/mach/impl/cached_self_ports.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 #define UNIMPLEMENTED_TRAP() { char msg[] = "Called unimplemented Mach trap: "; write(2, msg, sizeof(msg)-1); write(2, __FUNCTION__, sizeof(__FUNCTION__)-1); write(2, "\n", 1); }
 
@@ -36,6 +37,14 @@ void __darling_reset_cached_self_ports(void) {
 mach_port_name_t mach_reply_port_impl(void)
 {
 	unsigned int port_name;
+	// perf #18 P3: mach_reply_port is the UNCACHED high-frequency op (every Mach RPC round-trip
+	// needs a reply port), so unlike task_self_trap it actually exercises the ring's latency win.
+	// Only a negative pre-publication miss permits UDS fallback. A published failure
+	// must return MACH_PORT_NULL without minting another port over UDS.
+	int ring_code = __dserver_ring_mach_reply_port(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
+	}
 	if (dserver_rpc_mach_reply_port(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
@@ -45,6 +54,11 @@ mach_port_name_t mach_reply_port_impl(void)
 mach_port_name_t thread_self_trap_impl(void)
 {
 	unsigned int port_name;
+	// Uncached, per-thread port. Retry only if the ring did not publish.
+	int ring_code = __dserver_ring_thread_self_trap(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
+	}
 	if (dserver_rpc_thread_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
@@ -54,6 +68,11 @@ mach_port_name_t thread_self_trap_impl(void)
 mach_port_name_t host_self_trap_impl(void)
 {
 	unsigned int port_name;
+	// A published ring failure must not mint a second send right over UDS.
+	int ring_code = __dserver_ring_host_self_trap(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
+	}
 	if (dserver_rpc_host_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
@@ -263,7 +282,19 @@ kern_return_t _kernelrpc_mach_vm_deallocate_trap_impl(
 
 	if (target != 0 && target != mach_task_self())
 	{
-		int code = dserver_rpc_mach_vm_deallocate(target, address, size);
+		// perf #18 P8 D5 (dar-1il.3.2.2): vm_deallocate of ANOTHER task's address space goes to the
+		// server, whose vm_map_remove can drive a munmap S2C upcall back to THIS caller -- the exact
+		// caller-S2C shape that wedges a simple-ring-parked thread (dar-1il.1). The DUPLEX lane lets the
+		// caller pump that munmap S2C on its own thread while parked for the final reply. Try it FIRST
+		// (a strict no-op unless the per-command hatch DARLING_GUEST_DUPLEX_VM_DEALLOCATE=1 is set AND the
+		// VM_DEALLOCATE cap is negotiated). On a valid round-trip `code` is the kern_return_t, used
+		// verbatim. On ANY transport miss or a server PRE-MUTATION decline it returns nonzero and we
+		// UDS-fall-back -- safe, because the server declines BEFORE dispatching (the op runs exactly once).
+		// Folded away entirely unless -DDARLING_RING_TRANSPORT.
+		int code;
+		if (__dserver_ring_mach_vm_deallocate_duplex(target, address, size, &code) != 0) {
+			code = dserver_rpc_mach_vm_deallocate(target, address, size);
+		}
 
 		if (code < 0) {
 			__simple_printf("mach_vm_deallocate failed (internally): %d\n", code);
@@ -394,7 +425,13 @@ kern_return_t _kernelrpc_mach_port_allocate_trap_impl(
 				mach_port_name_t *name
 )
 {
-	int code = dserver_rpc_mach_port_allocate(target, right, name);
+	int code;
+	// perf #18 P5-bulk (dar-1il.1): ride the ring (Tier-1 generic fiber path) -- byte-identical to
+	// UDS, the allocated name is written into guest memory via `name` exactly as before; the reply
+	// is header-only. On any ring miss, fall back to UDS. Folded away unless -DDARLING_RING_TRANSPORT.
+	if (__dserver_ring_mach_port_allocate(target, right, (uint64_t)(uintptr_t)name, &code) != 0) {
+		code = dserver_rpc_mach_port_allocate(target, right, name);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_allocate failed (internally): %d\n", code);
@@ -425,7 +462,21 @@ kern_return_t _kernelrpc_mach_port_deallocate_trap_impl(
 				mach_port_name_t name
 )
 {
-	int code = dserver_rpc_mach_port_deallocate(target, name);
+	// perf #18 P5-bulk (dar-1il.1): mach_port_deallocate is NOT on the SIMPLE ring -- destroying a port
+	// backing a mapped region drives a vm-munmap S2C upcall to THIS thread, which a simple-ring-parked
+	// (futex-waiting, non-recvmsg) caller cannot service -> deadlock. (See DSERVER_RING_C2S_OPCODES.)
+	//
+	// perf #18 P8 D4 (dar-1il.3.2.1): the DUPLEX lane fixes exactly that -- the caller pumps the munmap
+	// S2C on its own thread while parked for the final reply. Try the duplex lane FIRST (it is a strict
+	// no-op unless the per-command hatch DARLING_GUEST_DUPLEX_DEALLOCATE=1 is set AND the cap is
+	// negotiated). On a valid duplex round-trip `code` is the kern_return_t and we use it verbatim. On
+	// ANY transport miss or a server PRE-MUTATION decline it returns nonzero and we UDS-fall-back --
+	// safe, because the server declines BEFORE dispatching (no mutation), so the op runs exactly once.
+	// Folded away entirely unless -DDARLING_RING_TRANSPORT.
+	int code;
+	if (__dserver_ring_mach_port_deallocate_duplex(target, name, &code) != 0) {
+		code = dserver_rpc_mach_port_deallocate(target, name);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_deallocate failed (internally): %d\n", code);
@@ -442,10 +493,20 @@ kern_return_t _kernelrpc_mach_port_mod_refs_trap_impl(
 				mach_port_delta_t delta
 )
 {
+	// perf #18 P5-bulk audit (dar-1il.2): mach_port_mod_refs is DELIBERATELY NOT ring-routed.
+	// It is destroy-CAPABLE: mod_refs(right, delta<0) dropping the last user-ref of a receive right
+	// destroys the port, and destroying a port that backs a mapped region drives a vm munmap
+	// server-to-client (S2C) upcall to THIS thread -- the SAME hazard that sank mach_port_deallocate.
+	// A thread parked on a ring reply is not in a recvmsg and cannot service an S2C call, so the
+	// server microthread would block on the S2C reply while the guest blocks in the ring futex-wait
+	// -> deadlock. The hazard is a SIDE EFFECT of certain (negative-delta, last-ref) args, not the
+	// return code, and cannot be decided before the ipc_space lock is held and the refcount known
+	// (i.e. after mutation begins), so it stays on UDS -- where the caller's recvmsg services the
+	// S2C -- until a proven-safe subset is gated. (See DSERVER_RING_C2S_OPCODES, rpc-supplement.h.)
 	int code = dserver_rpc_mach_port_mod_refs(target, name, right, delta);
 
 	if (code < 0) {
-		__simple_printf("mach_port_deallocate failed (internally): %d\n", code);
+		__simple_printf("mach_port_mod_refs failed (internally): %d\n", code);
 		__simple_abort();
 	}
 
@@ -475,7 +536,11 @@ kern_return_t _kernelrpc_mach_port_insert_right_trap_impl(
 				mach_msg_type_name_t polyPoly
 )
 {
-	int code = dserver_rpc_mach_port_insert_right(target, name, poly, polyPoly);
+	int code;
+	// perf #18 P5-bulk (dar-1il.1): ring Tier-1 (generic fiber path), UDS fallback on any miss.
+	if (__dserver_ring_mach_port_insert_right(target, name, poly, polyPoly, &code) != 0) {
+		code = dserver_rpc_mach_port_insert_right(target, name, poly, polyPoly);
+	}
 
 	if (code < 0) {
 		__simple_printf("mach_port_insert_right failed (internally): %d\n", code);
@@ -722,6 +787,12 @@ kern_return_t syscall_thread_switch_impl(
 static cached_port_name_t __task_self_trap_rpc(void)
 {
 	unsigned int port_name;
+	// Return a failed published request as NULL; the cache does not retain failures.
+	// Only a pre-publication miss may use UDS for this invocation.
+	int ring_code = __dserver_ring_task_self_trap(&port_name);
+	if (ring_code >= 0) {
+		return ring_code == 0 ? port_name : MACH_PORT_NULL;
+	}
 	if (dserver_rpc_task_self_trap(&port_name) != 0) {
 		port_name = MACH_PORT_NULL;
 	}
@@ -732,7 +803,19 @@ mach_port_name_t task_self_trap_impl(void)
 {
 	// perf #7: the task self port is immutable per process; serve it from the cache
 	// (filled by one real RPC, reset on fork via __darling_reset_cached_self_ports).
-	return cached_self_port_get(&__task_self_port_cache, __task_self_trap_rpc);
+	mach_port_name_t self = cached_self_port_get(&__task_self_port_cache, __task_self_trap_rpc);
+	// perf #18 P8 D3 (dar-1il.3.1.1): one-shot DUPLEX-lane selftest, driven here because this is an
+	// early trap with the ring already attached. A strict no-op unless the marker file
+	// /private/tmp/.dring-duplex-go exists (see __dserver_ring_maybe_run_duplex_selftest); it is
+	// consumed by the first guest to claim it, so it never perturbs a normal boot. Folds away entirely
+	// when the dylib is built without the ring.
+	__dserver_ring_maybe_run_duplex_selftest();
+	// perf #18 P8 D6 (caller-S2C sideband): one-shot synthetic WARM real-munmap proof, driven here for the
+	// same reason (early trap, ring attached). Strict no-op unless the marker /private/tmp/.dring-d6-munmap-go
+	// exists. `self` is this task's mach_task_self() name -> the server resolves it to current_task() and
+	// frees our just-mapped page = a REAL caller-S2C munmap over the duplex lane.
+	__dserver_ring_maybe_run_d6_munmap_proof(self);
+	return self;
 }
 
 /*

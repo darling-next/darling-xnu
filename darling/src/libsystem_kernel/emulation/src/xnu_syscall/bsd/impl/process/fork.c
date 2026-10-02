@@ -14,6 +14,7 @@
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
 #include <darling/emulation/common/guarded/table.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 #include <darlingserver/rpc.h>
 
@@ -25,6 +26,7 @@ static long fork_with_exit_signal(int exit_signal, int* pidfd)
 {
 	int ret;
 	int wdfd = get_perthread_wd();
+	__mldr_prefork_prepare();
 
 	if (pidfd != NULL) {
 		/*
@@ -42,6 +44,9 @@ static long fork_with_exit_signal(int exit_signal, int* pidfd)
 		ret = LINUX_SYSCALL(__NR_clone, exit_signal, 0);
 #endif
 	}
+	if (ret != 0) {
+		__mldr_postfork_parent();
+	}
 	if (ret < 0)
 		ret = errno_linux_to_bsd(ret);
 	else if (ret == 0)
@@ -57,6 +62,9 @@ static long fork_with_exit_signal(int exit_signal, int* pidfd)
 
 		// create a new dserver RPC socket
 		__dserver_per_thread_socket_refresh();
+		// The loader already closed both images' inherited ring FDs. Drop this
+		// image's mappings without closing numbers the new RPC socket may reuse.
+		__dserver_ring_postfork_reset();
 		int newReadFd = __dserver_process_lifetime_pipe_refresh();
 
 		// guard it
