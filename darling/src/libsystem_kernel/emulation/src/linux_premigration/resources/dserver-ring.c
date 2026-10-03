@@ -810,8 +810,18 @@ uint64_t __dserver_fd_courier_send(int fd, uint32_t kind) {
 	// pending registry then paired one process's request with another process's descriptor
 	// (`PARKED pid=672791 token=X` against `bundle pid=672797 token=X`, same generation). The token is the
 	// identity both halves share, so it has to be unique per process as well as per send.
+	//
+	// perf#30 IMAGE IDENTITY: generation+pid+counter is STILL not unique, because the loader and this image
+	// are two copies of this code inside ONE process: same pid, same generation, and each copy's counter
+	// starts at the same value. MEASURED on the recovered Ring candidate: mldr's lane-backing bundle
+	// (kind=1) and this image's execve checkout bundle (kind=2) carried the SAME token 5189026761396706776,
+	// the checkout envelope was dropped as a duplicate of the pending lane bundle, and the checkout then
+	// resolved as KindMismatch (want=2 got=1) -> sys_execve returned -EBADF -> `execv: Bad file descriptor`
+	// and shellspawn never became ready. The counter's own address is per image, so mixing it in separates
+	// the images while the counter still separates sends within one image.
 	uint64_t token = (gr_fd_courier_generation * 0x9E3779B97F4A7C15ull)
 		^ ((uint64_t)(unsigned)LINUX_SYSCALL(__NR_getpid) * 0xC2B2AE3D27D4EB4Full)
+		^ ((uint64_t)(uintptr_t)&gr_fd_courier_next_token * 0x94D049BB133111EBull)
 		^ (++gr_fd_courier_next_token);
 	const char* mutation = gr_fd_courier_mutation();
 
