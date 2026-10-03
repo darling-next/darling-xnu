@@ -6,7 +6,17 @@
 
 __darling_bsd_syscall:
 Lentry_hook:
-	.space 13, 0x90
+	# EXPERIMENT (temporary): a semantics-preserving jump inside the 13-byte hook area -- same 13 bytes, same
+	# behaviour, different bytes. If the guest still starts, the area is statically occupiable and the earlier
+	# breakage was my trampoline's ABI; if it does not, something else claims these bytes and only a RUNTIME hook
+	# installation (xtrace's model) is available.
+	# MEASURED (2026-09-27): this MUST be a `call`, not a `jmp`. xtrace installs the same hook with
+	# `setup_hook(..., jump=false)` -- i.e. a call -- and the trampoline ends in `ret`, so a `jmp` here returns
+	# straight to the syscall's caller and SKIPS THE WHOLE DISPATCHER: every Darwin syscall in the guest then
+	# returns garbage and every run is NO-RUN, hatch or not. That was the third measured way this instrument broke
+	# the guest; the contract's first claim is what catches it.
+	call	__darling_bsd_syscall_trace_entry
+	.space 8, 0x90
 	movq    ___bsd_syscall_table@GOTPCREL(%rip), %r10
 	movq	(%r10,%rax,8), %r10
 	test	%r10, %r10
@@ -26,6 +36,38 @@ Lexit_hook:
 	movq	%rax, %rdi
 	call	___unknown_syscall
 	jmp		.std_ret
+
+# step A: trampoline copied from xtrace's proven pattern, calling an EMPTY C body.
+__darling_bsd_syscall_trace_entry:
+	pushq	%rbp
+	movq	%rsp, %rbp
+	andq	$-16, %rsp
+	subq	$8, %rsp
+	movq	40(%rbp), %r11
+	pushq	%r11
+	movq	32(%rbp), %r11
+	pushq	%r11
+	pushq	%r9
+	pushq	%r8
+	pushq	%rcx
+	pushq	%rdx
+	pushq	%rsi
+	pushq	%rdi
+	pushq	%rax
+	movq	%rax, %rdi
+	leaq	8(%rsp), %rsi
+	call	___darling_bsd_syscall_trace_c
+	popq	%rax
+	popq	%rdi
+	popq	%rsi
+	popq	%rdx
+	popq	%rcx
+	popq	%r8
+	popq	%r9
+	leave
+	ret
+
+
 
 .section        __DATA,__data
 .globl __darling_bsd_syscall_entry

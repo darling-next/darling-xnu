@@ -1,5 +1,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/chmod_extended.h>
 
+#include <sys/errno.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -13,6 +14,18 @@ long sys_chmod_extended(const char* path, int uid, int gid, int mode, void* xsec
 	struct vchroot_expand_args vc;
 	vc.flags = VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
+
+	if (!path)
+		return -EFAULT;
+
+#ifdef EUNION
+	// chmod+chown mutate metadata: copy up first so the change lands on the upper.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_write(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+#endif
 
 	strcpy(vc.path, path);
 	ret = vchroot_expand(&vc);

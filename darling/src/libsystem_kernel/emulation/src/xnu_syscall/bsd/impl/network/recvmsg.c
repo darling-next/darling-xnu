@@ -92,7 +92,7 @@ long sys_recvmsg_nocancel(int socket, struct bsd_msghdr* msg, int flags)
 
 					bnext->cmsg_len = lnext->cmsg_len - LINUX_BSD_CMSGHDR_SIZE_DIFFERENCE;
 					bnext->cmsg_level = socket_level_linux_to_bsd(lnext->cmsg_level);
-					bnext->cmsg_type = lnext->cmsg_type;
+					bnext->cmsg_type = socket_cmsg_type_linux_to_bsd(lnext->cmsg_level, lnext->cmsg_type);
 
 					// __simple_printf("About to copy %d bytes\n", lnext->cmsg_len - sizeof(struct linux_cmsghdr));
 
@@ -107,6 +107,15 @@ long sys_recvmsg_nocancel(int socket, struct bsd_msghdr* msg, int flags)
 			else
 			{
 				msg->msg_controllen = lmsg.msg_controllen;
+				for (size_t pos = 0; pos + sizeof(*bchdr) <= msg->msg_controllen;) {
+					bchdr = (struct bsd_cmsghdr*)((char*)msg->msg_control + pos);
+					if (bchdr->cmsg_len < sizeof(*bchdr) ||
+						bchdr->cmsg_len > msg->msg_controllen - pos)
+						break;
+					bchdr->cmsg_type = socket_cmsg_type_linux_to_bsd(bchdr->cmsg_level, bchdr->cmsg_type);
+					bchdr->cmsg_level = socket_level_linux_to_bsd(bchdr->cmsg_level);
+					pos += BSD_CMSG_ALIGN(bchdr->cmsg_len);
+				}
 			}
 		}
 

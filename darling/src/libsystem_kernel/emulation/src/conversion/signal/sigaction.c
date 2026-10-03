@@ -5,6 +5,7 @@
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/conversion/signal/duct_signals.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigaction.h>
+#include <darling/emulation/common/simple.h>
 
 extern void* memset(void* dest, int v, __SIZE_TYPE__ len);
 
@@ -14,6 +15,22 @@ static void ucontext_linux_to_bsd(const struct linux_ucontext *lc, struct bsd_uc
 
 void handler_linux_to_bsd(int linux_signum, struct linux_siginfo* info, void* ctxt)
 {
+	// FAULT-SITE PROBE. This IS the function the host disposition points at (measured: is_wrapper=0, the disposition
+	// is a real Darling handler, and this is the one a delivered signal lands in), so the faulting address and the
+	// interrupted instruction pointer are finally available: si_addr is the address that faulted and gregs.rip is
+	// where execution was when it did. Bounded, signal 11 only, and signal-safe -- two values and a write.
+	if (linux_signum == 11) {
+		static int emitted_fault = 0;
+		if (emitted_fault < 16) {
+			++emitted_fault;
+			// si_code matters as much as the address: SEGV_MAPERR (1) is an unmapped access and SEGV_ACCERR (2) is a
+			// protection violation, and the two point at different faults.
+			__simple_fprintf(2, "[fault sig=11 addr=%p sicode=%d]\n",
+				(info != NULL) ? (const void*)info->si_addr : (const void*)0,
+				(info != NULL) ? (int)info->si_code : -1);
+		}
+	}
+
 	int bsd_signum;
 	struct bsd_siginfo binfo;
 	struct linux_ucontext* lc = (struct linux_ucontext*) ctxt;

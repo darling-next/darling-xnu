@@ -1,5 +1,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/time/utimes.h>
 
+#include <sys/errno.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
@@ -23,7 +24,19 @@ long sys_utimes(const char* path, struct bsd_timeval* tv)
 
 	vc.flags = VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
-	
+
+	if (!path)
+		return -EFAULT;
+
+#ifdef EUNION
+	// utimes mutates metadata: copy up first so the change lands on the upper copy.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_write(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+#endif
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);

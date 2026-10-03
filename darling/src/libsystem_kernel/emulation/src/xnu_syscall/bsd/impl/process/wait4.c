@@ -1,5 +1,9 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/process/wait4.h>
 
+#include <darling/emulation/common/simple.h>
+
+static int emitted_wait4 = 0;
+
 #include <sys/signal.h>
 #include <stddef.h>
 
@@ -34,6 +38,15 @@ long sys_wait4_nocancel(int pid, int* status, int options, void* rusage)
 
 restart:
 	ret = LINUX_SYSCALL(__NR_wait4, pid, status, linux_options, rusage);
+	// REAP PROBE. MEASURED NEED: for the fatal SIGSEGV the kernel enters neither the guest's handler wrapper nor the
+	// loader's host probe, although the guest installed a handler for SIGSEGV and never blocks it -- so the process
+	// that dies is NOT the one that installed them. This prints the pid the host reaped and the RAW host status, so
+	// the dying process is named instead of inferred: a signaled status is (signum | 0x80) and the pid can be
+	// matched against the pid-tagged lines of the same log. Bounded.
+	if (ret > 0 && emitted_wait4 < 40) {
+		++emitted_wait4;
+		__simple_fprintf(2, "[wait4 pid=%d raw=0x%x]\n", ret, (unsigned)*status);
+	}
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 

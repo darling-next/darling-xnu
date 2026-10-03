@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/spawn.h>
 #include <sys/fcntl.h>
+#include <sys/errno.h>
 #include <_libkernel_init.h>
 
 #include <darling/emulation/xnu_syscall/bsd/impl/process/execve.h>
@@ -28,6 +29,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/signal/sigprocmask.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/simple.h>
+#include <darling/emulation/common/guarded/table.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/process/fork.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/chdir.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/fchdir.h>
@@ -41,6 +43,9 @@
 #endif
 
 #define LINUX_ADDR_NO_RANDOMIZE 0x40000
+#define LINUX_WCLONE 0x80000000U
+#define LINUX_WEXITED 0x00000004
+#define LINUX_P_PIDFD 3
 
 extern _libkernel_functions_t _libkernel_functions;
 
@@ -49,6 +54,8 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 {
 	int ret, my_pid;
 	int pipe[2] = { -1, -1 };
+	/* Transient, like the error pipe; never published to application code. */
+	int pidfd = -1;
 
 	if (desc && desc->attrp && desc->attrp->psa_flags & POSIX_SPAWN_SETEXEC)
 		goto no_fork;
@@ -63,7 +70,7 @@ long sys_posix_spawn(int* pid, const char* path, const struct _posix_spawn_args_
 
 	_libkernel_functions->posix_spawn_prepare();
 
-	if ((my_pid = sys_fork()) == 0)
+	if ((my_pid = fork_for_spawn(&pidfd)) == 0)
 	{
 		// child
 		// close the reading side
@@ -110,15 +117,16 @@ no_fork:
 			}
 
 			if (desc->attrp->psa_flags & POSIX_SPAWN_CLOEXEC_DEFAULT) {
-				// set O_CLOEXEC on everything
-				int dir = sys_open("/proc/self/fd", BSD_O_RDONLY, 0);
+				// Enumerate host descriptors without resolving /proc through the guest root.
+				int dir = LINUX_SYSCALL(__NR_open, "/proc/self/fd",
+					LINUX_O_RDONLY | LINUX_O_DIRECTORY | LINUX_O_CLOEXEC, 0);
 				char buf[4096];
 				int len = 0;
 
 				//__simple_kprintf("asked for cloexec default\n");
 
 				if (dir < 0) {
-					ret = dir;
+					ret = errno_linux_to_bsd(dir);
 					goto fail;
 				}
 
@@ -134,9 +142,8 @@ no_fork:
 
 						fd = __simple_atoi(dirent->d_name, NULL);
 
-						// FIXME: pretty sure this should not be hardcoded
-						if (fd == 1023) {
-							// special commpage fd
+						// Preserve the commpage FD and guarded runtime-owned descriptors.
+						if (fd == 1023 || guard_table_check(fd, guard_flag_prevent_close)) {
 							continue;
 						}
 
@@ -357,16 +364,43 @@ fail:
 
 		if (my_pid < 0)
 		{
+			close_internal(pipe[0]);
 			ret = my_pid;
 			goto out;
 		}
 
-		if (pid != NULL)
-			*pid = my_pid;
-
-		if (sys_read(pipe[0], &ret, sizeof(ret)) != sizeof(ret))
-			ret = 0;
+		long received;
+		do {
+			received = sys_read(pipe[0], &ret, sizeof(ret));
+		} while (received == -EINTR);
 		close_internal(pipe[0]);
+		if (received == 0)
+			ret = 0;
+		else if (received != sizeof(ret))
+			ret = received < 0 ? (int)received : -EIO;
+
+		/*
+		 * Failed setup/exec children remain private and cannot notify or be
+		 * reaped by application SIGCHLD handlers. Successful exec changes the
+		 * Linux exit signal to SIGCHLD, so __WCLONE returns ECHILD without
+		 * consuming the public child. The atomically acquired pidfd retains
+		 * identity even if a SIGCHLD handler reaps that child and Linux reuses
+		 * its numeric PID for a different private clone. Reap even an
+		 * unexpectedly killed private child whose error pipe closed without
+		 * a complete error record.
+		 */
+		do {
+			/* Raw Linux waitid permits NULL siginfo and returns 0 on reap. */
+			err = LINUX_SYSCALL(__NR_waitid, LINUX_P_PIDFD, pidfd, NULL,
+				LINUX_WEXITED | LINUX_WCLONE, NULL);
+		} while (err == -EINTR);
+		close_internal(pidfd);
+		if (err == 0 && ret == 0)
+			ret = -EIO;
+		else if (err < 0 && err != -ECHILD && ret == 0)
+			ret = errno_linux_to_bsd(err);
+		if (ret == 0 && pid != NULL)
+			*pid = my_pid;
 	}
 
 out:

@@ -22,9 +22,11 @@
 #include <darling/emulation/common/bsdthread/per_thread_wd.h>
 #include <darling/emulation/common/simple.h>
 #include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
+#include <darlingserver/rpc-supplement.h>   // perf#30: the process-control page protocol
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/write.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
 
 
 #undef memcpy
@@ -46,7 +48,17 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 	uint64_t mldr_path_length;
 	const char* path_to_exec = vc.path;
 
-	ret = dserver_rpc_mldr_path(mldr_path, sizeof(mldr_path), &mldr_path_length);
+	// perf #18 D13 (dar-1il.8): try the ring first (fixed 16B body, 8B reply; the path itself is
+	// delivered by the server's writeMemory on our /proc/mem, transport-agnostic). On any transport
+	// miss (-1) fall back to UDS, preserving this site's exact result semantics.
+	{
+		int t_code;
+		if (__dserver_ring_mldr_path((uint64_t)(uintptr_t)mldr_path, sizeof(mldr_path), &mldr_path_length, &t_code) == 0) {
+			ret = t_code;
+		} else {
+			ret = dserver_rpc_mldr_path(mldr_path, sizeof(mldr_path), &mldr_path_length);
+		}
+	}
 	if (ret < 0) {
 		return errno_linux_to_bsd(ret);
 	}
@@ -57,7 +69,7 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 	strcpy(vc.path, fname);
 
 	ret = vchroot_expand(&vc);
-	__simple_kprintf("execve expand %s -> %s, ret %d", fname, vc.path, ret);
+	hotpath_kdebug("execve expand %s -> %s, ret %d", fname, vc.path, ret);
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 
@@ -192,7 +204,25 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 		// count original env vars
 		while (envp[len++]);
 
-		const int new_env_count = 2;
+		// THE GUEST ROOT IS RE-EXPORTED TO EVERY SPAWNED PROCESS. MEASURED: the loader renames
+		// __mldr_DYLD_ROOT_PATH into DYLD_ROOT_PATH for the image it is about to run, dyld consumes that name, and
+		// the image's own children therefore received NO root at all -- the child's loader then opened the
+		// unprefixed path and the boot died with "Cannot open /usr/lib/dyld: No such file or directory" followed by
+		// "Rootless shellspawn did not become ready". The root is known here (the same vchroot the server reports
+		// for this process), so it is exported explicitly on the exec path instead of relying on an environment that
+		// dyld has already consumed. A re-publishing setenv inside the loader does not help: that writes the
+		// process environment, while the image and its spawn path use the envp array built here.
+		char vchroot_env[4096 + sizeof("__mldr_DYLD_ROOT_PATH=")];
+		vchroot_env[0] = '\0';
+		{
+			struct vchroot_expand_args vc;
+			memset(&vc, 0, sizeof(vc));
+			strcpy(vc.path, "/");
+			if (vchroot_expand(&vc) == 0)
+				__simple_snprintf(vchroot_env, sizeof(vchroot_env) - 1, "__mldr_DYLD_ROOT_PATH=%s", vc.path);
+		}
+
+		const int new_env_count = 3;
 
 		// allocate a new envp and env0, env1
 		modenvp = (const char**)__builtin_alloca(sizeof(void*) * (len + new_env_count));
@@ -203,6 +233,7 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 		strcat(buf, server_socket_path);
 		modenvp[0] = buf;
 		modenvp[1] = mldr_lifetime_pipe_env;
+		modenvp[2] = vchroot_env;
 
 		// append original env vars
 		for (int i = new_env_count; i < len + new_env_count; i++)
@@ -231,7 +262,106 @@ long sys_execve(const char* fname, const char** argvp, const char** envp)
 		return errno_linux_to_bsd(ret);
 
 	// send a copy of the read end to the server (along with whether or not we're executing another Darling-managed binary)
-	ret = dserver_rpc_checkout(dserver_execve_pipe[0], is_script || is_macho);
+	// perf#30 CHECKOUT ON THE PAGE: the execve teardown call rides the page when its transport is up, with the
+	// exec listener pipe on the process courier (kind = CHECKOUT_FD). The server no longer aborts when the peer
+	// has gone (ENOTCONN is handled as a dropped message), which is what made the earlier attempt look like a
+	// boot wedge.
+	ret = 0;
+	{
+		int viaPage = 0;
+		struct dserver_process_control* page =
+			(struct dserver_process_control*)__dserver_process_control_page();
+		if (page != NULL) {
+			for (int w = 0; w < 200 && __atomic_load_n(&page->transport_ready, __ATOMIC_ACQUIRE) == 0; ++w) {
+				long ts[2] = {0, 1000000L};
+				(void)LINUX_SYSCALL6(__NR_nanosleep, ts, 0, 0, 0, 0, 0);
+			}
+		}
+		if (page != NULL && __atomic_load_n(&page->transport_ready, __ATOMIC_ACQUIRE) != 0) {
+			uint64_t token = __dserver_fd_courier_send(dserver_execve_pipe[0], DSERVER_FD_COURIER_KIND_CHECKOUT_FD);
+			if (token != 0) {
+				int slot = 0;
+				// NO SILENT DATAGRAM FALLBACK FOR A SHAPE THE PLANE CAN CARRY (dar-b5pe). MEASURED: when this
+				// claim failed, the code fell through to dserver_rpc_checkout, i.e. to the ordinary datagram
+				// transport, which under DARLING_DISABLE_THREAD_RPC_UDS=1 reports
+				// `[rpc-socket-DENIED] call=checkout image=kernel denied=1` and then aborts the process -- one run
+				// in forty of a guarded soak, which is why that run's log ends at a denial and a native exit
+				// status. The claim below therefore uses the SAME generation-scoped rule as the plane's publisher:
+				// a slot a previous generation left PENDING may be reclaimed once the ordinary bound has expired,
+				// while a slot the server has CLAIMED is never taken. The generation is taken BEFORE the loop,
+				// because the reclaim predicate needs it.
+				static uint32_t checkout_seq = 0;
+				uint32_t mine = __atomic_add_fetch(&checkout_seq, 1, __ATOMIC_RELAXED);
+				for (int t = 0; t < 2600 && !slot; ++t) {
+					uint32_t expect;
+					{
+						uint32_t obs = __atomic_load_n(&page->request_state, __ATOMIC_ACQUIRE);
+						if (obs == DSERVER_PROCESS_CONTROL_IDLE || obs == DSERVER_PROCESS_CONTROL_DONE) {
+							expect = obs;
+						} else if (t >= 2000 && obs == DSERVER_PROCESS_CONTROL_PENDING &&
+						           __atomic_load_n(&page->request_seq, __ATOMIC_ACQUIRE) < mine) {
+							expect = obs;
+						} else {
+							expect = 0xffffffffu;
+						}
+					}
+					if (expect != 0xffffffffu &&
+					    __atomic_compare_exchange_n(&page->request_state, &expect,
+					        DSERVER_PROCESS_CONTROL_PENDING, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { slot = 1; break; }
+					long ts[2] = {0, 1000000L};
+					(void)LINUX_SYSCALL6(__NR_nanosleep, ts, 0, 0, 0, 0, 0);
+				}
+				if (slot) {
+					// ATOMIC (doc section 70): a plain ++ in a multi-threaded process can hand two threads the SAME
+					// sequence, so the server answers one of them and the other sees reply_seq != mine, refuses the
+					// result and repeats the operation on another transport. MEASURED: every thread-create that fell
+					// back had its page request serviced with status 0, which leaves this collision as the cause.
+					page->reply_state = DSERVER_PROCESS_CONTROL_IDLE;
+					page->request_op = DSERVER_PROCESS_CONTROL_OP_CHECKOUT;
+					// perf#30 (directive D1): THREAD IDENTITY travels with every request, including this
+					// hand-rolled publisher: a management request that carries no identity is refused
+					// (-ESRCH), never serviced against whatever thread the pid resolves to.
+					page->request_tid = (int32_t)LINUX_SYSCALL(__NR_gettid);
+					page->request_seq = mine;
+					page->request_payload[0] = (is_script || is_macho) ? 1u : 0u;
+					page->request_payload[1] = (uint64_t)LINUX_SYSCALL(__NR_gettid);
+					page->request_payload[2] = token;
+					page->request_payload[3] = 1u;
+					__atomic_store_n(&page->request_state, DSERVER_PROCESS_CONTROL_PENDING, __ATOMIC_RELEASE);
+					{
+						int courier = __dserver_fd_courier_socket();
+						if (courier >= 0) {
+							char wake = 0;
+							(void)LINUX_SYSCALL6(__NR_sendto, courier, &wake, 1, 0x40, 0, 0);
+						}
+					}
+					int spins = 0, claimed = 0;
+					while (__atomic_load_n(&page->reply_state, __ATOMIC_ACQUIRE) != DSERVER_PROCESS_CONTROL_DONE) {
+						if (__atomic_load_n(&page->reply_state, __ATOMIC_ACQUIRE) == DSERVER_PROCESS_CONTROL_CLAIMED) { claimed = 1; }
+						if (++spins < 20000) { continue; }
+						{
+							uint32_t seen = page->futex;
+							long ts[2] = {0, claimed ? 2000000L : 1000000L};
+							if (page->reply_state == DSERVER_PROCESS_CONTROL_DONE) { break; }
+							(void)LINUX_SYSCALL6(__NR_futex, &page->futex, 0, seen, ts, 0, 0);
+						}
+					}
+					// read before release (doc 71): releasing first lets the next thread overwrite the fields.
+					uint32_t seenState = __atomic_load_n(&page->reply_state, __ATOMIC_ACQUIRE);
+					uint32_t seenSeq = page->reply_seq;
+					int32_t seenStatus = page->reply_status;
+	{ uint32_t _st = __atomic_load_n(&(page)->request_state, __ATOMIC_ACQUIRE); if (_st == DSERVER_PROCESS_CONTROL_PENDING) { static const char _m[] = "[release-drops-pending] site=execve.c:313\n"; long _a = 1, _d = 2, _s = (long)_m, _n = sizeof(_m) - 1; __asm__ volatile("syscall" : "+a"(_a), "+D"(_d), "+S"(_s), "+d"(_n) : : "rcx", "r11", "memory"); } }
+					DSERVER_PROCESS_CONTROL_RELEASE(page);
+					if (seenState == DSERVER_PROCESS_CONTROL_DONE && seenSeq == mine) {
+						ret = page->reply_status; viaPage = 1;
+					} else if (claimed) { ret = 0; viaPage = 1; }
+				}
+			}
+		}
+		if (!viaPage) {
+			ret = dserver_rpc_checkout(dserver_execve_pipe[0], is_script || is_macho);
+		}
+	}
 	if (ret < 0)
 		return errno_linux_to_bsd(ret);
 

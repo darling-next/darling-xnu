@@ -1,44 +1,135 @@
 #include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 #include <sys/errno.h>
 
 #include <darling/emulation/common/base.h>
+#include <darling/emulation/conversion/common_at.h>
 #include <darling/emulation/conversion/dirent/getdirentries.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/conversion/fcntl/open.h>
-#include <darling/emulation/conversion/common_at.h>
+#include <darling/emulation/conversion/stat/common.h>
+#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/linux_premigration/vchroot_expand.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/xattr/getattrlist_pack.h>
+#include <darling/emulation/xnu_syscall/bsd/helper/misc/fdpath.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/dirent/getdirentries.h>
-#include <darling/emulation/xnu_syscall/bsd/impl/unistd/dup.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/fcntl/open.h>
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/close.h>
-#include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
+#include <darling/emulation/xnu_syscall/bsd/impl/unistd/dup.h>
 
-#define ATTR_BIT_MAP_COUNT 5
-
-#define COMMON_SUPPORTED (ATTR_CMN_FNDRINFO | ATTR_CMN_OBJTAG)
-#define VOLUME_SUPPORTED 0
-#define DIR_SUPPORTED (ATTR_DIR_ENTRYCOUNT)
-#define FILE_SUPPORTED (ATTR_FILE_RSRCLENGTH)
-#define FORK_SUPPORTED 0
-
-#define ATTR_CMN_FNDRINFO 0x4000
-#define ATTR_FILE_RSRCLENGTH 0x1000
-#define ATTR_CMN_OBJTAG 0x00000010
-#define ATTR_DIR_ENTRYCOUNT 0x00000002
+#ifndef LINUX_AT_SYMLINK_NOFOLLOW
+#define LINUX_AT_SYMLINK_NOFOLLOW 0x100
+#endif
 
 #define XATTR_FINDER_INFO "com.apple.FinderInfo"
 #define XATTR_RESOURCE_FORK "com.apple.ResourceFork"
 
 #define FSOPT_NOFOLLOW 1
-#define FSOPT_REPORT_FULLSIZE 4
 
-#define VT_HFS 16
+#ifndef LINUX_O_RDONLY
+#define LINUX_O_RDONLY    0
+#endif
+#define LINUX_O_DIRECTORY 0200000
 
 #define min(a,b) (((a) < (b)) ? (a) : (b))
 
-extern void *memcpy(void *dest, const void *src, __SIZE_TYPE__ n);
-extern void *memset(void *s, int c, __SIZE_TYPE__ n);
-extern char *strcpy(char *dest, const char *src);
+static int darling_getattr_is_dot_or_dotdot(const char* name)
+{
+	if (name[0] != '.')
+		return 0;
+	if (name[1] == '\0')
+		return 1;
+	if (name[1] == '.' && name[2] == '\0')
+		return 1;
+	return 0;
+}
+
+static uint32_t darling_count_dir_entries(int fd)
+{
+	uint32_t count = 0;
+	char buf[2048];
+
+	while (1) {
+		long rv = LINUX_SYSCALL(__NR_getdents64, fd, buf, sizeof(buf));
+		if (rv <= 0)
+			break;
+
+		for (char* iter = buf; iter < buf + rv; iter += ((struct linux_dirent64*)iter)->d_reclen) {
+			if (!darling_getattr_is_dot_or_dotdot(((struct linux_dirent64*)iter)->d_name))
+				++count;
+		}
+	}
+
+	return count;
+}
+
+static uint32_t darling_getattr_dir_entrycount(int fd
+#if HAS_PATH
+	, const struct vchroot_expand_args* vc
+#endif
+)
+{
+	int tmp_fd;
+
+#if HAS_PATH
+	tmp_fd = LINUX_SYSCALL(__NR_openat, vc->dfd, vc->path, LINUX_O_RDONLY | LINUX_O_DIRECTORY, 0);
+#else
+	tmp_fd = sys_dup(fd);
+#endif
+	if (tmp_fd < 0)
+		return 0;
+
+	uint32_t count = darling_count_dir_entries(tmp_fd);
+	close_internal(tmp_fd);
+	return count;
+}
+
+static void darling_getattr_basename(char* out, size_t out_size, int fd
+#if HAS_PATH
+	, const char* path
+#endif
+)
+{
+#if HAS_PATH
+	const char* p = path;
+#else
+	if (fdpath(fd, out, out_size) < 0)
+		out[0] = '\0';
+	const char* p = out;
+#endif
+
+	size_t plen = strlen(p);
+	while (plen > 1 && p[plen - 1] == '/')
+		--plen;
+
+	if (plen == 1 && p[0] == '/') {
+		if (out_size > 1) {
+			out[0] = '/';
+			out[1] = '\0';
+		}
+		return;
+	}
+
+	size_t start = 0;
+	for (size_t i = plen; i > 0; --i) {
+		if (p[i - 1] == '/') {
+			start = i;
+			break;
+		}
+	}
+
+	size_t len = plen - start;
+	if (len > out_size - 1)
+		len = out_size - 1;
+
+	char tmpname[256];
+	if (len > sizeof(tmpname) - 1)
+		len = sizeof(tmpname) - 1;
+	memcpy(tmpname, p + start, len);
+	tmpname[len] = '\0';
+	memcpy(out, tmpname, len + 1);
+}
 
 long
 FUNC_NAME(int fd,
@@ -49,11 +140,10 @@ const char* path,
 
 struct xnu_attrlist* alist, void *attributeBuffer, __SIZE_TYPE__ bufferSize, unsigned long options)
 {
-	int rv;
-	char *ourBuffer, *next;
-	__SIZE_TYPE__ spaceNeeded = 4; // 4 bytes for the length header
-
-	if (!alist)
+	int rv = darling_attrlist_validate(alist, 0);
+	if (rv < 0)
+		return rv;
+	if (!attributeBuffer)
 		return -EFAULT;
 
 #if HAS_PATH
@@ -63,119 +153,94 @@ struct xnu_attrlist* alist, void *attributeBuffer, __SIZE_TYPE__ bufferSize, uns
 	struct vchroot_expand_args vc;
 	vc.flags = (options & FSOPT_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	vc.dfd = atfd(fd);
-
 	strcpy(vc.path, path);
+
 	rv = vchroot_expand(&vc);
-	
 	if (rv < 0)
 		return rv;
 #endif
 
-	if (alist->bitmapcount < ATTR_BIT_MAP_COUNT)
-		return -EINVAL;
+	struct darling_attrpack_entry entry;
+	memset(&entry, 0, sizeof(entry));
 
-	if ((alist->commonattr & COMMON_SUPPORTED) != alist->commonattr)
-		return -EINVAL;
-	if ((alist->volattr & VOLUME_SUPPORTED) != alist->volattr)
-		return -EINVAL;
-	if ((alist->dirattr & DIR_SUPPORTED) != alist->dirattr)
-		return -EINVAL;
-	if ((alist->fileattr & FILE_SUPPORTED) != alist->fileattr)
-		return -EINVAL;
-	if ((alist->forkattr & FORK_SUPPORTED) != alist->forkattr)
-		return -EINVAL;
-
-	if (alist->commonattr & ATTR_CMN_FNDRINFO)
-		spaceNeeded += 32;
-	if (alist->fileattr & ATTR_FILE_RSRCLENGTH)
-		spaceNeeded += 8; // off_t
-	if (alist->commonattr & ATTR_CMN_OBJTAG)
-		spaceNeeded += sizeof(uint32_t); // fsobj_tag_t
-	if (alist->dirattr & ATTR_DIR_ENTRYCOUNT)
-		spaceNeeded += sizeof(uint32_t);
-
-	ourBuffer = (char*) __builtin_alloca(spaceNeeded);
-	next = ourBuffer + 4;
-
-	if (alist->commonattr & ATTR_CMN_FNDRINFO)
-	{
+	char name_buf[256];
+	if (alist->commonattr & DARLING_ATTR_CMN_NAME) {
+		darling_getattr_basename(name_buf, sizeof(name_buf), fd
 #if HAS_PATH
-		rv = LINUX_SYSCALL(__NR_getxattr, vc.path, XATTR_FINDER_INFO, next, 32);
-#else
-		rv = LINUX_SYSCALL(__NR_fgetxattr, fd, XATTR_FINDER_INFO, next, 32);
+			, path
 #endif
-		if (rv < 0)
-			memset(next, 0, 32);
-		next += 32;
+		);
+		entry.name = name_buf;
+		entry.name_len = strlen(name_buf);
 	}
-	if (alist->fileattr & ATTR_FILE_RSRCLENGTH)
-	{
+
+	struct linux_stat lst;
+	long stat_rv = 0;
+	int need_stat = darling_attr_wants_objtype(alist);
+	if (need_stat) {
+		int lflags = (options & FSOPT_NOFOLLOW) ? LINUX_AT_SYMLINK_NOFOLLOW : 0;
 #if HAS_PATH
-		rv = LINUX_SYSCALL(__NR_getxattr, vc.path, XATTR_FINDER_INFO, NULL, 0);
+#ifdef __NR_newfstatat
+		stat_rv = LINUX_SYSCALL(__NR_newfstatat, vc.dfd, vc.path, &lst, lflags);
 #else
-		rv = LINUX_SYSCALL(__NR_fgetxattr, fd, XATTR_FINDER_INFO, NULL, 0);
+		stat_rv = LINUX_SYSCALL(__NR_fstatat64, vc.dfd, vc.path, &lst, lflags);
 #endif
-		if (rv < 0)
-			*((uint32_t*) next) = 0;
-		else
-			*((uint32_t*) next) = rv;
-		next += 4;
+#else
+		stat_rv = LINUX_SYSCALL(__NR_fstat, fd, &lst);
+#endif
 	}
 
-	if (alist->commonattr & ATTR_CMN_OBJTAG) {
-		// pretend we're always on HFS
-		*((uint32_t*)next) = VT_HFS;
-		next += 4;
+	if (alist->commonattr & DARLING_ATTR_CMN_OBJTYPE) {
+		entry.has_objtype = 1;
+		entry.objtype = (stat_rv >= 0) ? darling_objtype_from_mode(lst.st_mode) : DARLING_DTAPE_VNON;
 	}
-
-	if (alist->dirattr & ATTR_DIR_ENTRYCOUNT) {
-		char buf[1024]; // maybe this should be smaller?
-		int tmp_fd;
-
-		*((uint32_t*)next) = 0;
-
+	if (alist->commonattr & DARLING_ATTR_CMN_OBJTAG) {
+		entry.has_objtag = 1;
+		entry.objtag = DARLING_VT_UNKNOWN;
+	}
+	if (alist->commonattr & DARLING_ATTR_CMN_FNDRINFO) {
+		static const char zero_finderinfo[32] = {0};
+		char finderinfo[32];
 #if HAS_PATH
-		tmp_fd = LINUX_SYSCALL(__NR_openat, vc.dfd, vc.path, LINUX_O_RDONLY | LINUX_O_DIRECTORY, 0);
-		if (tmp_fd < 0) {
-			rv = -EIO; // translate all errors into EIO (to avoid confusing our caller)
-			goto attr_dir_entrycount_out_no_fd;
-		}
+		long xr = LINUX_SYSCALL(__NR_getxattr, vc.path, XATTR_FINDER_INFO, finderinfo, sizeof(finderinfo));
 #else
-		// dupe it to avoid advancing the internal `getdents` position if our caller is using that
-		tmp_fd = sys_dup(fd);
-		if (tmp_fd < 0) {
-			rv = -EIO; // see above
-			goto attr_dir_entrycount_out_no_fd;
-		}
+		long xr = LINUX_SYSCALL(__NR_fgetxattr, fd, XATTR_FINDER_INFO, finderinfo, sizeof(finderinfo));
 #endif
-
-		while (1) {
-			// there's basically no other way to do this (at least none that either i or the internet know of)
-			rv = LINUX_SYSCALL(__NR_getdents64, tmp_fd, buf, sizeof(buf));
-			if (rv < 0) {
-				rv = -EIO; // same as before: avoid confusing our caller with unexepected errnos
-				goto attr_dir_entrycount_out;
-			} else if (rv == 0) {
-				break;
-			}
-
-			for (char* iter = buf; iter < buf + rv; iter += ((struct linux_dirent64*)iter)->d_reclen) {
-				++(*((uint32_t*)next));
-			}
+		entry.has_finderinfo = 1;
+		entry.finderinfo = xr >= 0 ? finderinfo : zero_finderinfo;
+	}
+	if (alist->commonattr & DARLING_ATTR_CMN_ERROR) {
+		entry.has_error = 1;
+		entry.error = 0;
+	}
+	if (alist->dirattr & DARLING_ATTR_DIR_ENTRYCOUNT) {
+		entry.has_dir_entrycount = 1;
+		if (stat_rv >= 0 && darling_objtype_from_mode(lst.st_mode) == DARLING_DTAPE_VDIR) {
+			entry.dir_entrycount = darling_getattr_dir_entrycount(fd
+#if HAS_PATH
+				, &vc
+#endif
+			);
 		}
-
-attr_dir_entrycount_out:
-		close_internal(tmp_fd);
-attr_dir_entrycount_out_no_fd:
-		next += 4;
+	}
+	if (alist->fileattr & DARLING_ATTR_FILE_RSRCLENGTH) {
+		long xr;
+#if HAS_PATH
+		xr = LINUX_SYSCALL(__NR_getxattr, vc.path, XATTR_RESOURCE_FORK, 0, 0);
+#else
+		xr = LINUX_SYSCALL(__NR_fgetxattr, fd, XATTR_RESOURCE_FORK, 0, 0);
+#endif
+		entry.has_file_rsrclength = 1;
+		entry.file_rsrclength = xr > 0 ? (uint64_t)xr : 0;
 	}
 
-	if (!(options & FSOPT_REPORT_FULLSIZE) && bufferSize < spaceNeeded)
-		bufferSize = spaceNeeded;
+	size_t space_needed = darling_attrpack_entry_size(alist, &entry);
+	char* out = (char*)__builtin_alloca(space_needed);
+	darling_attrpack_entry(out, alist, &entry);
 
-	*((uint32_t*) ourBuffer) = bufferSize;
+	if (bufferSize < space_needed && !(options & DARLING_FSOPT_REPORT_FULLSIZE))
+		return -ERANGE;
 
-	memcpy(attributeBuffer, ourBuffer, min(bufferSize, spaceNeeded));
-	
+	memcpy(attributeBuffer, out, min(bufferSize, space_needed));
 	return 0;
 }

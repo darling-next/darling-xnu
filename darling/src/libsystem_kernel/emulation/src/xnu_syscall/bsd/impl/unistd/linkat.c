@@ -16,6 +16,9 @@ long sys_linkat(int fd, const char* path, int fdlink, const char* link, int flag
 	struct vchroot_expand_args vc, vc2;
 	int linux_flags;
 
+	if (!path || !link)
+		return -EFAULT;
+
 	vc.flags = (flag & BSD_AT_SYMLINK_FOLLOW) ? VCHROOT_FOLLOW : 0;
 	vc.dfd = atfd(fd);
 
@@ -25,6 +28,20 @@ long sys_linkat(int fd, const char* path, int fdlink, const char* link, int flag
 	vc2.dfd = atfd(fdlink);
 
 	strcpy(vc2.path, link);
+
+#ifdef EUNION
+	// hardlink: the source must live in the writable upper layer (you cannot link
+	// a file out of the read-only template into it), and the new name must clear
+	// any whiteout. Note: copy-up breaks link identity (st_nlink resets) -- same
+	// behaviour as gVisor; documented in DESIGN.md.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_write(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+	if (link[0] == '/')
+		vchroot_pre_mkdir(link);
+#endif
 
 	ret = vchroot_expand(&vc);
 	if (ret < 0)

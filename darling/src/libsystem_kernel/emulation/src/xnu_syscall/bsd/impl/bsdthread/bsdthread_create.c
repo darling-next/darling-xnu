@@ -17,6 +17,38 @@
 #include <darling/emulation/common/simple.h>
 
 #include <darlingserver/rpc.h>
+#include <stdlib.h>
+
+// perf#30 DIAGNOSIS: lock-free, libc-free marks for the create path. MEASURED: the guest's `[bsc wrap post]` (a
+// __simple_printf, i.e. a Darwin `write` through the dispatcher) did not appear for the SECOND create although the
+// loader's own marker showed its host `pthread_create` returning rc=0 -- so either the fault is between the loader's
+// return and that print, or the print's own syscall path is what dies. RAW LINUX writes take the dispatcher out of
+// the picture and separate the two.
+static int __bsc_mark_enabled(void) {
+	static int cached = -1;
+	if (cached < 0) { const char* v = getenv("DARLING_GUEST_CREATE_TRACE"); cached = (v != NULL && v[0] == '1') ? 1 : 0; }
+	return cached;
+}
+
+static void __bsc_mark_ulong(char* buf, int* at, unsigned long v) {
+	char tmp[24]; int n = 0;
+	if (v == 0) { tmp[n++] = '0'; }
+	while (v != 0 && n < (int)sizeof(tmp)) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+	while (n > 0) { buf[(*at)++] = tmp[--n]; }
+}
+
+static void __bsc_mark(const char* tag, unsigned long a, unsigned long b) {
+	if (!__bsc_mark_enabled()) { return; }
+	char buf[96]; int at = 0;
+	for (const char* q = tag; *q != '\0' && at < (int)sizeof(buf) - 32; ++q) { buf[at++] = *q; }
+	__bsc_mark_ulong(buf, &at, a);
+	buf[at++] = ' '; buf[at++] = 'b'; buf[at++] = '=';
+	__bsc_mark_ulong(buf, &at, b);
+	buf[at++] = '\n';
+	LINUX_SYSCALL(__NR_write, 2, buf, at);
+}
+
+
 
 extern void *memset(void *s, int c, size_t n);
 
@@ -33,21 +65,12 @@ static bool _uses_threads = false;
 
 // http://www.tldp.org/FAQ/Threads-FAQ/clone.c
 
-static void rpc_guard(int fd) {
-	guard_entry_options_t options;
-	options.close = __dserver_close_socket;
-	guard_table_add(fd, guard_flag_prevent_close | guard_flag_close_on_fork, &options);
-};
-
-static void rpc_unguard(int fd) {
-	guard_table_remove(fd);
-};
-
+// perf#30 REMOVAL STEP 3c: there is no per-thread RPC fd, so there is nothing for a thread to guard or unguard -- the
+// guard pair, the fd it remembered, and the callbacks entries that carried it are gone. The process socket and the
+// lifetime pipe are guarded by the kernel image directly.
 static const struct darling_thread_create_callbacks callbacks = {
 	.thread_self_trap = &thread_self_trap_impl,
 	.thread_set_tsd_base = &sys_thread_set_tsd_base,
-	.rpc_guard = rpc_guard,
-	.rpc_unguard = rpc_unguard,
 };
 
 long sys_bsdthread_create(void* thread_start, void* arg,
@@ -62,16 +85,34 @@ long sys_bsdthread_create(void* thread_start, void* arg,
 #ifndef BSDTHREAD_WRAP_LINUX_PTHREAD
 	if (!(flags & PTHREAD_START_CUSTOM))
 	{
+		// perf#30 DIAGNOSIS: the minimal repro (`threadnoop 2`) dies inside the SECOND pthread_create, before
+		// the new thread reaches ANY RPC, so the two client-side statements that can be responsible are named:
+		// the guest stack allocation (an EMULATED mmap/mprotect, i.e. requests to the server) and the raw clone
+		// itself. The marks are in the PARENT only (the child jumps away in assembly), so a missing `[bsc post-clone]`
+		// says the fault is in the child's prologue -- whose first act is `call _thread_self_trap`.
+		__simple_printf("[bsc %s alloc-pre]\n", uses_threads() ? "later" : "first");
 		// We have to allocate stack ourselves
 		pthread = stack = thread_stack_allocate(stacksize);
+		__simple_printf("[bsc alloc-post stack=%p]\n", stack);
 	}
 
+	__simple_printf("[bsc pre-clone stack=%p]\n", stack);
 	ret = darling_thread_create((void**) stack, pthread_entry_point_wrapper, thread_start,
 			arg, stacksize, flags);
+	__simple_printf("[bsc post-clone ret=%d pthread=%p]\n", ret, pthread);
 #else
-	return __darling_thread_create(((uintptr_t)stack), pthread_obj_size,
+	// perf#30 DIAGNOSIS: THIS is the branch this build compiles (`-DBSDTHREAD_WRAP_LINUX_PTHREAD`, measured in
+	// build.ninja), so the marks above are compiled out and this call is where the guest's second pthread_create
+	// enters the LOADER. MEASURED need: `threadnoop 2` dies before the new thread reaches any RPC, and the loader's
+	// create is the only code between the caller and that first `thread_self_trap`. The mark is printed before the
+	// call: if it appears and the process still dies, the statement is inside the loader.
+	__bsc_mark("[bsc pre-loader a=", (unsigned long)(uintptr_t)stack, (unsigned long)(uintptr_t)pthread);
+	void* rv = __darling_thread_create(((uintptr_t)stack), pthread_obj_size,
 			pthread_entry_point_wrapper, thread_start, arg, (uintptr_t) stack, flags,
 			&callbacks, pthread);
+	__bsc_mark("[bsc post-loader rv=", (unsigned long)(uintptr_t)rv, (unsigned long)0);
+	__simple_printf("[bsc wrap post rv=%p]\n", rv);
+	return rv;
 #endif
 
 	if (ret < 0)

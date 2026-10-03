@@ -1,8 +1,7 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/xattr/getxattr.h>
 
 #include <sys/errno.h>
-
-extern char* strcpy(char* dst, const char* src);
+#include <string.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -19,9 +18,21 @@ long sys_getxattr(const char* path, const char* name, char* value,
 	if (pos != 0)
 		return -ERANGE;
 
+#ifdef EUNION
+	// E-UNION marker isolation: the union's overlay-private markers (user.union.*)
+	// must be invisible to the guest -- a getxattr of one returns ENOATTR exactly
+	// as if the attribute did not exist, so the guest cannot probe the union's
+	// internal whiteout/opaque bookkeeping.
+	if (vchroot_xattr_is_marker(name))
+		return -ENOATTR;
+#endif
+
 	struct vchroot_expand_args vc;
 	vc.flags = (options & XATTR_NOFOLLOW) ? 0 : VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
+
+	if (!path)
+		return -EFAULT;
 
 	strcpy(vc.path, path);
 	ret = vchroot_expand(&vc);

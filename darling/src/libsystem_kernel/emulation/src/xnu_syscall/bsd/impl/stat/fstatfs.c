@@ -49,6 +49,11 @@ long sys_fstatfs64(int fd, struct bsd_statfs64* buf)
 
 	statfs_linux_to_bsd64(&lbuf, buf);
 
+	buf->f_mntonname[0] = 0;
+	buf->f_fstypename[0] = 0;
+	buf->f_mntfromname[0] = 0;
+	buf->f_iosize = 512;
+
 	ret = fdpath(fd, path, sizeof(path));
 
 	if (ret < 0)
@@ -56,14 +61,15 @@ long sys_fstatfs64(int fd, struct bsd_statfs64* buf)
 
 	fd_m = sys_open("/proc/self/mounts", O_RDONLY, 0);
 	if (fd_m < 0)
-		return fd_m;
+		/*
+		 * The fd is valid and the core statfs data is already filled in
+		 * from the Linux fstatfs syscall above. /proc/self/mounts is only
+		 * used to populate cosmetic mount-name strings, and can be absent
+		 * in copy-mode prefixes without a procfs bind mount.
+		 */
+		return 0;
 	
 	__simple_readline_init(&rbuf);
-
-	buf->f_mntonname[0] = 0;
-	buf->f_fstypename[0] = 0;
-	buf->f_mntfromname[0] = 0;
-	buf->f_iosize = 512;
 
 	while (__simple_readline(fd_m, &rbuf, line, sizeof(line)))
 	{

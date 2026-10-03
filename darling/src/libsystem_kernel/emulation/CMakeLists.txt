@@ -16,6 +16,7 @@ add_definitions(-DBSDTHREAD_WRAP_LINUX_PTHREAD
 
 # include src/startup for rtsig.h
 include_directories(
+	${CMAKE_CURRENT_SOURCE_DIR}/include
 	${CMAKE_BINARY_DIR}/src/startup
 	${CMAKE_BINARY_DIR}/src/external/xnu/darling/src/libsystem_kernel/libsyscall
 	${CMAKE_CURRENT_BINARY_DIR}/src/other
@@ -82,12 +83,27 @@ set(linux_premigration_sources
 	src/linux_premigration/ext/uname.c
 	src/linux_premigration/misc/ioctl.c
 	src/linux_premigration/resources/dserver-rpc-defs.c
+	src/linux_premigration/resources/rpc-sleep-account.c
+	src/linux_premigration/resources/dserver-ring.c
 	src/linux_premigration/signal/sig_restorer.S
 	src/linux_premigration/signal/sigexc.c
 	src/linux_premigration/elfcalls_wrapper.c
+	src/linux_premigration/eunion_resolver.c
 	src/linux_premigration/linux-syscall.S
 	src/linux_premigration/vchroot_userspace.c
 )
+
+if (BUILD_TESTING)
+	add_executable(eunion_resolver_test
+		tests/eunion_resolver_test.c
+		src/linux_premigration/eunion_resolver.c
+	)
+	target_include_directories(eunion_resolver_test PRIVATE
+		${CMAKE_CURRENT_SOURCE_DIR}/include
+	)
+	add_test(NAME eunion_resolver_test COMMAND eunion_resolver_test)
+	set_tests_properties(eunion_resolver_test PROPERTIES LABELS eunion-host)
+endif()
 
 set(xnu_syscall_bsd_sources
 	src/xnu_syscall/bsd/bsd_syscall_table.c
@@ -376,6 +392,56 @@ set_target_properties(emulation_dyld PROPERTIES COMPILE_FLAGS "-ffunction-sectio
 add_dependencies(emulation rtsig_h generate_dserver_rpc_wrappers)
 add_dependencies(emulation_dyld rtsig_h generate_dserver_rpc_wrappers)
 
+# perf #9-decompose (dar-dar6x4-perf-5dq): guest-side per-callnum recvmsg-sleep
+# accounting. OFF by default -> the emulation builds byte-identical to baseline (the
+# accounting #ifdef DARLING_RPC_SLEEP_ACCOUNT compiles to nothing). When ON, the
+# generated RPC wrappers time each reply-wait and attribute it per call number, dumped
+# at process exit to DARLING_RPC_SLEEP_ACCOUNT_PATH (default /tmp/darling-rpc-sleep.log).
+# Diagnostic only -- never ship ON.
+option(DARLING_RPC_SLEEP_ACCOUNT "Enable guest-side per-callnum recvmsg-sleep accounting (diagnostic)" OFF)
+if (DARLING_RPC_SLEEP_ACCOUNT)
+	target_compile_definitions(emulation PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_RPC_SLEEP_ACCOUNT)
+endif()
+
+# Shared-memory ring transport is compiled into BOTH the dylib (emulation) and dyld
+# (emulation_dyld), since both contain trap paths. OFF leaves dserver-ring.c empty and
+# folds the helper calls into ordinary UDS fallbacks. Pair this option with the server's
+# DSERVER_RING_TRANSPORT when building matched OFF/ON runtimes from the same sources.
+option(DARLING_RING_TRANSPORT "Enable guest-side shared-memory ring RPC transport (perf #18)" ON)
+if (DARLING_RING_TRANSPORT)
+	target_compile_definitions(emulation PRIVATE DARLING_RING_TRANSPORT)
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_RING_TRANSPORT)
+endif()
+
+# perf #7-generalize (dar-dar6x4-perf-5dq.14): guest-side adaptive recv-spin budget.
+# The dylib RPC receive hook (dserver-rpc-defs.h) does a bounded LINUX_MSG_DONTWAIT
+# spin before the blocking recvmsg, so a fast RPC reply is grabbed before the guest
+# thread sleeps (attacks the perf#6 57% __skb_wait reply-wait for the guest's own RPCs:
+# mach_msg_overwrite, mach_reply_port, ...). The budget is a compile-time constant; the
+# header defaults it to 512 (matches perf#3, validated to cover server p99). This cache
+# variable lets A/B and tuning override it WITHOUT editing the header:
+#   -DDARLING_GUEST_RECVSPIN=0   -> disabled: legacy blocking recvmsg (A/B baseline)
+#   -DDARLING_GUEST_RECVSPIN=N   -> spin up to N non-blocking polls, then block
+# Leave UNSET to take the header default (512, the shipped value). Symmetric to perf#1
+# (creator wait) and perf#3 (mldr checkin recv); bounded so it never busy-waits forever.
+set(DARLING_GUEST_RECVSPIN "" CACHE STRING "Guest RPC recv-spin poll budget (empty = header default 512; 0 = disabled)")
+if (NOT DARLING_GUEST_RECVSPIN STREQUAL "")
+	target_compile_definitions(emulation PRIVATE DARLING_GUEST_RECVSPIN=${DARLING_GUEST_RECVSPIN})
+	target_compile_definitions(emulation_dyld PRIVATE DARLING_GUEST_RECVSPIN=${DARLING_GUEST_RECVSPIN})
+endif()
+
+# E-UNION (dar-test-infra-sp5.8.4.4): union-by-path-translation in vchroot.
+# OFF by default -> the emulation builds byte-identical to baseline. When ON,
+# define EUNION (activates the #ifdef EUNION code) and EUNION_LIBEXEC_PATH (the
+# shared read-only template, == darlingserver's LIBEXEC_PATH).
+option(DARLING_EUNION "Enable E-UNION union-in-vchroot prefix assembly (experimental)" OFF)
+if (DARLING_EUNION)
+	target_compile_definitions(emulation PRIVATE
+		EUNION EUNION_LIBEXEC_PATH="${CMAKE_INSTALL_PREFIX}/libexec/darling")
+	target_compile_definitions(emulation_dyld PRIVATE
+		EUNION EUNION_LIBEXEC_PATH="${CMAKE_INSTALL_PREFIX}/libexec/darling")
+endif()
+
 make_fat(emulation)
 make_fat(emulation_dyld)
-

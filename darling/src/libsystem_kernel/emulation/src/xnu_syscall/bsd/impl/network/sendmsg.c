@@ -1,10 +1,12 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/network/sendmsg.h>
 
 #include <stddef.h>
+#include <sys/errno.h>
 
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
 #include <darling/emulation/conversion/network/duct.h>
+#include <darling/emulation/conversion/network/getsockopt.h>
 #include <darling/emulation/linux_premigration/linux-syscalls/linux.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/network/duct.h>
 #include <darling/emulation/xnu_syscall/bsd/helper/bsdthread/cancelable.h>
@@ -12,6 +14,25 @@
 extern void *malloc(__SIZE_TYPE__ size);
 extern void free(void* ptr);
 extern void* memcpy(void* dest, const void* src, __SIZE_TYPE__ len);
+
+static void normalize_packet_info(struct linux_cmsghdr* header)
+{
+	/* IPv4 packet-info has the same three 32-bit fields in both ABIs. */
+	struct ipv4_packet_info {
+		uint32_t ifindex;
+		uint32_t spec_dst;
+		uint32_t addr;
+	};
+	if (header->cmsg_level == XNU_IPPROTO_IP &&
+			header->cmsg_type == LINUX_IP_PKTINFO &&
+			header->cmsg_len == LINUX_CMSG_LEN(sizeof(struct ipv4_packet_info))) {
+		struct ipv4_packet_info* info = (void*)header->cmsg_data;
+		/* Darwin ignores the source address when an interface is specified.
+		 * Linux still uses that address, so clear it in our private copy. */
+		if (info->ifindex != 0)
+			info->spec_dst = 0;
+	}
+}
 
 long sys_sendmsg(int socket, const struct bsd_msghdr* msg, int flags)
 {
@@ -42,10 +63,25 @@ long sys_sendmsg_nocancel(int socket, const struct bsd_msghdr* msg, int flags)
 	lmsg.msg_iov = msg->msg_iov;
 	lmsg.msg_iovlen = msg->msg_iovlen;
 
-	if (sizeof(unsigned long) == 4)
+	if (sizeof(unsigned long) == 4 && msg->msg_control != NULL && msg->msg_controllen > 0)
 	{
-		lmsg.msg_control = msg->msg_control;
 		lmsg.msg_controllen = msg->msg_controllen;
+		lchdr = malloc(lmsg.msg_controllen);
+		if (lchdr == NULL)
+			return -ENOMEM;
+		memcpy(lchdr, msg->msg_control, lmsg.msg_controllen);
+		lmsg.msg_control = lchdr;
+		for (size_t pos = 0; pos + sizeof(*lchdr) <= lmsg.msg_controllen;) {
+			struct linux_cmsghdr* header = (struct linux_cmsghdr*)((char*)lchdr + pos);
+			if (header->cmsg_len < sizeof(*header) || header->cmsg_len > lmsg.msg_controllen - pos) {
+				free(lchdr);
+				return -EINVAL;
+			}
+			header->cmsg_type = socket_cmsg_type_bsd_to_linux(header->cmsg_level, header->cmsg_type);
+			header->cmsg_level = socket_level_bsd_to_linux(header->cmsg_level);
+			normalize_packet_info(header);
+			pos += LINUX_CMSG_ALIGN(header->cmsg_len);
+		}
 	}
 	else if (msg->msg_control != NULL && msg->msg_controllen > 0)
 	{
@@ -61,10 +97,11 @@ long sys_sendmsg_nocancel(int socket, const struct bsd_msghdr* msg, int flags)
 
 		lchdr->cmsg_len = bchdr->cmsg_len + LINUX_BSD_CMSGHDR_SIZE_DIFFERENCE;
 		lchdr->cmsg_level = socket_level_bsd_to_linux(bchdr->cmsg_level);
-		lchdr->cmsg_type = bchdr->cmsg_type;
+		lchdr->cmsg_type = socket_cmsg_type_bsd_to_linux(bchdr->cmsg_level, bchdr->cmsg_type);
 
 		memcpy(lchdr->cmsg_data, bchdr->cmsg_data,
 				bchdr->cmsg_len - sizeof(struct bsd_cmsghdr));
+		normalize_packet_info(lchdr);
 	}
 	else
 	{

@@ -1,3 +1,14 @@
+#if defined(__x86_64__)
+#define DSERVER_URGENT_ARCH 2u
+#elif defined(__i386__)
+#define DSERVER_URGENT_ARCH 1u
+#elif defined(__aarch64__) || defined(__arm64__)
+#define DSERVER_URGENT_ARCH 4u
+#elif defined(__arm__)
+#define DSERVER_URGENT_ARCH 3u
+#else
+#define DSERVER_URGENT_ARCH 0u
+#endif
 #include <darling/emulation/linux_premigration/signal/sigexc.h>
 
 #include <stddef.h>
@@ -16,6 +27,24 @@
 #include <darling/emulation/common/simple.h>
 
 #include <darlingserver/rpc.h>
+#include <darling/emulation/linux_premigration/resources/dserver-ring.h>
+#include <darlingserver/rpc-supplement.h>
+#include <darling/emulation/linux_premigration/elfcalls_wrapper.h>
+// perf#30 (directive sections 19-21): the interrupt calls ride the URGENT pool -- signal-safe, non-blocking.
+// Only when there is no transport or no free slot does the datagram path run.
+static inline int __dserver_urgent_enter(void) {
+	if (__dserver_plane_urgent_publish(DSERVER_PROCESS_CONTROL_OP_INTERRUPT_ENTER, 0, 0, 0, DSERVER_URGENT_ARCH) == 0) {
+		return 0;
+	}
+	return dserver_rpc_interrupt_enter();
+}
+static inline int __dserver_urgent_exit(void) {
+	if (__dserver_plane_urgent_publish(DSERVER_PROCESS_CONTROL_OP_INTERRUPT_EXIT, 0, 0, 0, DSERVER_URGENT_ARCH) == 0) {
+		return 0;
+	}
+	return dserver_rpc_interrupt_exit();
+}
+
 
 // Support for Darwin debugging.
 // Unlike other Unix-like systems, macOS doesn't use wait() to handle events in the debugged process.
@@ -61,7 +90,13 @@ static void float_state_to_mcontext(const x86_float_state32_t* s, linux_fpregset
 static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, const void* fstate);
 static void state_to_kernel(struct linux_ucontext* ctxt, void* tstate, void* fstate);
 
-#define DEBUG_SIGEXC
+// DEBUG_SIGEXC routes every kern_printf() in the signal/suspend path through
+// __simple_kprintf(), which is a synchronous RPC round-trip to darlingserver.
+// The sigexc handler and its state save/restore helpers emit dozens of these
+// per signal (dump_gregs alone logs 23 lines), so leaving this on turns any
+// signal-heavy or suspend-heavy workload (e.g. a fork/exec storm) into a flood
+// of thousands of blocking RPCs that collapses guest throughput. Keep it off by
+// default; define it (e.g. via the build) only when actively debugging sigexc.
 #ifdef DEBUG_SIGEXC
 #define kern_printf(...) __simple_kprintf(__VA_ARGS__)
 #else
@@ -114,13 +149,36 @@ static void handle_rt_signal(int signum)
 
 void sigexc_setup(void)
 {
+	// SETUP PROBE. sigexc_setup() is the ONE place that makes Darling's delivery handler the kernel
+	// disposition for every signal, and it is called from _libkernel_init for a mapped image. Measured need:
+	// a guest process has the SIGSEGV bit in SigCgt while the process it spawns does NOT, and the spawned one
+	// dies of a real SIGSEGV in silence -- so the question is whether this setup runs for the exec'd image at
+	// all. Bounded, and it prints the process so the answer is attributable.
+	{
+		static int emitted_setup = 0;
+		if (emitted_setup < 12) {
+			++emitted_setup;
+			// The address of this static is printed as a per-PROCESS identity: the library is mapped at a
+			// different base in every process, so the address is a handle that can be matched against the
+			// library's mapping range in /proc/PID/maps for the process that is being asked about -- which is
+			// how the emitter is attributed without relying on the guest's pid, the trap that has already
+			// misled this hunt twice.
+			__simple_fprintf(2, "[sigexc-setup pid=%d tid=%d seq=%d libpage=%p]\n",
+				(int)LINUX_SYSCALL(__NR_getpid), (int)LINUX_SYSCALL(__NR_gettid), emitted_setup,
+				(const void*)((unsigned long)&emitted_setup & ~0xfffUL));
+		}
+	}
 	darling_sigexc_self();
 	sigexc_setup1();
 	sigexc_setup2();
 
 #ifdef VARIANT_DYLD
 	bool started_suspended;
-	int code = dserver_rpc_started_suspended(&started_suspended);
+	// perf #18 D11 (dar-1il.6): ride the ring (Tier-1 generic fiber); on any ring miss fall back to UDS.
+	int code;
+	if (__dserver_ring_started_suspended(&started_suspended, &code) != 0) {
+		code = dserver_rpc_started_suspended(&started_suspended);
+	}
 	if (code < 0) {
 		__simple_printf("Failed to get started_suspended status: %d\n", code);
 		__simple_abort();
@@ -131,7 +189,10 @@ void sigexc_setup(void)
 		kern_printf("sigexc: start_suspended -> wokenup (ret to %p)\n", __builtin_return_address(0));
 	} else {
 		int32_t tracer;
-		code = dserver_rpc_get_tracer(&tracer);
+		// perf #18 D11 (dar-1il.6): ride the ring; on any ring miss fall back to UDS.
+		if (__dserver_ring_get_tracer(&tracer, &code) != 0) {
+			code = dserver_rpc_get_tracer(&tracer);
+		}
 		if (code < 0) {
 			__simple_printf("Failed to get tracer status: %d\n", code);
 			__simple_abort();
@@ -148,7 +209,7 @@ void sigexc_setup(void)
 
 void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
-	int status = dserver_rpc_interrupt_enter();
+	int status = __dserver_urgent_enter();
 
 	if (status != 0) {
 		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
@@ -177,7 +238,7 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 
 	state_from_kernel(ctxt, &tstate, &fstate);
 	} else if (signum == SIGNAL_S2C) {
-		__simple_kprintf("sigexc: sigrt_handler S2C");
+		kern_printf("sigexc: sigrt_handler S2C");
 
 		int ret = dserver_rpc_s2c_perform();
 		if (ret < 0) {
@@ -188,7 +249,7 @@ void sigrt_handler(int signum, struct linux_siginfo* info, struct linux_ucontext
 		__simple_printf("Unknown/unrecognized real-time signal: %d", signum);
 	}
 
-	status = dserver_rpc_interrupt_exit();
+	status = __dserver_urgent_exit();
 
 	if (status != 0) {
 		__simple_printf("*** dserver_rpc_interrupt_exit failed with code %d ***\n", status);
@@ -201,7 +262,12 @@ void darling_sigexc_self(void)
 {
 	am_i_ptraced = true;
 
-	__simple_kprintf("darling_sigexc_self()\n");
+	// Routed through kern_printf (gated by DEBUG_SIGEXC, off by default) instead of a
+	// bare __simple_kprintf: sigexc_setup() runs on EVERY process startup, so this
+	// once-per-process marker was a synchronous RPC round-trip per process -- part of the
+	// kprintf 14.5% of a build's reply-wait measured by perf #9-decompose. No data, pure
+	// trace; compiled out by default.
+	kern_printf("darling_sigexc_self()\n");
 	// Make sigexc_handler the handler for all signals in the process
 	for (int i = 1; i <= 31; i++)
 	{
@@ -212,8 +278,6 @@ void darling_sigexc_self(void)
 		sa.sa_sigaction = (linux_sig_handler*) sigexc_handler;
 		sa.sa_mask = 0x7fffffff; // all other standard Unix signals should be blocked while the handler is run
 		sa.sa_mask |= (1ull << (SIGNAL_SIGEXC_SUSPEND-1));
-		sa.sa_flags = LINUX_SA_RESTORER | LINUX_SA_SIGINFO | LINUX_SA_RESTART | LINUX_SA_ONSTACK;
-		sa.sa_restorer = sig_restorer;
 
 		LINUX_SYSCALL(__NR_rt_sigaction, i,
 				&sa, NULL,
@@ -234,6 +298,41 @@ void darling_sigexc_self(void)
 		.ss_flags = 0
 	};
 	sys_sigaltstack(&newstack, NULL);
+}
+
+long sigexc_set_restart(int linux_signum, bool restart)
+{
+	struct linux_sigaction sa;
+
+	sa.sa_sigaction = (linux_sig_handler*) sigexc_handler;
+	sa.sa_mask = 0x7fffffff;
+	sa.sa_mask |= (1ull << (SIGNAL_SIGEXC_SUSPEND-1));
+	sa.sa_flags = LINUX_SA_RESTORER | LINUX_SA_SIGINFO | LINUX_SA_ONSTACK;
+	if (restart)
+		sa.sa_flags |= LINUX_SA_RESTART;
+	sa.sa_restorer = sig_restorer;
+
+	// INSTALL RESULT PROBE. This is the call that installs Darling's delivery handler for a signal the GUEST
+	// asked for -- for SIGSEGV it is reached through sys_sigaction's else-branch, not through the
+	// SIGCHLD/SIGTTOU branch. MEASURED contradiction it exists to settle: the guest's sigaction(SIGSEGV, ...)
+	// reports a real handler, this install should therefore make SigCgt's bit 0x400 set, and yet /proc shows
+	// the bit CLEAR for every sample of that process's life. The return value is the only thing between those
+	// two statements, so print it.
+	long install_ret = LINUX_SYSCALL(__NR_rt_sigaction, linux_signum, &sa, NULL, sizeof(sa.sa_mask));
+	if (linux_signum == 11) {
+		static int emitted_install = 0;
+		if (emitted_install < 12) {
+			++emitted_install;
+			// libpage identifies the IMAGE that performed the install: its address is a static of this
+			// library, so it lies inside that library's mapping in WHATEVER process ran it. Comparing it with
+			// the mapping base an outside /proc sample reports says whether the install and the sample are the
+			// same process -- the question the SigCgt contradiction turns on.
+			__simple_fprintf(2, "[setrestart sig=%d ret=%ld host_tid=%d libpage=%p]\n", linux_signum, install_ret,
+				(int)LINUX_SYSCALL(__NR_gettid),
+				(const void*)((unsigned long)&emitted_install & ~0xfffUL));
+		}
+	}
+	return install_ret;
 }
 
 
@@ -269,7 +368,8 @@ static void state_from_kernel(struct linux_ucontext* ctxt, const void* tstate, c
 
 void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_ucontext* ctxt)
 {
-	int status = dserver_rpc_interrupt_enter();
+
+	int status = __dserver_urgent_enter();
 
 	if (status != 0) {
 		__simple_printf("*** dserver_rpc_interrupt_enter failed with code %d ***\n", status);
@@ -277,6 +377,25 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	}
 
 	kern_printf("sigexc_handler(%d, %p, %p)\n", linux_signum, info, ctxt);
+
+	// perf#30 DIAGNOSIS: A GUEST THAT DIES OF A SIGNAL MUST NAME IT. MEASURED: the default build compiles every
+	// kern_printf() in this file to NOTHING (DEBUG_SIGEXC only), so the fatal path was invisible -- `basic 2`/`basic 3`
+	// died with rc=139 and no line anywhere in the guest log said which signal arrived, on which thread, or from which
+	// address. The port teardown that provokes it was then read as a transport deadlock for a long stretch.
+	// One RAW, BOUNDED line per signal number per process: __simple_fprintf is a plain write syscall (safe in a raw
+	// handler on sigexc_altstack) and the bound keeps a signal storm from turning the death into a log flood.
+	if (linux_signum == LINUX_SIGSEGV || linux_signum == LINUX_SIGBUS || linux_signum == LINUX_SIGILL ||
+	    linux_signum == LINUX_SIGABRT || linux_signum == LINUX_SIGFPE || linux_signum == LINUX_SIGTRAP ||
+	    linux_signum == LINUX_SIGKILL || linux_signum == LINUX_SIGTERM) {
+		static unsigned char reported_fatal[64];
+		if (linux_signum >= 0 && linux_signum < 64 && !reported_fatal[linux_signum]) {
+			reported_fatal[linux_signum] = 1;
+			__simple_fprintf(2, "[sigexc-fatal sig=%d code=%d addr=%p pid=%d tid=%d]\n",
+				linux_signum, info ? (int)info->si_code : -1,
+				info ? (void*)(uintptr_t)info->si_addr : (void*)0,
+				(int)LINUX_SYSCALL(__NR_getpid), (int)LINUX_SYSCALL(__NR_gettid));
+		}
+	}
 
 
 	if (linux_signum == LINUX_SIGCONT)
@@ -304,7 +423,47 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 #endif
 
 	state_to_kernel(ctxt, &tstate, &fstate);
-	int ret = dserver_rpc_sigprocess(bsd_signum, linux_signum, info->si_pid, info->si_code, info->si_addr, &tstate, &fstate, &bsd_signum);
+	// perf#30 (directive section 20 / doc sections 87-88): sigprocess runs in a RAW signal handler (this
+	// function is on sigexc_altstack) and needs a COMPLETION, so it publishes to the urgent pool and polls its
+	// own slot -- bounded, signal-safe, and independent of both the lane and the management slot, so a handler
+	// that interrupts a thread holding either still makes progress. The server writes the two structure
+	// pointers during processCall, so only completion and the new signal number travel back.
+	int ret;
+	{
+		uint64_t words[8];
+		words[0] = (uint64_t)(uint32_t)bsd_signum | ((uint64_t)(uint32_t)linux_signum << 32);
+		words[1] = (uint64_t)(uint32_t)info->si_pid | ((uint64_t)(uint32_t)info->si_code << 32);
+		words[2] = (uint64_t)(uintptr_t)info->si_addr;
+		words[3] = (uint64_t)(uintptr_t)&tstate;
+		words[4] = (uint64_t)(uintptr_t)&fstate;
+		words[5] = (uint64_t)DSERVER_URGENT_ARCH;
+		words[6] = 0;
+		words[7] = 0;
+		int32_t urgentStatus = -1;
+		uint64_t urgentExtra = 0;
+		ret = __dserver_plane_urgent_publish_wait(DSERVER_PROCESS_CONTROL_OP_SIGPROCESS, words, 8,
+			&urgentStatus, &urgentExtra);
+		if (ret == -2) {
+			// perf#30 (directive section 3, doc section 206): the publication WAS made and its completion was not
+			// observed inside the signal-safe window. The standing rule applies -- no retry after publication -- so
+			// the datagram is NOT taken (a retry would run the operation twice) and no per-thread socket is created
+			// for it. The one thing lost is a server-side change to the signal number, which is a degradation this
+			// path accepts; a socket is not.
+			static int reportedPublishedNotCompleted = 0;
+			if (!reportedPublishedNotCompleted) {
+				reportedPublishedNotCompleted = 1;
+				__simple_fprintf(2, "[sigprocess-urgent-uncompleted] no-datagram-retry\n");
+			}
+			ret = 0;
+		} else if (ret != -1) {
+			int newSignum = (int)(uint32_t)urgentExtra;
+			if (newSignum > 0) {
+				bsd_signum = newSignum;
+			}
+		} else {
+			ret = dserver_rpc_sigprocess(bsd_signum, linux_signum, info->si_pid, info->si_code, info->si_addr, &tstate, &fstate, &bsd_signum);
+		}
+	}
 	if (ret < 0) {
 		__simple_printf("sigprocess failed internally while processing Linux signal %d: %d", linux_signum, ret);
 		__simple_abort();
@@ -325,16 +484,29 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 		{
 			kern_printf("sigexc: will forward signal to app handler (%p)\n", sig_handlers[linux_signum]);
 
-			// Update the signal mask to what the application actually wanted
-			linux_sigset_t set = sig_masks[linux_signum];
+			// Preserve the interrupted mask and add the translated application mask.
+			linux_sigset_t set;
+			sigset_bsd_to_linux(&sig_masks[linux_signum], &set);
+			set |= ctxt->uc_sigmask;
 
 			// Keep the current signal blocked, which is the default behavior
-			if (!(sig_flags[linux_signum] & LINUX_SA_NODEFER))
+			if (!(sig_flags[linux_signum] & BSD_SA_NODEFER))
 				set |= (1ull << (linux_signum-1));
 
 			LINUX_SYSCALL(__NR_rt_sigprocmask, 2 /* LINUX_SIG_SETMASK */,
 				&set, NULL, sizeof(linux_sigset_t));
 
+			// DELIVERY PROBE AT THE FINAL DISPATCH. A probe at sigexc_handler's function entry printed only for
+			// signal 15 while the host disposition for the fatal SIGSEGV was measured to be a handler 0x20 bytes
+			// inside sigexc_handler -- so the entry a probe must occupy is the one every delivery path reaches,
+			// this dispatch, not the prologue. Bounded, and it prints what the guest is being told to deliver.
+			{
+				static int emitted_deliver = 0;
+				if (emitted_deliver < 24) {
+					++emitted_deliver;
+					__simple_fprintf(2, "[sigexc-deliver linux_sig=%d si_code=%d]\n", linux_signum, (int)info->si_code);
+				}
+			}
 			handler_linux_to_bsd(linux_signum, info, ctxt);
 		}
 		else
@@ -347,6 +519,7 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 			else
 			{
 				kern_printf("sigexc: emulating default signal effects\n");
+				__simple_fprintf(2, "[sigexc-default sig=%d tid=%d]\n", linux_signum, (int)LINUX_SYSCALL(__NR_gettid));
 				// Set handler to SIG_DFL
 				struct linux_sigaction sa;
 				sa.sa_sigaction = (linux_sig_handler*) NULL; // SIG_DFL
@@ -358,8 +531,18 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 						&sa, NULL,
 						sizeof(sa.sa_mask));
 
-				// Resend signal to self
-				LINUX_SYSCALL(__NR_kill, 0, linux_signum);
+				// Resend signal to self. NOTE: kill(0, sig) targets the
+				// CALLER'S ENTIRE PROCESS GROUP, not just this process, so a
+				// fatal default signal (e.g. SIGSEGV from a crashing conftest)
+				// would be broadcast to parent/sibling processes sharing the
+				// pgid and kill them too (observed: gnulib's printf-OOM conftest
+				// taking down its parent bash/configure with a spurious SI_USER
+				// SIGSEGV; dar-gwn.1.5 / dar-gwn.6.4). macOS terminates only the
+				// faulting process. Re-raise to THIS thread (raise() semantics)
+				// via tgkill(pid, tid, sig) so only this process is affected.
+				int self_pid = LINUX_SYSCALL(__NR_getpid);
+				int self_tid = LINUX_SYSCALL(__NR_gettid);
+				LINUX_SYSCALL(__NR_tgkill, self_pid, self_tid, linux_signum);
 			}
 		}
 	}
@@ -367,7 +550,7 @@ void sigexc_handler(int linux_signum, struct linux_siginfo* info, struct linux_u
 	kern_printf("sigexc: handler (%d) returning\n", linux_signum);
 
 out:
-	status = dserver_rpc_interrupt_exit();
+	status = __dserver_urgent_exit();
 
 	if (status != 0) {
 		__simple_printf("*** dserver_rpc_interrupt_exit failed with code %d ***\n", status);

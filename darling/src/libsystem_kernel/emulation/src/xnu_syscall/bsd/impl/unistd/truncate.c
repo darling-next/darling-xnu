@@ -1,5 +1,6 @@
 #include <darling/emulation/xnu_syscall/bsd/impl/unistd/truncate.h>
 
+#include <sys/errno.h>
 #include <darling/emulation/other/mach/lkm.h>
 #include <darling/emulation/common/base.h>
 #include <darling/emulation/conversion/errno.h>
@@ -14,7 +15,19 @@ long sys_truncate(const char* path, long long length)
 
 	vc.flags = VCHROOT_FOLLOW;
 	vc.dfd = get_perthread_wd();
-	
+
+	if (!path)
+		return -EFAULT;
+
+#ifdef EUNION
+	// truncate mutates file contents: copy up from the read-only template first.
+	if (path[0] == '/') {
+		int wr = vchroot_prepare_write(path);
+		if (wr < 0)
+			return errno_linux_to_bsd(wr);
+	}
+#endif
+
 	strcpy(vc.path, path);
 
 	ret = vchroot_expand(&vc);
